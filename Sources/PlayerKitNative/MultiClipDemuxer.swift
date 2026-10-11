@@ -22,6 +22,17 @@ final class MultiClipDemuxer: @unchecked Sendable {
     private var current: FFmpegDemuxer?
     private var pendingSwitchFlag = false
 
+    /// The open failure from the most recent switchTo(), kept until a packet
+    /// is successfully read. Combined with the active clip's own
+    /// lastDemuxError in `lastDemuxError` — either one means "real media
+    /// error", and their absence means the presentation genuinely ended.
+    private var lastSwitchError: Error?
+
+    /// nil = clean EOF / healthy state; non-nil = why demuxing failed.
+    /// Same contract as FFmpegDemuxer.lastDemuxError, threaded through the
+    /// active clip plus this class's own clip-switch failures.
+    var lastDemuxError: Error? { current?.lastDemuxError ?? lastSwitchError }
+
     /// A fully-opened demuxer for the next sequential clip, produced in the
     /// background by `preOpenQueue` while the current clip is still playing.
     /// Consumed by `switchTo` at the EOF seam so the 1~1.5s
@@ -125,6 +136,7 @@ final class MultiClipDemuxer: @unchecked Sendable {
     func readPacket() -> (streamIndex: Int32, packet: UnsafeMutablePointer<AVPacket>, didSwitchClip: Bool)? {
         guard let current else { return nil }
         if let result = current.readPacket() {
+            lastSwitchError = nil  // healthy read retires any stale switch failure
             let offsetSecs = timeline.startOffsets[currentIndex]
             // Local PTS (in this clip's own time domain) is computed for
             // every packet regardless of offset — it drives the pre-open
@@ -151,6 +163,11 @@ final class MultiClipDemuxer: @unchecked Sendable {
         do {
             try switchTo(clipIndex: currentIndex + 1, localSeekSecs: nil)
         } catch {
+            // Opening the next clip failed (disc sector gone, cloud file
+            // deleted, …). Record it so the backend can surface a real error
+            // instead of reading this as "the presentation ended here".
+            lastSwitchError = error
+            logger.error("switch to clip \(self.currentIndex + 1) failed: \(error, privacy: .public)")
             return nil
         }
         return readPacket()

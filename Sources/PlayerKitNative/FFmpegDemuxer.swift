@@ -43,6 +43,10 @@ enum DemuxerError: Error, CustomStringConvertible {
     case openFailed(Int32)
     /// avformat_find_stream_info returned < 0.
     case noStreams(Int32)
+    /// av_read_frame returned a non-EOF error and the reader had no thrown
+    /// error recorded (bridge-less URL open, or ffmpeg-internal failure).
+    /// Carries the FFmpeg error code.
+    case readFailed(Int32)
     /// No usable video or audio stream found after probing.
     case noUsableStreams
 
@@ -57,6 +61,12 @@ enum DemuxerError: Error, CustomStringConvertible {
             return "demux open failed (ret=\(ret)): \(msg)"
         case .noStreams(let ret):
             return "demux find_stream_info failed (ret=\(ret))"
+        case .readFailed(let ret):
+            let buf = UnsafeMutablePointer<CChar>.allocate(capacity: Int(AV_ERROR_MAX_STRING_SIZE))
+            defer { buf.deallocate() }
+            _ = av_make_error_string(buf, Int(AV_ERROR_MAX_STRING_SIZE), ret)
+            let msg = String(cString: buf)
+            return "demux read failed (ret=\(ret)): \(msg)"
         case .noUsableStreams:
             return "no usable video/audio stream found in container"
         }
@@ -68,6 +78,17 @@ final class FFmpegDemuxer: @unchecked Sendable {
     var formatContext: UnsafeMutablePointer<AVFormatContext>? { formatCtx }
     private var avioBridge: AVIOBridge?
     private(set) var duration: Double = 0
+
+    /// The reader error behind the most recent readPacket() failure, nil when
+    /// readPacket() returned nil because the stream genuinely ended (EOF).
+    /// This is the EOF/error distinction the demux loop needs: a thrown
+    /// reader error (network blackhole, risk-control block, token expired)
+    /// must surface as a playback error, not a silent "played to end".
+    /// Cleared on every successful read so a stale error can't outlive its
+    /// cause. Consumers read it right after a nil readPacket() on the same
+    /// (demux) thread; accesses elsewhere are still safe via the bridge's
+    /// internal lock.
+    private(set) var lastDemuxError: Error?
 
     var videoStreamIndex: Int32 { videoStream.map { $0.pointee.index } ?? -1 }
     var audioStreamIndex: Int32 { audioStream.map { $0.pointee.index } ?? -1 }
@@ -725,11 +746,22 @@ final class FFmpegDemuxer: @unchecked Sendable {
         let ret = av_read_frame(ctx, pkt)
         guard ret == 0, let packet = pkt else {
             if ret < 0 {
-                logger.error("av_read_frame error: \(ret)")
+                if ret == AVIOBridge.averrorEOF {
+                    // Natural end of stream — not an error.
+                    lastDemuxError = nil
+                } else {
+                    // Prefer the reader's own thrown error (its identity —
+                    // domain, code, message — is exactly what the UI needs;
+                    // AVERROR_EXTERNAL says only "external failure").
+                    let err = avioBridge?.lastReadError ?? DemuxerError.readFailed(ret)
+                    lastDemuxError = err
+                    logger.error("av_read_frame error \(ret): \((err as? CustomStringConvertible)?.description ?? String(describing: err), privacy: .public)")
+                }
             }
             av_packet_free(&pkt)
             return nil
         }
+        lastDemuxError = nil
         return (packet.pointee.stream_index, packet, false)
     }
 
