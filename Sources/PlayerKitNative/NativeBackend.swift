@@ -1160,6 +1160,25 @@ public final class NativeBackend: PlayerBackend {
 
                 guard let result = demuxer.readPacket() else {
                     dLock.unlock()
+                    // Real read failure (network blackhole, risk-control
+                    // block, gone cloud file) — surface it, never read it
+                    // as EOF: the markEOF() tail below would end playback
+                    // as a normal "played to end" and the UI would show a
+                    // frozen picture with no error. Same message convention
+                    // as the open-failure paths: description, not
+                    // localizedDescription.
+                    if let demuxError = demuxer.lastDemuxError {
+                        let msg = "demux I/O error: "
+                            + ((demuxError as? CustomStringConvertible)?.description
+                               ?? String(describing: demuxError))
+                        logger.error("\(msg, privacy: .public)")
+                        DispatchQueue.main.async { [weak self] in
+                            guard let self, !self.demuxCancelled else { return }
+                            self.state.error = msg
+                            self.notifyStateChange()
+                        }
+                        break
+                    }
                     if packetCount == 0, !eofRecoveryDone {
                         eofRecoveryDone = true
                         logger.error("immediate EOF, recovering to 0")

@@ -41,6 +41,12 @@ protocol PacketDemuxing: AnyObject, Sendable {
     func selectAudioStream(by id: Int) -> Bool
     func selectSubtitleStream(by id: Int?)
     func readPacket() -> (streamIndex: Int32, packet: UnsafeMutablePointer<AVPacket>, didSwitchClip: Bool)?
+    /// The reader/media error behind the most recent readPacket() failure,
+    /// nil when readPacket() returned nil because the stream genuinely ended.
+    /// Lets the demux loop tell a thrown reader error (network blackhole,
+    /// risk-control block, gone cloud file) apart from a natural EOF — the
+    /// former must surface as a playback error, the latter is "played to end".
+    var lastDemuxError: Error? { get }
     func seek(to time: Double) -> Bool
     func close()
 }

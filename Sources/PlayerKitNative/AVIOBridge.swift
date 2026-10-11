@@ -21,10 +21,24 @@ final class AVIOBridge: @unchecked Sendable {
     // AVERROR_EOF, mirrored from libavutil/error.h (FFERRTAG('E','O','F',' ')).
     // The Swift importer can't bridge that macro (function-like macro chain),
     // so it's reproduced here rather than hardcoding the resulting literal.
-    private static let averrorEOF: Int32 = {
+    // Internal so FFmpegDemuxer.readPacket can distinguish EOF from real
+    // read errors on the same av_read_frame return path.
+    static let averrorEOF: Int32 = {
         let tag = Int32(bitPattern: UInt32(UInt8(ascii: "E"))
             | (UInt32(UInt8(ascii: "O")) << 8)
             | (UInt32(UInt8(ascii: "F")) << 16)
+            | (UInt32(UInt8(ascii: " ")) << 24))
+        return -tag
+    }()
+
+    // AVERROR_EXTERNAL (FFERRTAG('E','X','T',' ')) — ffmpeg's designated
+    // "error from external/unknown source" code. doRead returns this when the
+    // Swift reader throws, so av_read_frame surfaces a non-EOF failure the
+    // demuxer must not treat as end-of-stream.
+    private static let averrorExternal: Int32 = {
+        let tag = Int32(bitPattern: UInt32(UInt8(ascii: "E"))
+            | (UInt32(UInt8(ascii: "X")) << 8)
+            | (UInt32(UInt8(ascii: "T")) << 16)
             | (UInt32(UInt8(ascii: " ")) << 24))
         return -tag
     }()
@@ -45,6 +59,33 @@ final class AVIOBridge: @unchecked Sendable {
     /// Highest byte offset available in the reader's internal buffer (for buffer bar).
     var downloadedUpToOffset: Int64 { reader.downloadedUpToOffset }
     var totalBytes: Int64 { cachedSize }
+
+    // The error thrown by the most recent failed reader.read(), surfaced so
+    // FFmpegDemuxer.readPacket can report WHY av_read_frame failed (network
+    // blackhole, risk-control block, token expired…) instead of a bare -1.
+    // doRead runs on the demux loop's thread via the synchronous C callback,
+    // and readPacket's consumer runs on that same thread — but the lock keeps
+    // this safe for readers demuxed from elsewhere (probe threads etc.).
+    private let errorLock = NSLock()
+    private var _lastReadError: Error?
+
+    /// The error thrown by the most recent failed reader.read(), nil until a
+    /// read has failed. Cleared by a subsequent *successful* read so a stale
+    /// error can't be attributed to a later failure.
+    var lastReadError: Error? {
+        errorLock.lock(); defer { errorLock.unlock() }
+        return _lastReadError
+    }
+
+    private func recordReadError(_ error: Error) {
+        errorLock.lock(); defer { errorLock.unlock() }
+        _lastReadError = error
+    }
+
+    private func clearReadError() {
+        errorLock.lock(); defer { errorLock.unlock() }
+        _lastReadError = nil
+    }
 
     init(reader: any MediaRandomAccessReader) {
         self.reader = reader
@@ -147,14 +188,18 @@ final class AVIOBridge: @unchecked Sendable {
             // of treating the stream as ended.
             guard n > 0 else { return AVIOBridge.averrorEOF }
             currentOffset += Int64(n)
+            clearReadError()
             return Int32(n)
         } catch {
-            // Previously silent — a thrown reader error (network timeout, SSL
-            // failure, cancelled task, etc.) turned into a bare -1 with no
-            // trace of *why*, making a demuxer-side "av_read_frame error: -1"
-            // undebuggable from the console log alone.
+            // A thrown reader error (network timeout, risk-control block,
+            // cancelled task, …) must reach the demuxer with its identity
+            // intact: record it for lastReadError and return a non-EOF
+            // AVERROR so FFmpegDemuxer.readPacket can tell this apart from
+            // a genuine end-of-stream. A bare -1 here is AVERROR(EPERM) —
+            // worse than useless, it lies about the cause.
             logger.error("read failed at offset=\(offset) length=\(length): \(error.localizedDescription, privacy: .public)")
-            return -1  // AVERROR
+            recordReadError(error)
+            return AVIOBridge.averrorExternal
         }
     }
 
