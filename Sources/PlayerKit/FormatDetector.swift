@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(VideoToolbox)
+import VideoToolbox
+#endif
 
 public enum FormatDetector {
     public static func isHardwareDecodable(codecId: String) -> Bool {
@@ -8,7 +11,14 @@ public enum FormatDetector {
         case "hevc", "h265", "hev1", "hvc1":
             return true
         case "av1":
-            return true
+            // AV1 hardware decode exists only on A17 Pro / M3 and later —
+            // probe the actual device instead of claiming support everywhere.
+            // (zyno#107; pairs with the VTVideoDecoder probe gate.)
+            #if canImport(VideoToolbox)
+            return VTIsHardwareDecodeSupported(kCMVideoCodecType_AV1)
+            #else
+            return false
+            #endif
         default:
             return false
         }
