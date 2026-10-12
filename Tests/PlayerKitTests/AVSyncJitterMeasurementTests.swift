@@ -19,6 +19,10 @@ import XCTest
 /// Gates are deliberately loose (CI/load must not flake this): they only catch
 /// catastrophic pacing breaks. The printed distributions ARE the deliverable
 /// — A/B runs across revisions (main vs pre-#15 vs pre-P2) compare them.
+///
+/// Since the 2026-10-12 fix (frame-count back-pressure + guard window wider
+/// than the compensation transient) the frame-count gate is a hard regression
+/// gate for that root cause, not just a sanity check — see assertSanePacing.
 final class AVSyncJitterMeasurementTests: XCTestCase {
 
     private func fixtureURL(_ name: String, _ ext: String) -> URL {
@@ -76,8 +80,16 @@ final class AVSyncJitterMeasurementTests: XCTestCase {
 
     private func assertSanePacing(_ name: String, _ s: SyncDiagStats,
                                   file: StaticString = #filePath, line: UInt = #line) {
-        guard s.count > 100 else {
-            XCTFail("\(name): only \(s.count) frames displayed — playback never paced",
+        // Regression gate for the 晃动 root cause (2026-10-12): a full frame
+        // buffer used to silently drop its OLDEST frame on every append, which
+        // pushed the front ahead of the audio clock and tripped the
+        // freeze-ahead guard — the pipeline displayed only 22-30 frames in 10s
+        // (18-24fps against 25/23.976fps fixtures). Healthy pacing delivers
+        // ~9s of the 10s window after the ~1s startup buffer: 216 frames at
+        // 23.976fps, 225 at 25fps. Gate at 190: catches a collapse back toward
+        // 20fps (180) while leaving ~13% headroom for CI load.
+        guard s.count > 190 else {
+            XCTFail("\(name): only \(s.count) frames displayed in the 10s window — pacing collapsed (expect ~216-225)",
                     file: file, line: line)
             return
         }

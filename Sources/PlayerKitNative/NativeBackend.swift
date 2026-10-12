@@ -1479,10 +1479,13 @@ public final class NativeBackend: PlayerBackend {
                     }
                     // Throttle: keep video demux within 2s of the audio clock.
                     // HW decode runs ~4× real-time; without throttling the demux
-                    // would advance 30+ seconds ahead of audio. maxFrameCount then
-                    // evicts old frames, leaving the jitter buffer with only
-                    // far-future frames — needsClockCalibration resets audioClock
-                    // to that far-future PTS, causing A/V desync / black screen.
+                    // would advance 30+ seconds ahead of audio and the jitter
+                    // buffer would fill with far-future frames —
+                    // needsClockCalibration resets audioClock to that far-future
+                    // PTS, causing A/V desync / black screen. (The demux
+                    // free-running on start — audio clock still 0, this guard
+                    // inactive — is also what arms the frame-count back-pressure
+                    // below.)
                     //
                     // We sleep AT MOST 50ms per video packet so the outer loop
                     // continues reading audio/subtitle packets in between, keeping
@@ -1541,6 +1544,24 @@ public final class NativeBackend: PlayerBackend {
                     // while the frame budget is used up; short sleep only, so the loop
                     // keeps reading the audio packets interleaved with the video.
                     if jitter.isFull {
+                        Thread.sleep(forTimeInterval: 0.010)
+                    }
+
+                    // Frame-count back-pressure (2026-10-12 晃动 fix). The frame
+                    // cap must hold the demux loop back exactly like the byte
+                    // budget above — and the buffer must never have to drop
+                    // frames to respect it. It used to: append() evicted the
+                    // OLDEST frame on overflow, i.e. the display loop's next
+                    // frame, so a full buffer advanced its front ahead of the
+                    // audio clock at supply rate and the freeze-ahead guard
+                    // held the picture until audio caught up (device: 18-24fps
+                    // vs 23.976fps content). VideoJitterBuffer.append now
+                    // refuses the incoming frame and counts it
+                    // (droppedIncomingCount); this sleep keeps that refusal
+                    // rare by pacing the supply to the drain rate once the
+                    // buffer is full. Short sleep only, so audio packets
+                    // interleaved after this one are still read.
+                    if jitter.count >= jitter.maxFrameCount {
                         Thread.sleep(forTimeInterval: 0.010)
                     }
 
@@ -1994,12 +2015,14 @@ public final class NativeBackend: PlayerBackend {
             (needsClockCalibration, audioClockReady)
         }
         if syncController.hasDisplayedFrame, !stillNeedsCal, clockReady {
-            // Guard window scales with the playback rate (zyno#99): at rate r
-            // the steady-state sync target holds the front frame at
-            // audioTime + displayLatencyCompensation×r (see SyncController
-            // computeDelay), so the window must stay above that — a fixed
-            // 60ms freezes the picture permanently at 2× (comp×r = 100ms).
-            let guardWindow = 0.06 * max(1.0, playbackRate)
+            // Guard window = compensation + 2 frames, scaled by max(1, rate)
+            // — see SyncController.guardWindow. The old fixed 60ms sat 10ms
+            // above the steady-state transient (comp 50ms + one frame), so
+            // normal pacing grazed the freeze threshold and any supply hiccup
+            // froze the picture: device-measured 18-24fps against 23.976fps
+            // content (2026-10-12 晃动). The guard is a safety net; pacing
+            // belongs to SyncController.
+            let guardWindow = syncController.guardWindow(rate: playbackRate)
             // Drain frames significantly behind audio
             while let lagging = jitterBuffer.peek(at: 0), lagging.pts < audioTime - guardWindow {
                 jitterBuffer.pop()

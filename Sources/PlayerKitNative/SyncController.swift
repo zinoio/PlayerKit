@@ -80,6 +80,32 @@ final class SyncController {
         lastDuration = 0.04
     }
 
+    /// Window (seconds of content time) for the display loop's freeze-ahead /
+    /// skip-behind guard.
+    ///
+    /// The guard is a SAFETY NET — it catches real desync after a stall, seek
+    /// or drop-out — and must not double as the pacing mechanism: pacing is
+    /// check()/advance()'s job. A fixed 60ms window did not respect that: in
+    /// steady state the front frame rides at displayLatencyCompensation
+    /// (50ms) plus up to one frame duration of pacing jitter, so normal
+    /// operation grazed the freeze threshold and any supply hiccup of a few
+    /// ms froze the picture — measured on device as 18-24fps against
+    /// 23.976fps content (2026-10-12, 晃动/过几秒卡一次).
+    ///
+    /// Window = compensation + 2 frame durations: compensation (what sync
+    /// deliberately holds the front at), one frame for the frame being
+    /// displayed, one frame of supply/pacing slack. Scaled by max(1, rate),
+    /// the same floor the old fixed window used, because comp×r grows with the
+    /// rate (at 2x the front legitimately rides 100ms ahead in content time)
+    /// while at rates below 1x supply jitter stays wall-clock sized and the
+    /// window must not shrink into it.
+    ///
+    /// 24fps @1x: 50 + 2×41.7 ≈ 133ms (old: 60ms).
+    func guardWindow(rate: Double = 1.0) -> Double {
+        let frame = lock.withLock { lastDuration > 0 ? lastDuration : 0.04 }
+        return (displayLatencyCompensation + 2 * frame) * max(1.0, rate)
+    }
+
     // MARK: - Private (call only under lock)
 
     private func nominalFrameDurationLocked(nextPTS: Double, followingPTS: Double?) -> Double {
