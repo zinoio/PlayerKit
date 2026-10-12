@@ -486,6 +486,118 @@ final class FFmpegVideoDecoder {
             maxFall: dm.l6.max_fall)
     }
 
+    // MARK: - DoVi RPU reshaping curve (issue #13)
+
+    /// Copy the reshaping curve out of `AVDOVIMetadata`, converting the
+    /// fixed-point coefficients exactly like libplacebo's
+    /// `pl_map_dovi_metadata` (libav_internal.h):
+    ///   pivots `p / ((1 << bl_bit_depth) - 1)`, coeffs `v / (1 << coef_log2_denom)`.
+    /// Only valid slots are copied (`num_pivots` / `poly_order` / `mmr_order`
+    /// scopes) so unused sentinel data can't pollute `Equatable` caching.
+    /// Returns nil when the mapping carries no pieces, or when the RPU color
+    /// block's `rgb_to_lms_matrix` is missing/all-zero (the reshape output
+    /// decodes through it — without it there is no well-defined chain).
+    ///
+    /// C fixed-size arrays (`pivots[9]`, `poly_coef[8][3]`, `curves[3]`, …)
+    /// import to Swift tuples without subscripting — they are read as typed
+    /// buffers through their contiguous memory layout instead. `av_dovi_get_*`
+    /// accessors are C static inlines (invisible to Swift), hence the manual
+    /// offset arithmetic.
+    static func parseDoviReshapingCurve(_ metadata: UnsafePointer<AVDOVIMetadata>) -> DoviReshapingCurve? {
+        let base = UnsafeRawPointer(metadata)
+        let header = base.advanced(by: metadata.pointee.header_offset)
+            .assumingMemoryBound(to: AVDOVIRpuDataHeader.self).pointee
+        var mapping = base.advanced(by: metadata.pointee.mapping_offset)
+            .assumingMemoryBound(to: AVDOVIDataMapping.self).pointee
+        var color = base.advanced(by: metadata.pointee.color_offset)
+            .assumingMemoryBound(to: AVDOVIColorMetadata.self).pointee
+
+        let pivotScale = 1.0 / Float((1 << Int(header.bl_bit_depth)) - 1)
+        let coefScale = 1.0 / Float(1 << Int(header.coef_log2_denom))
+
+        // Tuple fields are read as typed buffers and copied out to Arrays
+        // inside the closure (the raw buffer is only valid within it).
+        let curves: [AVDOVIReshapingCurve] = withUnsafeBytes(of: &mapping.curves) {
+            UnsafeRawBufferPointer($0).bindMemory(to: AVDOVIReshapingCurve.self).map { $0 }
+        }
+
+        var components: [DoviReshapingCurve.Component] = []
+        var hasPieces = false
+        for c in 0..<3 {
+            var src = curves[c]
+            let nPivots = Int(src.num_pivots)
+            // Code-domain range is [2, 9]; zero-initialized / malformed
+            // headers mean "no data" — pass the component through.
+            guard nPivots >= 2 else {
+                components.append(DoviReshapingCurve.Component(pivots: [], pieces: []))
+                continue
+            }
+            let pivots: [UInt16] = withUnsafeBytes(of: &src.pivots) {
+                UnsafeRawBufferPointer($0).bindMemory(to: UInt16.self).map { $0 }
+            }
+            let mappingIdc: [AVDOVIMappingMethod] = withUnsafeBytes(of: &src.mapping_idc) {
+                UnsafeRawBufferPointer($0).bindMemory(to: AVDOVIMappingMethod.self).map { $0 }
+            }
+            let polyOrder: [UInt8] = withUnsafeBytes(of: &src.poly_order) {
+                UnsafeRawBufferPointer($0).bindMemory(to: UInt8.self).map { $0 }
+            }
+            let polyCoef: [Int64] = withUnsafeBytes(of: &src.poly_coef) {
+                UnsafeRawBufferPointer($0).bindMemory(to: Int64.self).map { $0 }
+            }
+            let mmrOrder: [UInt8] = withUnsafeBytes(of: &src.mmr_order) {
+                UnsafeRawBufferPointer($0).bindMemory(to: UInt8.self).map { $0 }
+            }
+            let mmrConstant: [Int64] = withUnsafeBytes(of: &src.mmr_constant) {
+                UnsafeRawBufferPointer($0).bindMemory(to: Int64.self).map { $0 }
+            }
+            let mmrCoef: [Int64] = withUnsafeBytes(of: &src.mmr_coef) {
+                UnsafeRawBufferPointer($0).bindMemory(to: Int64.self).map { $0 }
+            }
+
+            var pivotsF: [Float] = []
+            pivotsF.reserveCapacity(nPivots)
+            for i in 0..<nPivots { pivotsF.append(pivotScale * Float(pivots[i])) }
+
+            var pieces: [DoviReshapingCurve.Piece] = []
+            for i in 0..<(nPivots - 1) {
+                if mappingIdc[i] == AV_DOVI_MAPPING_POLYNOMIAL {
+                    let order = Int(polyOrder[i])   // [1, 2]
+                    var coef = SIMD3<Float>.zero
+                    for k in 0...order { coef[k] = coefScale * Float(polyCoef[i * 3 + k]) }
+                    pieces.append(DoviReshapingCurve.Piece(isMMR: false, polyCoef: coef))
+                } else { // AV_DOVI_MAPPING_MMR
+                    let order = Int(mmrOrder[i])    // [1, 3]
+                    let constant = coefScale * Float(mmrConstant[i])
+                    var coefs: [[Float]] = []
+                    for j in 0..<order {
+                        coefs.append((0..<7).map { coefScale * Float(mmrCoef[(i * 3 + j) * 7 + $0]) })
+                    }
+                    pieces.append(DoviReshapingCurve.Piece(isMMR: true, mmrOrder: order,
+                                                           mmrConstant: constant, mmrCoef: coefs))
+                }
+            }
+            hasPieces = hasPieces || !pieces.isEmpty
+            components.append(DoviReshapingCurve.Component(pivots: pivotsF, pieces: pieces))
+        }
+        guard hasPieces else { return nil }
+
+        // RPU color block rgb_to_lms_matrix (row-major AVRational[9]).
+        // av_q2d is a C static inline — not visible to Swift — so compute
+        // num/den directly. An all-zero matrix means the RPU carried no
+        // usable color ext block: the reshape chain is undefined, fall back.
+        let rgbToLmsRaw: [AVRational] = withUnsafeBytes(of: &color.rgb_to_lms_matrix) {
+            UnsafeRawBufferPointer($0).bindMemory(to: AVRational.self).map { $0 }
+        }
+        let rationalToDouble = { (q: AVRational) -> Double in
+            Double(q.num) / Double(max(Int(q.den), 1))
+        }
+        guard !(0..<9).allSatisfy({ rationalToDouble(rgbToLmsRaw[$0]) == 0 }) else { return nil }
+        let rgbToLms = stride(from: 0, to: 9, by: 3).map { rowStart in
+            (0..<3).map { Float(rationalToDouble(rgbToLmsRaw[rowStart + $0])) }
+        }
+        return DoviReshapingCurve(components: components, rgbToLms: rgbToLms)
+    }
+
     /// Extract all per-frame HDR side data into a `FrameMetadata` value type.
     /// Covers Dolby Vision (Level 1 + Level 2/8 trim + Level 3 offsets +
     /// Level 6), HDR10+ bezier curve, SMPTE ST 2086 mastering display, and
@@ -520,8 +632,11 @@ final class FFmpegVideoDecoder {
                 if let dm = av_dovi_find_level(m, 6), dm.pointee.level == 6 {
                     dovi.level6 = FFmpegVideoDecoder.parseDoviLevel6(dm.pointee)
                 }
+                // RPU reshaping curve (P5 / P8 compat 0/4). nil when absent
+                // or malformed — renderer falls back to geometric IPT.
+                meta.doviReshape = FFmpegVideoDecoder.parseDoviReshapingCurve(m)
                 if decodedFrames <= 3 {
-                    logger.info("DV frame L1: \(dovi.level1.map { "min=\($0.minPq) max=\($0.maxPq) avg=\($0.avgPq)" } ?? "nil") L2: \(dovi.level2.map { "slope=\($0.trimSlope) power=\($0.trimPower)" } ?? "nil") L3: \(dovi.level3.map { "max=\($0.maxPqOffset)" } ?? "nil") L6: \(dovi.level6.map { "maxLum=\($0.maxLuminance) cll=\($0.maxCll)" } ?? "nil")")
+                    logger.info("DV frame L1: \(dovi.level1.map { "min=\($0.minPq) max=\($0.maxPq) avg=\($0.avgPq)" } ?? "nil") L2: \(dovi.level2.map { "slope=\($0.trimSlope) power=\($0.trimPower)" } ?? "nil") L3: \(dovi.level3.map { "max=\($0.maxPqOffset)" } ?? "nil") L6: \(dovi.level6.map { "maxLum=\($0.maxLuminance) cll=\($0.maxCll)" } ?? "nil") reshape: \(meta.doviReshape.map { "\($0.components.map { $0.pieces.count })" } ?? "nil")")
                 }
             }
             meta.dovi = dovi

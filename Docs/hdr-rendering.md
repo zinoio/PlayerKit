@@ -88,7 +88,7 @@ else:  # .sdr
 消费(两个渲染器的 BT.2390 DoVi-L1 路径):
 
 - **L3 max offset** 在进 EETF 前加到帧峰值上(归一 PQ 域,clamp 0..1)。注意方向:BT.2390 Hermite 里抬高 srcMaxPq = 压缩区间变宽 = **输出更暗**。
-- **L2 trim** 在 EETF 输出的信号线性域近似应用:`slope·x + offset → pow(power)`,再围绕 BT.2020 luma 做饱和度增益。Dolby 官方语义在 IPT 空间、studio reshape 之前;信号域是工程近似(libplacebo/mpv 同样没有 L2 直接消费路径,完整还原需要 libdovi 的 RPU reshape)。`msWeight` / `chromaWeight` 已解析但 shader 暂未消费。
+- **L2 trim** 在 EETF 输出的信号线性域近似应用:`slope·x + offset → pow(power)`,再围绕 BT.2020 luma 做饱和度增益。Dolby 官方语义在 IPT 空间、studio reshape 之前;信号域是工程近似(libplacebo/mpv 同样没有 L2 直接消费路径)。**RPU reshape 已于 issue #13 落地**(L2 的官方叠加位置在 reshape 之后的信号域,两者无交叠)。`msWeight` / `chromaWeight` 已解析但 shader 暂未消费。
 - **中性 trim 块**(全 2048)在 `makeUniform` 里被 1e-4 检测跳过,保证像素级 no-op。
 - SDR target 路径在 `ToneMapProcessor`(PlayerKitPro),EDR 直出路径在 `EDRRenderer`(L3 offset;trim 仅 SDR 路径)。
 
@@ -245,7 +245,7 @@ CI SDR: coded=1918x1036                          ← 走 8-bit CI SDR pipeline
 ## 不做
 
 - DoVi Profile 7 BL+EL 双层软件解码(复杂,留后续)
-- RPU reshape 完整链(IPT 域 + NLQ,需集成 Rust libdovi;L2 trim 已用信号域近似,见上文精修一节)
+- ~~RPU reshape 完整链~~ → **已落地(issue #13)**:数据源 = ffmpeg `AVDOVIMetadata.mapping` 直读(libplacebo/mpv 运行时同款),消费 = libplacebo `pl_shader_dovi_reshape` 的 Metal 逐行转写(ToneMapProcessor/EDRRenderer,shader 直算 poly/MMR),CPU 参考实现 `DolbyVisionReshape` 做镜像基准;libdovi 不进运行时,仅测试期金标准。NLQ(P7 EL)仍未做(既定范围外)
 - AV1 HDR(等 AV1 decoder 接入后再加 case)
 - HDR Vivid(国内标准,等需求)
 - DisplayCapability 的实时 NSScreen 监听(初版硬编码 1000 nits target,后续接 `NSScreen.maximumExtendedDynamicRangeColorComponentValue`)
