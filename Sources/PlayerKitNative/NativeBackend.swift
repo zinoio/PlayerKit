@@ -112,6 +112,15 @@ public final class NativeBackend: PlayerBackend {
     /// Set by PlayerController based on the user's quality preference.
     public nonisolated(unsafe) var preferredMaxVideoWidth: Int = 0
 
+    /// 帧率匹配(zyno#106):按内容帧率设显示链路的 preferredFrameRateRange
+    /// (24/25/30p → 保守倍频 48/50/60Hz,2:2 pulldown 消 3:2 judder;≥50p 用
+    /// 原速)。默认开;个别电视对非 60Hz 模式兼容差时可关(关 = 回退固定
+    /// (60,120,120) 旧行为)。切换即时生效;demux 循环报到真实 fps 时同样
+    /// 即时套用(含混帧率内容的热切换)。
+    public var frameRateMatchingEnabled: Bool = true {
+        didSet { applyFrameRateRange() }
+    }
+
     /// 用户字幕语言偏好(zyno#100):开播消费。"off" = 明确不挂内嵌字幕;
     /// nil/空 = 容器默认(旧行为);语言码(如 "zh"/"en")按
     /// TrackLanguageMatcher 匹配(精确 > 前缀 > 容器默认)。设置页改值后
@@ -279,6 +288,11 @@ public final class NativeBackend: PlayerBackend {
     private nonisolated(unsafe) var demuxLoopDemuxer: (any PacketDemuxing)?
     private var displayLink: CADisplayLink?
     private var displayLinkProxy: DisplayLinkProxy?
+    /// zyno#106: real content fps as reported by the demux loop (single
+    /// writer on the demux thread, read on the main actor). Benign race —
+    /// Double stores are atomic on arm64 and a one-frame-late refresh-rate
+    /// update is harmless.
+    private nonisolated(unsafe) var contentFps: Double = 0
     /// P2: iOS/tvOS display-link host thread (see startDisplayLink). Owned by
     /// main-thread lifecycle code; the thread itself runs a dedicated runloop.
     private var displayLinkThread: Thread?
@@ -1325,7 +1339,11 @@ public final class NativeBackend: PlayerBackend {
                 // 120fps 内容仍然卡在 24fps 假设算出的 60 帧(0.5s)上限，表现为
                 // "开播→弹一帧→冻结4秒"，跟从没做过这个修复一模一样。
                 if fr.num > 0 && fr.den > 0 {
-                    jitter.configureFrameRate(Double(fr.num) / Double(fr.den))
+                    let fps = Double(fr.num) / Double(fr.den)
+                    jitter.configureFrameRate(fps)
+                    // zyno#106: 真实 fps 同时喂给显示链路做刷新率匹配
+                    // (24/25/30p → 保守倍频;混帧率内容 fps 变化时热切换)。
+                    self?.noteContentFrameRate(fps)
                 }
             } else {
                 frameDuration = 1.0/25.0
@@ -3082,6 +3100,34 @@ public final class NativeBackend: PlayerBackend {
 
     // MARK: - Display link
 
+    /// Demux thread: the demux loop just (re)read the stream's real fps.
+    /// Debounces (first report, or ≥0.5fps delta for mixed-rate content) and
+    /// hops the display-link update to main — CADisplayLink host objects are
+    /// only poked from the main actor.
+    private nonisolated func noteContentFrameRate(_ fps: Double) {
+        let previous = contentFps
+        contentFps = fps
+        guard previous == 0 || abs(fps - previous) >= 0.5 else { return }
+        DispatchQueue.main.async { [weak self] in
+            self?.applyFrameRateRange()
+        }
+    }
+
+    /// Main actor: apply the content-derived preferredFrameRateRange to the
+    /// live display link. No-op on macOS — CVDisplayLink follows the screen;
+    /// display-mode switching there is a separate, larger project. No-op
+    /// without a live link (applied again by startDisplayLink on next play).
+    private func applyFrameRateRange() {
+        #if os(iOS) || os(tvOS)
+        guard let link = displayLink else { return }
+        guard #available(iOS 15.0, tvOS 15.0, *) else { return }
+        let range = FrameRateMatcher.displayRange(contentFps: contentFps, matchingEnabled: frameRateMatchingEnabled)
+        // CAFrameRateRange is Float-typed on iOS/tvOS (the macOS variant of
+        // CADisplayLink takes Double — irrelevant here, this file is #if'd).
+        link.preferredFrameRateRange = CAFrameRateRange(minimum: Float(range.minimum), maximum: Float(range.maximum), preferred: Float(range.preferred))
+        #endif
+    }
+
     private func startDisplayLink() {
         displayLinkStartWallTime = CACurrentMediaTime()
         displayLoopLock.withLock { firstTickLogged = false; displayLoopStopped = false }
@@ -3090,12 +3136,6 @@ public final class NativeBackend: PlayerBackend {
         displayLinkProxy = proxy
         displayLink?.invalidate()
         let link = CADisplayLink(target: proxy, selector: #selector(DisplayLinkProxy.tick))
-        // Request high refresh rate for smooth video — 25fps/24fps content on
-        // 60Hz suffers visible 3:2 pulldown judder (33/50ms alternating gaps).
-        // At 120Hz the same content maps to ~5-tick gaps (41ms), near-perfect.
-        if #available(iOS 15.0, tvOS 15.0, *) {
-            link.preferredFrameRateRange = CAFrameRateRange(minimum: 60, maximum: 120, preferred: 120)
-        }
         // P2: run the display link on a dedicated background runloop thread
         // instead of .main — video presentation no longer competes with UI work.
         // The link is registered from inside the thread (a CADisplayLink must be
@@ -3103,6 +3143,12 @@ public final class NativeBackend: PlayerBackend {
         // main thread and handing it over is fine). stop()/pause()/seek() set
         // displayLoopStopped, the loop notices within 0.5s and exits.
         displayLink = link
+        // zyno#106: match the refresh rate to the content fps (24p → 48Hz
+        // preferred = even 2:2 gaps, no 3:2 judder) instead of pinning 120Hz.
+        // Before the demux loop reports the real fps — and whenever
+        // frameRateMatchingEnabled is off — this applies the legacy fixed
+        // range, i.e. exactly the pre-#106 behavior.
+        applyFrameRateRange()
         let thread = Thread { [weak self] in
             let rl = RunLoop.current
             link.add(to: rl, forMode: .common)
