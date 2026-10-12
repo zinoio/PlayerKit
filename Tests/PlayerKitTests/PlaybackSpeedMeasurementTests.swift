@@ -27,12 +27,17 @@ final class PlaybackSpeedMeasurementTests: XCTestCase {
 
     /// Plays `url` for `wallSeconds` of wall clock; returns (positionAdvance,
     /// wallAdvance, samples) measured from the moment position first leaves 0.
-    private func measurePlaybackSpeed(url: URL, wallSeconds: Double) async throws
+    /// `rate` is applied before play() so the open path carries it into the
+    /// freshly-built output (see NativeBackend._finishOpen).
+    private func measurePlaybackSpeed(url: URL, wallSeconds: Double, rate: Double = 1.0) async throws
         -> (positionAdvance: Double, wallAdvance: Double, samples: [(Double, Double)]) {
         let backend = try await MainActor.run { try NativeBackend() }
         defer { Task { @MainActor in backend.stop() } }
 
-        await MainActor.run { backend.play(url: url, headers: [:], seekTo: nil) }
+        await MainActor.run {
+            backend.setRate(rate)
+            backend.play(url: url, headers: [:], seekTo: nil)
+        }
 
         var samples: [(Double, Double)] = []   // (wall, positionSecs)
         let start = Date()
@@ -64,6 +69,7 @@ final class PlaybackSpeedMeasurementTests: XCTestCase {
 
     private func assertApproximatelyRealtime(
         _ name: String, _ result: (positionAdvance: Double, wallAdvance: Double, samples: [(Double, Double)]),
+        expected: Double = 1.0,
         file: StaticString = #filePath, line: UInt = #line) {
         guard result.wallAdvance > 1.0 else {
             XCTFail("\(name): playback never started (position stayed at 0); samples=\(result.samples.count)",
@@ -74,8 +80,8 @@ final class PlaybackSpeedMeasurementTests: XCTestCase {
         print("[speed-test] \(name): position +\(String(format: "%.2f", result.positionAdvance))s "
             + "over wall +\(String(format: "%.2f", result.wallAdvance))s → \(String(format: "%.2f", speed))x "
             + "(\(result.samples.count) samples)")
-        XCTAssertLessThanOrEqual(abs(speed - 1.0), Self.tolerance,
-            "\(name) plays at \(String(format: "%.2f", speed))x — position must advance ≈ wall clock",
+        XCTAssertLessThanOrEqual(abs(speed - expected), Self.tolerance,
+            "\(name) plays at \(String(format: "%.2f", speed))x — position must advance ≈ \(expected)x wall clock",
             file: file, line: line)
     }
 
@@ -91,5 +97,22 @@ final class PlaybackSpeedMeasurementTests: XCTestCase {
         let r = try await measurePlaybackSpeed(
             url: fixtureURL("speed_aac44_stereo", "mp4"), wallSeconds: 9.0)
         assertApproximatelyRealtime("AAC/MP4", r)
+    }
+
+    /// 2x end-to-end (zyno#99): position (content time) must advance ~2s per
+    /// wall second through the full real pipeline — WSOLA tempo on the decode
+    /// path, rate-scaled AudioClock, rate-normalized SyncController.
+    /// Uses the 60s concat fixtures: at 2x a 30s fixture hits EOF after 15s
+    /// of wall clock, and the EOF stall would dominate the 9s window.
+    func testDTS_MKV_Rate2xAdvancesPositionTwiceAsFast() async throws {
+        let r = try await measurePlaybackSpeed(
+            url: fixtureURL("speed_dts48_51_60s", "mkv"), wallSeconds: 9.0, rate: 2.0)
+        assertApproximatelyRealtime("DTS/MKV@2x", r, expected: 2.0)
+    }
+
+    func testAAC_MP4_Rate2xAdvancesPositionTwiceAsFast() async throws {
+        let r = try await measurePlaybackSpeed(
+            url: fixtureURL("speed_aac44_stereo_60s", "mp4"), wallSeconds: 9.0, rate: 2.0)
+        assertApproximatelyRealtime("AAC/MP4@2x", r, expected: 2.0)
     }
 }

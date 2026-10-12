@@ -120,21 +120,7 @@ public struct FFmpegMediaProbe: MediaProbable {
                 }
 
                 // --- Chapters ---
-                let nbChapters = Int(fmtCtx.pointee.nb_chapters)
-                for i in 0..<nbChapters {
-                    guard let chPtr = fmtCtx.pointee.chapters[i] else { continue }
-                    let ch = chPtr.pointee
-                    let tb = ch.time_base
-
-                    var chapterTitle: String?
-                    if let entry = av_dict_get(ch.metadata, "title", nil, 0) {
-                        chapterTitle = String(cString: entry.pointee.value)
-                    }
-
-                    let startSec = Double(ch.start) * Double(tb.num) / Double(tb.den)
-                    let endSec = Double(ch.end) * Double(tb.num) / Double(tb.den)
-                    chapters.append(ChapterInfo(title: chapterTitle, startDuration: startSec, endDuration: endSec))
-                }
+                chapters = FFmpegChapterParser.parse(fmtCtx)
             }
 
             return MediaProbeResult(
