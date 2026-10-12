@@ -387,6 +387,23 @@ public final class NativeBackend: PlayerBackend {
     /// (stddev / maxJump / signFlips) make one visible. Guarded by
     /// displayLoopLock. Units: seconds.
     private nonisolated(unsafe) var avOffsetStats = SyncDiagStats()
+    /// [diag] Display-order integrity: distribution of the PTS interval between
+    /// consecutive DISPLAYED frames (track-switch 画面来回晃/闪 localization,
+    /// 2026-10-13). With B-frames the jitter buffer's PTS-sorted insertion is
+    /// what restores display order; if the PTS pipeline is disturbed (see
+    /// diagPTSRewriteCount) frames display in decode order and this interval
+    /// stops sitting at the source frame duration — it alternates (e.g.
+    /// 20.8/62.5ms at 23.976fps) or goes negative instead of a flat ~41.7ms.
+    /// Intervals outside ±1s are treated as seek discontinuities and dropped.
+    /// Guarded by displayLoopLock. Units: seconds.
+    private nonisolated(unsafe) var shownGapStats = SyncDiagStats()
+    private nonisolated(unsafe) var lastShownDiagPTS: Double = -.infinity
+    /// [diag] Frames whose PTS the demux-side PTSValidator REWROTE (synthesized
+    /// blind-clock PTS, >5s anomaly). A rewritten PTS no longer reflects the
+    /// frame's true display time, so PTS-ordered insertion can no longer undo
+    /// decoder reorder — the count is the direct signature of that failure.
+    /// Reset per log window. Guarded by displayLoopLock.
+    private nonisolated(unsafe) var diagPTSRewriteCount = 0
     /// [diag] Seek-landing capture: target set in _seek, consumed by the
     /// one-shot log on the first displayed frame after it. Guarded by
     /// displayLoopLock.
@@ -1405,6 +1422,15 @@ public final class NativeBackend: PlayerBackend {
                         pts = rawPTS
                     } else {
                         pts = ptsValidator.validate(rawPTS)
+                        // [diag] count rewritten PTS (blind clock / anomaly path)
+                        // — see diagPTSRewriteCount. A rewritten PTS is a
+                        // synthesized uniform timestamp, so the frame's true
+                        // display time is gone and decoder reorder can no longer
+                        // be undone by PTS-sorted insertion (track-switch
+                        // 画面来回晃 localization, 2026-10-13).
+                        if rawPTS.isFinite, abs(pts - rawPTS) > 0.0005 {
+                            displayLoopLock.withLock { self.diagPTSRewriteCount += 1 }
+                        }
                     }
                     // Track download progress (highest video PTS read so far)
                     if rawPTS.isFinite && rawPTS > maxDownloadedPts { maxDownloadedPts = rawPTS }
@@ -2160,6 +2186,15 @@ public final class NativeBackend: PlayerBackend {
             // [diag] every displayed frame feeds the offset distribution; the
             // first frame after a seek also logs the video landing error.
             avOffsetStats.record(popped.pts - audioTime)
+            // [diag] display-order integrity: interval between consecutive
+            // displayed frames' PTS. Continuous playback sits at the source
+            // frame duration; decode-order display (broken PTS) alternates or
+            // goes negative. ±1s guard drops seek jumps — see shownGapStats.
+            let shownGap = popped.pts - lastShownDiagPTS
+            if shownGap.isFinite, shownGap > -1.0, shownGap < 1.0 {
+                shownGapStats.record(shownGap)
+            }
+            lastShownDiagPTS = popped.pts
             if !seekLandLogged, let target = pendingSeekLandTarget {
                 seekLandLogged = true
                 logger.info("[diag] seek videoLand=\(String(format:"%+.3f", popped.pts - target), privacy: .public)s target=\(String(format:"%.3f", target), privacy: .public)s pts=\(String(format:"%.3f", popped.pts), privacy: .public)s")
@@ -2250,6 +2285,14 @@ public final class NativeBackend: PlayerBackend {
         }
         let aq = audioClock.drainAdvanceDiag()
         let tick = drainTickDiag()
+        // [diag] display-order integrity window + PTS rewrites since last log.
+        let (shown, rewrites) = displayLoopLock.withLock { () -> (SyncDiagStats, Int) in
+            let s = shownGapStats
+            shownGapStats.reset()
+            let r = diagPTSRewriteCount
+            diagPTSRewriteCount = 0
+            return (s, r)
+        }
         // state/demuxer reads + the cacheSpeed write stay on the main actor;
         // the whole log line hops (5s cadence — the hop costs nothing).
         DispatchQueue.main.async { [weak self] in
@@ -2264,6 +2307,11 @@ public final class NativeBackend: PlayerBackend {
             // [diag] where ticks went: drain=skip-behind pops, stall=freeze-ahead
             // ticks, deny=SyncController refusals, appends=decode supply.
             logger.info("[diag] tick[drain=\(tick.drainLag, privacy: .public) stall=\(tick.stallAhead, privacy: .public) deny=\(tick.checkDeny, privacy: .public) noFrame=\(tick.noFrame, privacy: .public) guardSkip=\(tick.guardSkip, privacy: .public) appends=\(tick.appends, privacy: .public) depth[n=\(tick.drainDepth.count, privacy: .public) mean=\(String(format:"%.0f", tick.drainDepth.mean*1000), privacy: .public)ms max=\(String(format:"%.0f", tick.drainDepth.max*1000), privacy: .public)ms]]")
+            // [diag] display-order integrity (2026-10-13): gap = pts interval
+            // between displayed frames. Healthy 23.976fps content: min≈max≈41.7ms.
+            // Decode-order display (broken PTS): min≈20.8 / max≈62.5 (or negative).
+            // rewrites = frames whose PTS the validator synthesized this window.
+            logger.info("[diag] show[n=\(shown.count, privacy: .public) mean=\(String(format:"%.1f", shown.mean*1000), privacy: .public)ms min=\(String(format:"%.1f", shown.min*1000), privacy: .public)ms max=\(String(format:"%.1f", shown.max*1000), privacy: .public)ms jump=\(String(format:"%.1f", shown.maxJump*1000), privacy: .public)ms] rewrites=\(rewrites, privacy: .public)")
 
             // Throughput: bytes read since last sample / elapsed.
             let (bytesDelta, tpElapsed): (Int64, Double) = displayLoopLock.withLock {
@@ -2799,17 +2847,39 @@ public final class NativeBackend: PlayerBackend {
             recreateAudioOutput()
             return
         }
+        // Millisecond precision: components.seconds alone truncates to whole
+        // seconds, seeking up to 1s behind the position being watched (and
+        // anchoring audioClock there).
         let posSecs = Double(state.position.components.seconds)
+            + Double(state.position.components.attoseconds) / 1e18
         _ = demuxer.seek(to: posSecs)
         if let stream = demuxer.audioStream {
             audioDecoder = FFmpegAudioDecoder(stream: stream, sampleRate: 44100, channels: 2)
         }
+        // Flush the video pipeline INSIDE demuxLock, same as performDemuxerSeek:
+        // the demux loop is blocked here, so no post-landing frame can slip in
+        // and be wiped by the flush, and no pre-switch frame in flight in the
+        // decoder can survive past it.
+        videoDecoder?.flush()
+        jitterBuffer.flush()
+        // The demuxer has just jumped physically. The demux loop resets the
+        // PTSValidator ONLY on a physicalSeekGeneration change (see
+        // performDemuxerSeek) — without this bump the validator keeps the
+        // pre-switch baseline, reads the landing keyframe as a >5s anomaly and
+        // enters its blind clock: every subsequent PTS is SYNTHESIZED as
+        // (+1 frame duration), so the jitter buffer's PTS-ordered insertion
+        // degenerates to decode order and B-frames display out of order. On
+        // fast motion the picture then visibly rocks back and forth, and it
+        // never recovers — predicted and real timestamps advance at the same
+        // rate, so the |pts - predict| < 1s exit can never fire — until a real
+        // seek resets the validator (2026-10-13 切音轨后画面来回晃: the
+        // validator reset is exactly why seek "fixed" it).
+        physicalSeekGeneration += 1
         seekLock.withLock { seekSerial += 1; seekLandedSerial = seekSerial }   // seeked synchronously above
         demuxLock.unlock()
 
-        // 4. Flush video pipeline
-        videoDecoder?.flush()
-        jitterBuffer.flush()
+        // 4. Flush the rest of the pipeline (the video decoders and the jitter
+        // buffer were flushed under demuxLock above).
         syncController.reset()
         displayLoopLock.withLock { lastBypassPopTime = 0 }
         _renderer.flush()
