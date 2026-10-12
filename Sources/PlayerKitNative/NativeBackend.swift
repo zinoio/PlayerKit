@@ -1508,7 +1508,7 @@ public final class NativeBackend: PlayerBackend {
                         diagAppendCount += 1
                         if diagAppendCount <= 200, Self.diagLoggingEnabled {
                             let regressed = framePts < diagLastAppendedPts
-                            logger.info("[diag] append#\(diagAppendCount) framePts=\(String(format:"%.3f",framePts)) decoderPts=\(frame.pts.map { String(format:"%.3f",$0) } ?? "nil") bounded=\(diagBounded) rawPTS=\(String(format:"%.3f",rawPTS)) REGRESSED=\(regressed)")
+                            logger.info("[diag] append#\(diagAppendCount, privacy: .public) framePts=\(String(format:"%.3f",framePts), privacy: .public) decoderPts=\(frame.pts.map { String(format:"%.3f",$0) } ?? "nil", privacy: .public) bounded=\(diagBounded, privacy: .public) rawPTS=\(String(format:"%.3f",rawPTS), privacy: .public) REGRESSED=\(regressed, privacy: .public)")
                         }
                         diagLastAppendedPts = framePts
                         jitter.append(.init(pixelBuffer: frame.pixelBuffer, pts: framePts, metadata: frame.metadata))
