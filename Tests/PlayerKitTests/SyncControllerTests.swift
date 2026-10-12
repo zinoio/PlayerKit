@@ -100,4 +100,57 @@ final class SyncControllerTests: XCTestCase {
         let (show, _) = ctrl.check(nextPTS: 0.0, followingPTS: 0.04, audioTime: 0.0, now: now, serial: 0)
         XCTAssertTrue(show, "reset 后应视为首帧，立即显示")
     }
+
+    // MARK: - Playback rate normalization (zyno#99)
+
+    /// Rate normalization: at rate r the pacing target is nominal/r and the
+    /// latency compensation is a wall-clock display delay worth latComp×r of
+    /// CONTENT time. With diff=0 the steady-state delay at 2x is exactly half
+    /// the nominal frame duration — 24fps content at 2x paces one frame per
+    /// ~20.8ms of wall clock.
+    func testRate2xSteadyStateDelayIsNominalOverRate() {
+        let ctrl = SyncController()
+        let now = 1000.0
+        let (_, d0) = ctrl.check(nextPTS: 0.0, followingPTS: 0.04, audioTime: 0.0, now: now, serial: 0, rate: 2.0)
+        ctrl.advance(delay: d0, pts: 0.0, followingPTS: 0.04, audioTime: 0.0, now: now)
+
+        // diff = 0 requires audioTime = nextPTS - latComp×r = 0.04 - 0.10.
+        let (_, delay) = ctrl.check(nextPTS: 0.04, followingPTS: 0.08,
+                                    audioTime: 0.04 - 0.05 * 2.0, now: now + 0.02, serial: 0, rate: 2.0)
+        XCTAssertEqual(delay, 0.04 / 2.0, accuracy: 0.0005,
+                       "steady-state delay at 2x must be nominal/2")
+    }
+
+    /// The low-pass gain is also divided by r: the same 40ms CONTENT-time
+    /// lag corrects with (α/r)·diff, so 2x converges with the same wall-clock
+    /// character as 1x (no double-speed correction, no residual offset).
+    func testRate2xLowPassGainNormalized() {
+        let ctrl = SyncController()
+        let now = 1000.0
+        let (_, d0) = ctrl.check(nextPTS: 0.0, followingPTS: 0.04, audioTime: 0.0, now: now, serial: 0, rate: 2.0)
+        ctrl.advance(delay: d0, pts: 0.0, followingPTS: 0.04, audioTime: 0.0, now: now)
+
+        // audioTime 40ms content-behind the compensated target: diff = -0.04.
+        // (audioTime = nextPTS - latComp×r - diff = 0.04 - 0.10 + 0.04)
+        let (_, delay) = ctrl.check(nextPTS: 0.04, followingPTS: 0.08,
+                                    audioTime: 0.04 - 0.05 * 2.0 + 0.04, now: now + 0.02, serial: 0, rate: 2.0)
+        // delay = 0.04/2 + (0.15/2)·(-0.04) = 0.02 - 0.003
+        XCTAssertEqual(delay, 0.017, accuracy: 0.0005)
+    }
+
+    /// Default-argument regression: existing 1x callers (tests included) keep
+    /// byte-for-byte the pre-rate delay math.
+    func testDefaultRateIsOne() {
+        let withDefault = SyncController()
+        let explicit1x = SyncController()
+        let now = 1000.0
+        for c in [withDefault, explicit1x] {
+            let (_, d) = c.check(nextPTS: 0.0, followingPTS: 0.04, audioTime: 0.0, now: now, serial: 0)
+            c.advance(delay: d, pts: 0.0, followingPTS: 0.04, audioTime: 0.0, now: now)
+        }
+        let (_, dDefault) = withDefault.check(nextPTS: 0.04, followingPTS: 0.08, audioTime: 0.02, now: now + 0.04, serial: 0)
+        let (_, d1x) = explicit1x.check(nextPTS: 0.04, followingPTS: 0.08, audioTime: 0.02, now: now + 0.04, serial: 0, rate: 1.0)
+        XCTAssertEqual(dDefault, d1x, accuracy: 1e-12)
+        XCTAssertEqual(d1x, 0.0355, accuracy: 0.001)
+    }
 }

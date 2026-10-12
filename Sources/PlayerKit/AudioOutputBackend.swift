@@ -36,4 +36,9 @@ public protocol AudioOutputBackend: AnyObject {
 public extension AudioOutputBackend {
     /// Default: no playback clock — NativeBackend falls back to its AudioClock.
     var playbackTime: Double? { nil }
+    /// Default: rate is ignored (no real clock or no tempo support). Backends
+    /// that consume PCM at a device-fixed rate implement this so their
+    /// content-time accounting converts consumed OUTPUT samples back to
+    /// CONTENT samples (playback rate ≠ output sample rate).
+    func setPlaybackRate(_ rate: Double) {}
 }

@@ -352,6 +352,7 @@ public final class AudioUnitOutput: AudioOutputBackend {
         lock.lock()
         if bufferedFrameCount > 0 { bufferedFrameCount &-= 1 }
         let ch = _channels
+        let rate = _playbackRate
         let isPrimer = pendingPrimerCallbacks > 0
         if isPrimer { pendingPrimerCallbacks -= 1 }
         else {
@@ -364,11 +365,26 @@ public final class AudioUnitOutput: AudioOutputBackend {
         lock.unlock()
         // Route primer callbacks to advancePrimer() so _primerPendingSamples in
         // AudioClock stays accurate for calibrate() after a position reset.
+        // Primer buffers are silent and carry no content time, so they are NOT
+        // rate-scaled — the primer debt in startPrimer() is recorded in output
+        // samples and must cancel exactly.
         if isPrimer {
             clock.advancePrimer(byteCount: byteCount, channels: ch)
         } else {
-            clock.advance(byteCount: byteCount, channels: ch)
+            // Tempo path: the queue holds rate-scaled PCM, so convert consumed
+            // OUTPUT samples back to CONTENT samples for the clock (zyno#99).
+            clock.advance(byteCount: byteCount, channels: ch, rate: rate)
         }
+    }
+
+    /// Playback rate for content-time accounting (see _callbackConsumed).
+    /// Guarded by `lock`.
+    private var _playbackRate: Double = 1.0
+
+    public func setPlaybackRate(_ rate: Double) {
+        lock.lock()
+        _playbackRate = max(0.25, min(4.0, rate.isFinite ? rate : 1.0))
+        lock.unlock()
     }
 
     /// Proxy for clock.audioTime.

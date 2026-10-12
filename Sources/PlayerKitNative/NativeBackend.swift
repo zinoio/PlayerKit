@@ -170,6 +170,9 @@ public final class NativeBackend: PlayerBackend {
     // A/V sync modules
     private let audioClock = AudioClock()
     private var audioUnitOutput: AudioUnitOutput?
+    /// Playback-rate time-stretch, fed between the audio decoder and the
+    /// AudioUnitOutput on the audioDecodeQueue (rate≠1 only; 1x bypasses).
+    private let audioTempo = PlaybackTempoProcessor()
     /// True only when compressed audio passthrough is actually in use (macOS
     /// with HDMI/SPDIF). On iOS/tvOS passthrough is disabled and PCM decode
     /// via AudioUnitOutput drives the audioClock normally.
@@ -342,6 +345,12 @@ public final class NativeBackend: PlayerBackend {
     /// Guarded by displayLoopLock.
     private nonisolated(unsafe) var forceClockCalibration = false
 
+    /// Playback rate snapshot for the nonisolated display loop (zyno#99):
+    /// setRate() runs on the main actor, displayNextFrame() must not touch
+    /// `state` directly. Written before it's read (setRate assigns both).
+    /// Guarded by displayLoopLock.
+    private nonisolated(unsafe) var displayRate: Double = 1.0
+
     /// Guards render configuration (`colorParams`, `rendererStrategy`) and the
     /// frame-sink list: written on the main actor (stream open / addFrameSink),
     /// read every display tick. Since P2 those run concurrently.
@@ -384,8 +393,16 @@ public final class NativeBackend: PlayerBackend {
     }
 
     public func play(url: URL, headers: [String: String], seekTo: Duration?, knownDuration: Duration? = nil) {
+        // Capture the rate BEFORE stop(): stop() ends with `state = PlayerState()`
+        // (rate back to 1.0), so a capture after it always reads 1.0 and the
+        // restore below was a no-op — the 2x end-to-end test opened at 1x.
+        let previousRate = state.rate
         stop()
         state = PlayerState()
+        // Rate is a user preference — it survives open (play() resets all
+        // playback state, but a speed the user picked before open must still
+        // apply to the new item; _finishOpen wires it into the new output).
+        state.rate = previousRate
         state.isBuffering = true
         notifyStateChange()
 
@@ -434,8 +451,16 @@ public final class NativeBackend: PlayerBackend {
     public func play(reader: any MediaRandomAccessReader,
                      seekTo: Duration?,
                      knownDuration: Duration? = nil) {
+        // Capture the rate BEFORE stop(): stop() ends with `state = PlayerState()`
+        // (rate back to 1.0), so a capture after it always reads 1.0 and the
+        // restore below was a no-op — the 2x end-to-end test opened at 1x.
+        let previousRate = state.rate
         stop()
         state = PlayerState()
+        // Rate is a user preference — it survives open (play() resets all
+        // playback state, but a speed the user picked before open must still
+        // apply to the new item; _finishOpen wires it into the new output).
+        state.rate = previousRate
         state.isBuffering = true
         notifyStateChange()
 
@@ -487,8 +512,16 @@ public final class NativeBackend: PlayerBackend {
 
     public func play(concatURLs: [URL], headers: [String: String],
                      seekTo: Duration?, knownDuration: Duration? = nil) {
+        // Capture the rate BEFORE stop(): stop() ends with `state = PlayerState()`
+        // (rate back to 1.0), so a capture after it always reads 1.0 and the
+        // restore below was a no-op — the 2x end-to-end test opened at 1x.
+        let previousRate = state.rate
         stop()
         state = PlayerState()
+        // Rate is a user preference — it survives open (play() resets all
+        // playback state, but a speed the user picked before open must still
+        // apply to the new item; _finishOpen wires it into the new output).
+        state.rate = previousRate
         state.isBuffering = true
         notifyStateChange()
 
@@ -584,8 +617,16 @@ public final class NativeBackend: PlayerBackend {
     public func play(clips: [(reader: any MediaRandomAccessReader, durationSecs: Double)],
                      seekTo: Duration?,
                      knownDuration: Duration? = nil) {
+        // Capture the rate BEFORE stop(): stop() ends with `state = PlayerState()`
+        // (rate back to 1.0), so a capture after it always reads 1.0 and the
+        // restore below was a no-op — the 2x end-to-end test opened at 1x.
+        let previousRate = state.rate
         stop()
         state = PlayerState()
+        // Rate is a user preference — it survives open (play() resets all
+        // playback state, but a speed the user picked before open must still
+        // apply to the new item; _finishOpen wires it into the new output).
+        state.rate = previousRate
         state.isBuffering = true
         notifyStateChange()
 
@@ -964,6 +1005,9 @@ public final class NativeBackend: PlayerBackend {
         // 微秒级窗口放大到秒级,竞态几乎必现。
         if let out = audioUnitOutput, let dec = audioDecoder {
             out.start(sampleRate: dec.outputSampleRate, channels: dec.outputChannels)
+            // Align the tempo pipeline with the stream format (zyno#99).
+            audioTempo.reset(sampleRate: dec.outputSampleRate, channels: dec.outputChannels)
+            out.setPlaybackRate(state.rate)
             // Pause immediately — jitterBuffer.onStateChange will resume when
             // enough video is buffered (resumeDuration = 2.0s). Without this,
             // audio runs freely during the initial BUFFERING phase and drifts
@@ -1376,13 +1420,17 @@ public final class NativeBackend: PlayerBackend {
                     let usePassthrough: Bool
                     if let injected = _injectedAudioOutput,
                        injected.supportsPassthrough,
-                       demuxer.isPassthroughCodec {
+                       demuxer.isPassthroughCodec,
+                       abs(state.rate - 1.0) < 0.001 {
                         // Passthrough (AC3, E-AC3, DTS, TrueHD) requires a
                         // digital audio output (HDMI ARC / SPDIF). The
                         // AudioOutputBackend.supportsPassthrough property is
                         // responsible for reporting whether the current output
                         // device can actually decode compressed audio — if not,
                         // it returns false and we fall through to PCM decode.
+                        // Playback rate ≠ 1 also forces PCM: a compressed
+                        // bitstream cannot be time-stretched, so tempo needs
+                        // the decoded path (zyno#99).
                         usePassthrough = true
                     } else {
                         usePassthrough = false
@@ -1421,12 +1469,18 @@ public final class NativeBackend: PlayerBackend {
                         audioDecodeQueue.async {
                             let pcm = currentDec?.decode(packet: packet)
                             if let pcm {
+                                // Playback rate: time-stretch the decoded PCM
+                                // before it reaches the AudioQueue (zyno#99).
+                                // Emits 0..n frames; 1x bypasses untouched.
+                                let stretched = self.audioTempo.process(pcm)
                                 var contentPts = Double.nan
                                 if trackContent {
                                     contentPts = packetPts.isFinite ? packetPts : self.playedContentTrackerEnd
                                     self.playedContentTrackerEnd = contentPts + Double(pcm.sampleCount) / outputRate
                                 }
-                                currentOut?.enqueue(pcm, contentPts: contentPts)
+                                for out in stretched {
+                                    currentOut?.enqueue(out, contentPts: contentPts)
+                                }
                             }
                             var p: UnsafeMutablePointer<AVPacket>? = packet
                             av_packet_free(&p)
@@ -1793,6 +1847,7 @@ public final class NativeBackend: PlayerBackend {
             audioTime = audioClock.audioTime
         }
         let serial = seekLock.withLock { seekSerial }
+        let playbackRate = displayLoopLock.withLock { displayRate }
 
         // --- Freeze-ahead / Skip-behind (commercial player A/V sync) ---
         // After the first post-seek frame has been displayed, guard against large
@@ -1809,12 +1864,18 @@ public final class NativeBackend: PlayerBackend {
             (needsClockCalibration, audioClockReady)
         }
         if syncController.hasDisplayedFrame, !stillNeedsCal, clockReady {
+            // Guard window scales with the playback rate (zyno#99): at rate r
+            // the steady-state sync target holds the front frame at
+            // audioTime + displayLatencyCompensation×r (see SyncController
+            // computeDelay), so the window must stay above that — a fixed
+            // 60ms freezes the picture permanently at 2× (comp×r = 100ms).
+            let guardWindow = 0.06 * max(1.0, playbackRate)
             // Drain frames significantly behind audio
-            while let lagging = jitterBuffer.peek(at: 0), lagging.pts < audioTime - 0.06 {
+            while let lagging = jitterBuffer.peek(at: 0), lagging.pts < audioTime - guardWindow {
                 jitterBuffer.pop()
             }
             // Freeze-ahead: if the front frame is ahead of audio, stall
-            if let ahead = jitterBuffer.peek(at: 0), ahead.pts > audioTime + 0.06 {
+            if let ahead = jitterBuffer.peek(at: 0), ahead.pts > audioTime + guardWindow {
                 let pos = Duration.milliseconds(Int64(audioTime * 1000))
                 let due = displayLoopLock.withLock { (pos - lastNotifiedPos) >= .milliseconds(500) }
                 if due {
@@ -1847,7 +1908,8 @@ public final class NativeBackend: PlayerBackend {
                 followingPTS: followingPTS,
                 audioTime: audioTime,
                 now: now,
-                serial: serial
+                serial: serial,
+                rate: playbackRate
             )
         } else {
             // 旁路不再每 tick 弹帧:音频时钟卡死时 audioClockReady 永远为
@@ -2381,7 +2443,13 @@ public final class NativeBackend: PlayerBackend {
         videoDecoder?.flush()
         // Routed through audioDecodeQueue so this can't race a still-in-flight
         // decode() of a pre-seek packet on that queue.
-        audioQueue.sync { audioDecoder?.flush() }
+        audioQueue.sync {
+            audioDecoder?.flush()
+            // Same serial queue as tempo.process() — safe to drop stretch
+            // state for the new position (stale windows would crossfade
+            // pre-seek content into post-seek audio).
+            backend?.audioTempo.reset()
+        }
         // The sync above is a barrier: every packet read from the OLD position has
         // now been decoded and its PCM is already in the audio queue that _seek
         // restarted BEFORE this physical seek landed (a cast at a position is
@@ -2478,7 +2546,19 @@ public final class NativeBackend: PlayerBackend {
     }
 
     public func setVolume(_ volume: Double) { state.volume = volume; notifyStateChange() }
-    public func setRate(_ rate: Double)     { state.rate = rate; notifyStateChange() }
+    public func setRate(_ rate: Double) {
+        let clamped = max(0.25, min(4.0, rate.isFinite ? rate : 1.0))
+        state.rate = clamped
+        displayLoopLock.withLock { displayRate = clamped }
+        // Wire the rate to every consumer (zyno#99 — previously state.rate had
+        // none, which made the UI rate control a no-op on the FFmpeg backend):
+        //   - the tempo processor (audioDecodeQueue reads it per process())
+        //   - the output's content-time accounting (callback → AudioClock)
+        //   - the display loop's guard window and sync normalization
+        audioTempo.setRate(clamped)
+        audioUnitOutput?.setPlaybackRate(clamped)
+        notifyStateChange()
+    }
     public func selectAudioTrack(id: String) {
         guard let demuxer else { return }
         guard let trackId = Int(id) else { return }
@@ -2523,9 +2603,17 @@ public final class NativeBackend: PlayerBackend {
         // 5. Recreate audio output with new decoder's parameters
         let sr = audioDecoder?.outputSampleRate ?? 44100
         let ch = audioDecoder?.outputChannels ?? 2
+        // New stream format → drop stale WSOLA windows (they were sized for the
+        // old sr/ch; a mid-pipeline format change would corrupt the crossfade).
+        // Safe off-queue here: the audioDecodeQueue.sync flush above drained any
+        // in-flight process(), and the demux loop is blocked on demuxLock.
+        audioTempo.reset(sampleRate: sr, channels: ch)
         audioClock.reset(to: posSecs, sampleRate: sr)
         audioUnitOutput = AudioUnitOutput(clock: audioClock)
         audioUnitOutput?.start(sampleRate: sr, channels: ch)
+        // A fresh output starts at rate 1.0 — reapply the current rate or a
+        // track switch silently drops playback speed.
+        audioUnitOutput?.setPlaybackRate(state.rate)
         audioUnitOutput?.pause()
         displayLoopLock.withLock {
             needsClockCalibration = true
@@ -2623,6 +2711,8 @@ public final class NativeBackend: PlayerBackend {
         if let dec = audioDecoder {
             audioUnitOutput?.start(sampleRate: dec.outputSampleRate, channels: dec.outputChannels)
             audioUnitOutput?.pause()
+            // Fresh output defaults to rate 1.0 — carry the current rate over.
+            audioUnitOutput?.setPlaybackRate(state.rate)
         }
     }
 

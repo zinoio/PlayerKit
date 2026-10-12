@@ -34,11 +34,15 @@ final class SyncController {
 
     /// Call every display tick. Returns (shouldDisplay, computedDelay).
     /// Pass the returned delay to advance() when displaying.
+    /// `rate` is the playback rate (1.0 default): the pacing target becomes
+    /// nominal/rate wall-clock per content frame, with the low-pass diff
+    /// normalized the same way — see computeDelay.
     func check(nextPTS: Double,
                followingPTS: Double?,
                audioTime: Double,
                now: Double,
-               serial: Int64) -> (Bool, Double) {
+               serial: Int64,
+               rate: Double = 1.0) -> (Bool, Double) {
 
         lock.lock(); defer { lock.unlock() }
 
@@ -52,7 +56,7 @@ final class SyncController {
         if lastDisplayedPTS < 0 { return (true, 0) }
 
         let nominalDelay = nominalFrameDurationLocked(nextPTS: nextPTS, followingPTS: followingPTS)
-        let delay = computeDelay(nominalDelay: nominalDelay, nextPTS: nextPTS, audioTime: audioTime)
+        let delay = computeDelay(nominalDelay: nominalDelay, nextPTS: nextPTS, audioTime: audioTime, rate: rate)
         return (now >= frameTimer + delay, delay)
     }
 
@@ -83,23 +87,33 @@ final class SyncController {
         return lastDuration > 0 ? lastDuration : 0.04
     }
 
-    private func computeDelay(nominalDelay: Double, nextPTS: Double, audioTime: Double) -> Double {
-        // Continuous low-pass correction: delay = nominal + α·diff, no hard
-        // threshold. The previous `if abs(diff) >= syncThreshold` gate made the
-        // correction kick in/out across consecutive frames as diff hovered near
-        // the threshold, causing delay to oscillate between nominalDelay and
-        // nominalDelay + α·diff → frame pacing jitter / 来回拉扯.
-        // With α=0.1 and typical diff in ±50ms, correction is ±5ms — well below
-        // one-frame duration (~33ms) and imperceptible, but still pulls video
-        // toward audio continuously.
+    private func computeDelay(nominalDelay: Double, nextPTS: Double, audioTime: Double, rate: Double) -> Double {
+        // Rate normalization (zyno#99): both the pacing target and the
+        // low-pass gain are divided by r, so the steady state at any rate is
+        // exactly the 1x steady state expressed on the wall clock —
+        // delay* = nominal/r and diff* = latencyComp×r (the compensation is a
+        // wall-clock display delay, which is comp×r of CONTENT time).
+        // Without the /r gain, the fixed-α correction leaves a constant
+        // −(1−r)·nominal/α content-time offset: at 2x/α=0.15 that is ~133ms
+        // of permanent lip-flap.
+        //
+        // Continuous low-pass correction: delay = nominal/r + (α/r)·diff, no
+        // hard threshold. The previous `if abs(diff) >= syncThreshold` gate
+        // made the correction kick in/out across consecutive frames as diff
+        // hovered near the threshold, causing delay to oscillate between
+        // nominalDelay and nominalDelay + α·diff → frame pacing jitter / 来回拉扯.
+        // With α=0.15 and typical diff in ±50ms, correction is ±5ms per frame
+        // at 1x — well below one-frame duration (~33ms) and imperceptible,
+        // but still pulls video toward audio continuously.
         //
         // displayLatencyCompensation: ASBDLRenderer.enqueue() is async, so the
         // frame actually appears on screen 1-2 vsyncs after we call enqueue.
         // Without this, sync thinks video is on-time but the user perceives
         // audio/subtitles ahead of video. Subtracting the compensation from
         // diff makes sync think video is slightly behind, speeding it up.
-        let diff = nextPTS - audioTime - displayLatencyCompensation
-        let delay = nominalDelay + alpha * diff
+        let r = max(0.25, min(4.0, rate))
+        let diff = nextPTS - audioTime - displayLatencyCompensation * r
+        let delay = nominalDelay / r + (alpha / r) * diff
         return max(0, min(delay, maxDelay))
     }
 }

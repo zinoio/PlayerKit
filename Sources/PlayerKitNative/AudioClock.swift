@@ -31,13 +31,24 @@ final class AudioClock: @unchecked Sendable {
     private let maxAdvanceSeconds: Double = 0.2
 
     /// Called by AudioQueue callback when a real (non-primer) buffer is consumed.
-    func advance(byteCount: Int, channels: Int32) {
+    /// `rate` is the playback rate: the callback reports OUTPUT samples
+    /// (tempo-scaled PCM), while this clock tracks CONTENT time — so the
+    /// sample count is scaled by `rate` before accumulating. The 0.2s cap is
+    /// applied BEFORE the scaling, in the OUTPUT domain: batched callbacks
+    /// report consumed OUTPUT audio (a wall-clock quantity — capping it
+    /// bounds how far audioTime can jump in one callback and keeps the
+    /// skip-behind guard from popping a frame avalanche). Capping after
+    /// scaling instead would silently DISCARD content time at rate>1 (a
+    /// normal 23ms buffer becomes 46ms of content and hits the cap) — the
+    /// clock falls behind the audio actually heard and every rate above 1x
+    /// plays slow.
+    func advance(byteCount: Int, channels: Int32, rate: Double = 1.0) {
         let bytesPerSample = Int(channels) * 4  // float32 interleaved
         guard bytesPerSample > 0, sampleRate > 0 else { return }
-        let samples = Int64(byteCount / bytesPerSample)
         let maxPerCall = Int64(Double(sampleRate) * maxAdvanceSeconds)
-        let clamped = min(samples, maxPerCall)
-        lock.withLock { _consumedSamples += clamped }
+        let outputSamples = min(Int64(byteCount / bytesPerSample), maxPerCall)
+        let scaled = Int64(Double(outputSamples) * max(0.25, min(4.0, rate)))
+        lock.withLock { _consumedSamples += scaled }
     }
 
     /// Called by AudioQueue callback when a primer (silence) buffer is consumed.
