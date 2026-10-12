@@ -93,16 +93,17 @@ public enum DolbyVisionReshape {
     public static func decodeShaped(_ shaped: SIMD3<Float>,
                                     rgbToLms: [[Float]]) -> SIMD3<Float> {
         let lin = SIMD3<Float>(pqEotf(shaped.x), pqEotf(shaped.y), pqEotf(shaped.z))
-        // Row-major → column-major for simd_float3x3.
+        // Row-major → column-major for simd_float3x3. 分步构造:旧工具链对
+        // 内联三维字面量表达式会 type-check 超时(CI 实测)。
         let r = rgbToLms
-        let rgbToLmsM = simd_float3x3(
-            SIMD3<Float>(r[0][0], r[1][0], r[2][0]),
-            SIMD3<Float>(r[0][1], r[1][1], r[2][1]),
-            SIMD3<Float>(r[0][2], r[1][2], r[2][2]))
-        let hpeLms2rgb = simd_float3x3(
-            SIMD3<Float>(3.06441879, -0.65612108, 0.01736321),
-            SIMD3<Float>(-2.16597676, 1.78554118, -0.04725154),
-            SIMD3<Float>(0.10155818, -0.12943749, 1.03004253))
+        let rlCol0 = SIMD3<Float>(r[0][0], r[1][0], r[2][0])
+        let rlCol1 = SIMD3<Float>(r[0][1], r[1][1], r[2][1])
+        let rlCol2 = SIMD3<Float>(r[0][2], r[1][2], r[2][2])
+        let rgbToLmsM = simd_float3x3(rlCol0, rlCol1, rlCol2)
+        let hpeCol0 = SIMD3<Float>(3.06441879, -0.65612108, 0.01736321)
+        let hpeCol1 = SIMD3<Float>(-2.16597676, 1.78554118, -0.04725154)
+        let hpeCol2 = SIMD3<Float>(0.10155818, -0.12943749, 1.03004253)
+        let hpeLms2rgb = simd_float3x3(hpeCol0, hpeCol1, hpeCol2)
         let rgb = hpeLms2rgb * (rgbToLmsM * lin)
         return SIMD3<Float>(pqOetf(rgb.x), pqOetf(rgb.y), pqOetf(rgb.z))
     }
