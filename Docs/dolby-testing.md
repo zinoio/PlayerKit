@@ -16,14 +16,15 @@
 | EDR 探测(三端) | ✅ | `DisplayCapability.probeCurrent()` | mac NSScreen / iOS/tvOS potentialEDRHeadroom |
 | P7 EL(BL+EL 双层) | ❌ 决策不做 | — | FEL 硬件稀少,降级 BL(HDR10)已可接受 |
 | Dolby 官方认证 | ❌ 商业不做 | — | 含官方 logo 授权;客户端徽章用描述性文字 lockup |
-| RPU reshape | ❌ 未做 | — | P5 完整还原需 Rust libdovi;当前 IPT 几何近似 + L2/L3 已接近 |
+| RPU reshape(P5/P8 compat 0/4) | ✅ | `DoviReshapingCurve` + `DolbyVisionReshape`(CPU 参考)+ 两 shader 直算(`DoViReshapeShaderTests` GPU e2e) | libplacebo `pl_shader_dovi_reshape` 逐行转写;curve 来自 ffmpeg `AVDOVIMetadata.mapping`;libdovi 仅测试金标准 |
 | PQ 10-bit 输出 | ❌ 未做 | — | tone map 目标现为 SDR 203 / EDR 1000 nits |
 | AC-4 音频 | ❌ 零处理 | — | Apple 生态少见 |
 | Atmos JOC 精确检测 | ❌ 启发式 | — | TrueHD profile / E-AC3 title 启发式够用 |
 
 竞品坐标:Infuse/VidHub 的 DV 能力来自 Apple 系统授权管道(ATV 系统直出),
-自研渲染器内的 L1/L2/L3 消费与 P5 IPT 修复是本项目独有;完整 reshape 行业
-仅 mpv/libplacebo(libdovi)系实现。
+自研渲染器内的 L1/L2/L3 消费与 P5 IPT 修复是本项目独有;RPU reshape 自
+issue #13 起与 mpv/libplacebo 同源同语义(同款 ffmpeg metadata 数据源 +
+逐行转写的 shader 消费),对齐验证走 `DoViReshapeShaderTests` CPU 镜像。
 
 ## 测试分层
 

@@ -17,6 +17,12 @@ public struct FrameMetadata: Sendable, Equatable {
     /// FFmpeg software (VT strips the RPU).
     public var dovi: DolbyVisionFrameMetadata?
 
+    /// Dolby Vision RPU reshaping curve (P5 / P8 compat 0/4). Copied from the
+    /// frame's `AVDOVIMetadata.mapping` with libplacebo-style fixed-point
+    /// conversion. `nil` = no usable curve — consumers fall back to the IPT
+    /// geometric approximation chain (`DolbyVisionColorSignal`).
+    public var doviReshape: DoviReshapingCurve?
+
     /// HDR10+ ST 2094-40 dynamic metadata (per-frame bezier curve).
     /// Present only for HDR10+ streams decoded via FFmpeg SW.
     public var hdr10Plus: HDR10PlusFrameMetadata?
@@ -34,11 +40,13 @@ public struct FrameMetadata: Sendable, Equatable {
     public init(dovi: DolbyVisionFrameMetadata?,
                 hdr10Plus: HDR10PlusFrameMetadata?,
                 masteringDisplay: MasteringDisplayMetadata?,
-                contentLightLevel: ContentLightLevelMetadata?) {
+                contentLightLevel: ContentLightLevelMetadata?,
+                doviReshape: DoviReshapingCurve? = nil) {
         self.dovi = dovi
         self.hdr10Plus = hdr10Plus
         self.masteringDisplay = masteringDisplay
         self.contentLightLevel = contentLightLevel
+        self.doviReshape = doviReshape
     }
 }
 
