@@ -112,6 +112,15 @@ public final class NativeBackend: PlayerBackend {
     /// Set by PlayerController based on the user's quality preference.
     public nonisolated(unsafe) var preferredMaxVideoWidth: Int = 0
 
+    /// 用户字幕语言偏好(zyno#100):开播消费。"off" = 明确不挂内嵌字幕;
+    /// nil/空 = 容器默认(旧行为);语言码(如 "zh"/"en")按
+    /// TrackLanguageMatcher 匹配(精确 > 前缀 > 容器默认)。设置页改值后
+    /// 下一次 play() 生效。
+    public var preferredSubtitleLanguage: String?
+    /// 用户音轨语言偏好(zyno#100):开播消费。"default"/nil/空 = 容器默认
+    /// (旧行为);语言码按 TrackLanguageMatcher 匹配,无匹配则保持容器默认。
+    public var preferredAudioLanguage: String?
+
     /// Strategy resolved once at open time from stream attributes + display
     /// capability + renderer's `prefersTenBit`. Drives decoder selection and
     /// is forwarded to `VideoRenderer.render` every frame so EDRRenderer can
@@ -950,15 +959,29 @@ public final class NativeBackend: PlayerBackend {
             // Auto-select a subtitle stream if the demuxer hasn't already.
             // Without this, applyStreamDiscard() sets AVDISCARD_ALL on every
             // subtitle stream (because subtitleStream == nil), so PGS packets
-            // are never read and bitmap subtitles never appear. Prefer the
-            // stream with AV_DISPOSITION_DEFAULT; fall back to the first
-            // subtitle stream of any type.
+            // are never read and bitmap subtitles never appear. With a user
+            // language preference set (zyno#100), the preference drives the
+            // pick (exact > prefix > container default); "off" deliberately
+            // selects nothing, leaving every subtitle stream discarded.
             if demuxer.subtitleStreamIndex < 0, !subs.isEmpty {
-                let defaultSub = subs.first(where: { $0.isDefault }) ?? subs.first
-                if let id = defaultSub?.id {
+                let chosen: TrackInfo?
+                if let pref = preferredSubtitleLanguage, !pref.isEmpty {
+                    if pref.lowercased() == "off" {
+                        chosen = nil
+                        logger.info("subtitles: language pref off — no embedded subtitle selected")
+                    } else {
+                        chosen = TrackLanguageMatcher.pickSubtitle(from: subs, preference: pref)
+                        if let c = chosen {
+                            logger.info("subtitles: language pref '\(pref)' → stream \(c.id) (\(c.lang ?? "?"))")
+                        }
+                    }
+                } else {
+                    chosen = subs.first(where: { $0.isDefault }) ?? subs.first
+                }
+                if let id = chosen?.id {
                     demuxer.selectSubtitleStream(by: id)
                     state.selectedSubtitleTrackId = id
-                    logger.info("[sub] auto-selected stream \(id) (default=\(defaultSub?.isDefault ?? false))")
+                    logger.info("[sub] auto-selected stream \(id) (\(chosen?.lang ?? "?"))")
                 }
             }
         }
@@ -971,6 +994,18 @@ public final class NativeBackend: PlayerBackend {
                 let vSize = CGSize(width: codedVideoWidth, height: codedVideoHeight)
                 subtitleDecoder = FFmpegSubtitleDecoder(stream: defaultSubStream, videoSize: vSize)
             }
+        }
+
+        // Language-preference audio selection (zyno#100): the demuxer opened
+        // with the container-default audio stream; if the user prefers a
+        // language and a track matches, switch NOW — before the decoder and
+        // output are built below — so the whole audio chain follows without a
+        // re-open. No match keeps the container default (pickAudio → nil).
+        if let pref = preferredAudioLanguage,
+           let picked = TrackLanguageMatcher.pickAudio(from: state.audioTracks, preference: pref),
+           picked.id != demuxer.audioStreamIndex,
+           demuxer.selectAudioStream(by: picked.id) {
+            logger.info("audio: language pref '\(pref)' → stream \(picked.id) (\(picked.lang ?? "?"))")
         }
 
         if let as_ = demuxer.audioStream,
