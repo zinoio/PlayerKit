@@ -22,10 +22,13 @@ final class VTVideoDecoder {
     private var session: VTDecompressionSession?
     private var formatDesc: CMVideoFormatDescription?
     private let isH264: Bool
+    // zyno#107: AV1 takes a dedicated init path (probe-gated, no in-band
+    // param-set collection) and passes packets straight to VT unconverted.
+    private let isAV1: Bool
     let is10Bit: Bool
     private let needsHDRTag: Bool
     private let colorParams: VideoColorParams
-    private var needsParamSetInit: Bool
+    private(set) var needsParamSetInit: Bool
     private var pendingSPS: [UInt8]?
     private var pendingPPS: [UInt8]?
     private var pendingVPS: [UInt8]?
@@ -62,6 +65,16 @@ final class VTVideoDecoder {
     /// are NOT counted as failures — VT correctly ignores those.
     var needsSoftwareFallback: Bool {
         if initFailed { return true }
+        // zyno#114 zero-output fast path: a session that accepted 30 real
+        // decode attempts without producing a single frame is dead in a way
+        // the error-rate heuristics below see too late when packet supply is
+        // slow (network recovery playback stalls ~2.6s waiting for the 200-
+        // attempt sample). A healthy session never looks like this — every
+        // attempt either decodes or errors, and 30 errors in a row on real
+        // H.264/HEVC packets means the session cannot decode this stream.
+        if totalAttempts >= 30 && idrSuccessCount + nonIDRSuccessCount == 0 {
+            return true
+        }
         // Must have meaningful sample size AND >90% real error rate.
         if totalAttempts >= 200 && Double(failedAttempts) / Double(totalAttempts) > 0.9 {
             return true
@@ -92,21 +105,55 @@ final class VTVideoDecoder {
         let cp = stream.pointee.codecpar.pointee
         self.streamStartTime = stream.pointee.start_time
         self.streamTimeBase  = stream.pointee.time_base
-        // VideoToolbox only decodes H.264 and HEVC. Without this guard, every
-        // other codec (RealVideo rv40, VP8, old MPEG-4 profiles, WMV...) falls
-        // through the `isH264 ? H.264 : HEVC` binary below and gets silently
-        // treated as HEVC: init "succeeds" (returns non-nil), but the in-band
-        // parameter-set scan below expects HEVC NAL unit framing that the
-        // actual bitstream never has, so `decode(packet:)` returns nil forever
-        // and zero frames ever reach the renderer — without ever tripping
-        // `needsSoftwareFallback` (VT is never actually invoked, so there are
-        // no counted errors) or the `NativeBackend` `.vtHW` init-failure
-        // fallback to `FFmpegVideoDecoder` (this initializer never returns nil).
-        guard cp.codec_id == AV_CODEC_ID_H264 || cp.codec_id == AV_CODEC_ID_HEVC else {
+        // VideoToolbox decodes H.264, HEVC and (zyno#107) AV1. Without this
+        // guard, every other codec (RealVideo rv40, VP8, old MPEG-4 profiles,
+        // WMV...) falls through the `isH264 ? H.264 : HEVC` binary below and
+        // gets silently treated as HEVC: init "succeeds" (returns non-nil),
+        // but the in-band parameter-set scan below expects HEVC NAL unit
+        // framing that the actual bitstream never has, so `decode(packet:)`
+        // returns nil forever and zero frames ever reach the renderer —
+        // without ever tripping `needsSoftwareFallback` (VT is never actually
+        // invoked, so there are no counted errors) or the `NativeBackend`
+        // `.vtHW` init-failure fallback to `FFmpegVideoDecoder` (this
+        // initializer never returns nil).
+        let isAV1 = cp.codec_id == AV_CODEC_ID_AV1
+        self.isAV1 = isAV1
+        guard cp.codec_id == AV_CODEC_ID_H264 || cp.codec_id == AV_CODEC_ID_HEVC || isAV1 else {
             logger.info("codec \(String(cString: avcodec_get_name(cp.codec_id))) unsupported by VideoToolbox — deferring to FFmpeg software decode")
             return nil
         }
+        // AV1 hardware decode only exists on A17 Pro/M3 and later. On older
+        // devices this returns nil and NativeBackend falls back to FFmpeg
+        // software decode — identical to the pre-zyno#107 behavior.
+        if isAV1 && !VTIsHardwareDecodeSupported(kCMVideoCodecType_AV1) {
+            logger.info("AV1 hardware decode not available on this device — deferring to FFmpeg software decode")
+            return nil
+        }
         self.isH264 = (cp.codec_id == AV_CODEC_ID_H264)
+        if isAV1 {
+            // zyno#107: VT's AV1 decoder reads sequence headers from the
+            // bitstream itself, so no parameter-set extraction or in-band
+            // collection is needed — the format description is built from
+            // dimensions alone and packets pass through unconverted. AV1 is
+            // all-or-nothing: if session creation fails we return nil and
+            // NativeBackend falls back to FFmpeg software decode, instead of
+            // dead-waiting on in-band parameter sets that never classify.
+            self.is10Bit     = prefer10Bit && cp.bits_per_raw_sample >= 10
+            self.needsHDRTag = false
+            self.colorParams = colorParams
+            self.width       = Int(cp.width)
+            self.height      = Int(cp.height)
+            self.needsParamSetInit = false
+            guard let desc = VTVideoDecoder.makeAV1FormatDesc(width: cp.width, height: cp.height),
+                  let s    = VTVideoDecoder.makeSession(formatDesc: desc, is10Bit: is10Bit) else {
+                logger.error("AV1 VT session creation failed — deferring to FFmpeg software decode")
+                return nil
+            }
+            self.formatDesc = desc
+            self.session    = s
+            logger.info("init OK (AV1): \(self.width)x\(self.height)")
+            return
+        }
         // MKV containers often leave bits_per_raw_sample = 0 even for HEVC Main10.
         // Fall back to profile check: AV_PROFILE_HEVC_MAIN_10 = 2, REXT = 4.
         let isHEVC = cp.codec_id == AV_CODEC_ID_HEVC
@@ -147,7 +194,9 @@ final class VTVideoDecoder {
         let dataSize = Int(packet.pointee.size)
         guard dataSize > 4, !initFailed else { return nil }
 
-        let isAnnexB = dataPtr[0] == 0 && dataPtr[1] == 0 &&
+        // AV1 packets are OBU streams, never AnnexB — a raw byte coincidence
+        // must not route them into the NAL-unit rewriter below.
+        let isAnnexB = !isAV1 && dataPtr[0] == 0 && dataPtr[1] == 0 &&
                        dataPtr[2] == 0 && dataPtr[3] == 1
 
         // ── Phase 1: collect in-band parameter sets if not yet initialised ──
@@ -202,6 +251,12 @@ final class VTVideoDecoder {
             isIDR = foundIDR
         } else {
             lpData = Data(bytes: dataPtr, count: dataSize)
+            if isAV1 {
+                // AV1 passes through as a raw OBU stream (VT reads sequence
+                // headers in-band); keyframe classification comes from the
+                // demuxer flag so the fallback counters stay meaningful.
+                isIDR = packet.pointee.flags & AV_PKT_FLAG_KEY != 0
+            }
         }
         guard !lpData.isEmpty else { return nil }
 
@@ -364,6 +419,16 @@ final class VTVideoDecoder {
                 lastVTError = false
             } else {
                 lastVTError = true
+                // zyno#114: this branch used to be completely silent — a
+                // persistently failing VT session (in-band param-set init
+                // path) produced zero diagnostics until the aggregate
+                // failure heuristic fired ~2.6s into playback. Throttled
+                // logging: first 3 failures then every 100th.
+                let n = totalAttempts + 1
+                let codecName = isH264 ? "H.264" : (isAV1 ? "AV1" : "HEVC")
+                if n <= 3 || n % 100 == 0 {
+                    logger.error("VT decode failed status=\(decodeStatus, privacy: .public) at attempt #\(n, privacy: .public) (\(codecName, privacy: .public))")
+                }
             }
         } else {
             lastVTError = false
@@ -543,6 +608,21 @@ final class VTVideoDecoder {
             }
         }
         if status != noErr { logger.error("HEVCFormatDesc failed: \(status)") }
+        return status == noErr ? desc : nil
+    }
+
+    // MARK: - AV1 helpers (zyno#107)
+
+    /// AV1 has no CMVideoFormatDescriptionCreateFrom*ParameterSets equivalent:
+    /// the decoder reads sequence headers from the bitstream itself, so the
+    /// format description only carries codec type + dimensions (extensions
+    /// nil, same shape FFmpeg's videotoolbox hwaccel uses for AV1).
+    static func makeAV1FormatDesc(width: Int32, height: Int32) -> CMVideoFormatDescription? {
+        var desc: CMVideoFormatDescription?
+        let status = CMVideoFormatDescriptionCreate(
+            allocator: kCFAllocatorDefault, codecType: kCMVideoCodecType_AV1,
+            width: width, height: height, extensions: nil, formatDescriptionOut: &desc)
+        if status != noErr { logger.error("AV1FormatDesc failed: \(status)") }
         return status == noErr ? desc : nil
     }
 
