@@ -383,6 +383,23 @@ public final class NativeBackend: PlayerBackend {
 
     /// [diag] Per-displayed-frame `pts - audioTime` distribution, drained into
     /// the 5s logSync line. The single 5s sample cannot show an oscillating
+    /// Runtime switch for the periodic `[diag]` os_log lines: the 5s A/V
+    /// offset / tick attribution / display-order windows, the freeze-site and
+    /// guard-skip samples, and the first 200 appends. OFF by default — these
+    /// lines are what localized the 2026-10 晃动 regressions and stay
+    /// available for field debugging, but a production player should not emit
+    /// them.
+    ///
+    /// Only the log OUTPUT is gated: the distributions behind it (and the
+    /// `drainDiag*` APIs the measurement tests read) always run. Turn it on
+    /// with the `PLAYERKIT_DIAG=1` environment variable, or set it from the
+    /// host app before playback starts.
+    ///
+    /// `[diag] seek videoLand` is deliberately NOT gated: one line per seek,
+    /// and seek-landing accuracy is itself something we track (zyno#117).
+    public nonisolated(unsafe) static var diagLoggingEnabled =
+        ProcessInfo.processInfo.environment["PLAYERKIT_DIAG"] == "1"
+
     /// offset (user-reported 晃动/字幕-vs-声音, 2026-10-12) — the window stats
     /// (stddev / maxJump / signFlips) make one visible. Guarded by
     /// displayLoopLock. Units: seconds.
@@ -1489,7 +1506,7 @@ public final class NativeBackend: PlayerBackend {
                             diagBounded = false
                         }
                         diagAppendCount += 1
-                        if diagAppendCount <= 200 {
+                        if diagAppendCount <= 200, Self.diagLoggingEnabled {
                             let regressed = framePts < diagLastAppendedPts
                             logger.info("[diag] append#\(diagAppendCount) framePts=\(String(format:"%.3f",framePts)) decoderPts=\(frame.pts.map { String(format:"%.3f",$0) } ?? "nil") bounded=\(diagBounded) rawPTS=\(String(format:"%.3f",rawPTS)) REGRESSED=\(regressed)")
                         }
@@ -2066,7 +2083,9 @@ public final class NativeBackend: PlayerBackend {
                     tickStallSample += 1
                     if tickStallSample >= 450 {
                         tickStallSample = 0
-                        logger.warning("[diag] stall: front=\(String(format: "%.3f", ahead.pts), privacy: .public) audio=\(String(format: "%.3f", audioTime), privacy: .public) gap=\(String(format: "%.0f", (ahead.pts - audioTime) * 1000), privacy: .public)ms q=\(self.jitterBuffer.count, privacy: .public)")
+                        if Self.diagLoggingEnabled {
+                            logger.warning("[diag] stall: front=\(String(format: "%.3f", ahead.pts), privacy: .public) audio=\(String(format: "%.3f", audioTime), privacy: .public) gap=\(String(format: "%.0f", (ahead.pts - audioTime) * 1000), privacy: .public)ms q=\(self.jitterBuffer.count, privacy: .public)")
+                        }
                     }
                 }
                 let pos = Duration.milliseconds(Int64(audioTime * 1000))
@@ -2085,8 +2104,10 @@ public final class NativeBackend: PlayerBackend {
                 tickGuardSkipSample += 1
                 if tickGuardSkipSample >= 450 {
                     tickGuardSkipSample = 0
-                    let front = jitterBuffer.peek(at: 0)
-                    logger.warning("[diag] guardSkip: hasDisplayed=\(self.syncController.hasDisplayedFrame, privacy: .public) stillNeedsCal=\(stillNeedsCal, privacy: .public) clockReady=\(clockReady, privacy: .public) front=\(String(format: "%.3f", front?.pts ?? -1), privacy: .public) audio=\(String(format: "%.3f", audioTime), privacy: .public) q=\(self.jitterBuffer.count, privacy: .public)")
+                    if Self.diagLoggingEnabled {
+                        let front = jitterBuffer.peek(at: 0)
+                        logger.warning("[diag] guardSkip: hasDisplayed=\(self.syncController.hasDisplayedFrame, privacy: .public) stillNeedsCal=\(stillNeedsCal, privacy: .public) clockReady=\(clockReady, privacy: .public) front=\(String(format: "%.3f", front?.pts ?? -1), privacy: .public) audio=\(String(format: "%.3f", audioTime), privacy: .public) q=\(self.jitterBuffer.count, privacy: .public)")
+                    }
                 }
             }
         }
@@ -2303,15 +2324,19 @@ public final class NativeBackend: PlayerBackend {
             // [diag] window distributions. av: per-frame pts-audioTime (ms);
             // aq: per-callback consumed output samples. maxJump/flips large =
             // pacing oscillation (晃动 signature); steady offset = healthy.
-            logger.info("[diag] av[n=\(av.count, privacy: .public) mean=\(String(format:"%+.1f", av.mean*1000), privacy: .public)ms sd=\(String(format:"%.1f", av.stddev*1000), privacy: .public)ms min=\(String(format:"%+.1f", av.min*1000), privacy: .public)ms max=\(String(format:"%+.1f", av.max*1000), privacy: .public)ms jump=\(String(format:"%.1f", av.maxJump*1000), privacy: .public)ms flips=\(av.signFlips, privacy: .public)] aq[n=\(aq.count, privacy: .public) mean=\(String(format:"%.0f", aq.mean), privacy: .public) min=\(String(format:"%.0f", aq.min), privacy: .public) max=\(String(format:"%.0f", aq.max), privacy: .public) jump=\(String(format:"%.0f", aq.maxJump), privacy: .public)]")
-            // [diag] where ticks went: drain=skip-behind pops, stall=freeze-ahead
-            // ticks, deny=SyncController refusals, appends=decode supply.
-            logger.info("[diag] tick[drain=\(tick.drainLag, privacy: .public) stall=\(tick.stallAhead, privacy: .public) deny=\(tick.checkDeny, privacy: .public) noFrame=\(tick.noFrame, privacy: .public) guardSkip=\(tick.guardSkip, privacy: .public) appends=\(tick.appends, privacy: .public) depth[n=\(tick.drainDepth.count, privacy: .public) mean=\(String(format:"%.0f", tick.drainDepth.mean*1000), privacy: .public)ms max=\(String(format:"%.0f", tick.drainDepth.max*1000), privacy: .public)ms]]")
-            // [diag] display-order integrity (2026-10-13): gap = pts interval
-            // between displayed frames. Healthy 23.976fps content: min≈max≈41.7ms.
-            // Decode-order display (broken PTS): min≈20.8 / max≈62.5 (or negative).
-            // rewrites = frames whose PTS the validator synthesized this window.
-            logger.info("[diag] show[n=\(shown.count, privacy: .public) mean=\(String(format:"%.1f", shown.mean*1000), privacy: .public)ms min=\(String(format:"%.1f", shown.min*1000), privacy: .public)ms max=\(String(format:"%.1f", shown.max*1000), privacy: .public)ms jump=\(String(format:"%.1f", shown.maxJump*1000), privacy: .public)ms] rewrites=\(rewrites, privacy: .public)")
+            // All periodic [diag] lines are gated by diagLoggingEnabled (off
+            // in production).
+            if Self.diagLoggingEnabled {
+                logger.info("[diag] av[n=\(av.count, privacy: .public) mean=\(String(format:"%+.1f", av.mean*1000), privacy: .public)ms sd=\(String(format:"%.1f", av.stddev*1000), privacy: .public)ms min=\(String(format:"%+.1f", av.min*1000), privacy: .public)ms max=\(String(format:"%+.1f", av.max*1000), privacy: .public)ms jump=\(String(format:"%.1f", av.maxJump*1000), privacy: .public)ms flips=\(av.signFlips, privacy: .public)] aq[n=\(aq.count, privacy: .public) mean=\(String(format:"%.0f", aq.mean), privacy: .public) min=\(String(format:"%.0f", aq.min), privacy: .public) max=\(String(format:"%.0f", aq.max), privacy: .public) jump=\(String(format:"%.0f", aq.maxJump), privacy: .public)]")
+                // [diag] where ticks went: drain=skip-behind pops, stall=freeze-ahead
+                // ticks, deny=SyncController refusals, appends=decode supply.
+                logger.info("[diag] tick[drain=\(tick.drainLag, privacy: .public) stall=\(tick.stallAhead, privacy: .public) deny=\(tick.checkDeny, privacy: .public) noFrame=\(tick.noFrame, privacy: .public) guardSkip=\(tick.guardSkip, privacy: .public) appends=\(tick.appends, privacy: .public) depth[n=\(tick.drainDepth.count, privacy: .public) mean=\(String(format:"%.0f", tick.drainDepth.mean*1000), privacy: .public)ms max=\(String(format:"%.0f", tick.drainDepth.max*1000), privacy: .public)ms]]")
+                // [diag] display-order integrity (2026-10-13): gap = pts interval
+                // between displayed frames. Healthy 23.976fps content: min≈max≈41.7ms.
+                // Decode-order display (broken PTS): min≈20.8 / max≈62.5 (or negative).
+                // rewrites = frames whose PTS the validator synthesized this window.
+                logger.info("[diag] show[n=\(shown.count, privacy: .public) mean=\(String(format:"%.1f", shown.mean*1000), privacy: .public)ms min=\(String(format:"%.1f", shown.min*1000), privacy: .public)ms max=\(String(format:"%.1f", shown.max*1000), privacy: .public)ms jump=\(String(format:"%.1f", shown.maxJump*1000), privacy: .public)ms] rewrites=\(rewrites, privacy: .public)")
+            }
 
             // Throughput: bytes read since last sample / elapsed.
             let (bytesDelta, tpElapsed): (Int64, Double) = displayLoopLock.withLock {
