@@ -121,6 +121,10 @@ public final class NativeBackend: PlayerBackend {
     /// (旧行为);语言码按 TrackLanguageMatcher 匹配,无匹配则保持容器默认。
     public var preferredAudioLanguage: String?
 
+    /// 容器章节(mkv/mp4,zyno#101)。_finishOpen 时从已打开的 demuxer 读取,
+    /// 零额外 I/O;stop() 清空。BDMV 原盘走 MplsParser/playlist 路径,不经这里。
+    public private(set) var chapters: [ChapterInfo] = []
+
     /// Strategy resolved once at open time from stream attributes + display
     /// capability + renderer's `prefersTenBit`. Drives decoder selection and
     /// is forwarded to `VideoRenderer.render` every frame so EDRRenderer can
@@ -955,6 +959,14 @@ public final class NativeBackend: PlayerBackend {
             }
             state.subtitleTracks = subs
             logger.info("subtitle tracks: \(subs.count)")
+
+            // Container chapters (zyno#101): read off the already-open format
+            // context — no second probe, no extra I/O. Empty for chapter-less
+            // files; the app layer unions this with BDMV/Jellyfin chapters.
+            chapters = FFmpegChapterParser.parse(ctx)
+            if !chapters.isEmpty {
+                logger.info("chapters: \(self.chapters.count)")
+            }
 
             // Auto-select a subtitle stream if the demuxer hasn't already.
             // Without this, applyStreamDiscard() sets AVDISCARD_ALL on every
@@ -2577,6 +2589,7 @@ public final class NativeBackend: PlayerBackend {
         state.currentSubtitleImage = nil
         state.currentSubtitleImageRect = .zero
         subtitleDecoder = nil
+        chapters = []  // container chapters are per-session (zyno#101)
         state = PlayerState()
     }
 
