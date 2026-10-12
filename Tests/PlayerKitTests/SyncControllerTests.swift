@@ -138,6 +138,50 @@ final class SyncControllerTests: XCTestCase {
         XCTAssertEqual(delay, 0.017, accuracy: 0.0005)
     }
 
+    // MARK: - Guard window (zyno P1 晃动 fix, 2026-10-12)
+
+    /// The freeze-ahead/skip-behind window must clear the steady-state
+    /// transient with real margin: the front frame rides at
+    /// displayLatencyCompensation plus up to one frame duration of pacing
+    /// jitter, and the frame being displayed is one more frame ahead. The old
+    /// fixed 60ms left only 10ms above that — normal pacing grazed the freeze
+    /// threshold on device and any supply hiccup froze the picture.
+    func testGuardWindowClearsCompensationPlusTwoFrames() {
+        let ctrl = SyncController()
+        let now = 1000.0
+        let (_, d0) = ctrl.check(nextPTS: 0.0, followingPTS: 1.0 / 24.0, audioTime: 0.0, now: now, serial: 0)
+        ctrl.advance(delay: d0, pts: 0.0, followingPTS: 1.0 / 24.0, audioTime: 0.0, now: now)
+
+        let w = ctrl.guardWindow(rate: 1.0)
+        XCTAssertEqual(w, ctrl.displayLatencyCompensation + 2 * (1.0 / 24.0), accuracy: 1e-9)
+        XCTAssertGreaterThan(w, 0.06, "must be wider than the old fixed 60ms window")
+        XCTAssertLessThan(w, 0.30, "still a safety net, not a second pacing threshold")
+    }
+
+    /// Scales with max(1, rate), like the fixed window it replaces: 2x keeps
+    /// twice the (wall-clock) margin needed by comp×r; below 1x the window
+    /// must not shrink — comp×r shrinks there, but decode/supply jitter is
+    /// wall-clock and does not.
+    func testGuardWindowScalesWithRate() {
+        let ctrl = SyncController()
+        let now = 1000.0
+        let (_, d0) = ctrl.check(nextPTS: 0.0, followingPTS: 0.04, audioTime: 0.0, now: now, serial: 0)
+        ctrl.advance(delay: d0, pts: 0.0, followingPTS: 0.04, audioTime: 0.0, now: now)
+
+        XCTAssertEqual(ctrl.guardWindow(rate: 2.0), 2 * ctrl.guardWindow(rate: 1.0), accuracy: 1e-9)
+        XCTAssertEqual(ctrl.guardWindow(rate: 0.5), ctrl.guardWindow(rate: 1.0), accuracy: 1e-9)
+        XCTAssertEqual(ctrl.guardWindow(), ctrl.guardWindow(rate: 1.0), accuracy: 1e-9,
+                       "default argument must be 1x")
+    }
+
+    /// Before any frame is displayed the lastDuration fallback is used, so the
+    /// window is still sane at start/resume (guard only runs after the first
+    /// frame, but the value must never be degenerate).
+    func testGuardWindowUsesFallbackFrameDurationBeforeFirstFrame() {
+        let ctrl = SyncController()
+        XCTAssertEqual(ctrl.guardWindow(rate: 1.0), 0.05 + 2 * 0.04, accuracy: 1e-9)
+    }
+
     /// Default-argument regression: existing 1x callers (tests included) keep
     /// byte-for-byte the pre-rate delay math.
     func testDefaultRateIsOne() {

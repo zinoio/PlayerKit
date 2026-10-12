@@ -140,6 +140,11 @@ final class VideoJitterBuffer: @unchecked Sendable {
     }
 
     private var frames: [Frame] = []
+    /// Frames refused by the hard cap in append() since the last flush(). A
+    /// rising value means the demux loop is feeding faster than the display loop
+    /// drains (see the back-pressure there) — the counter makes that visible
+    /// instead of letting the buffer silently reshape under pressure.
+    private var droppedIncomingFrames = 0
     private let lock = NSLock()
     private var _state: State = .buffering
     /// 视频流已读到 EOF(demux 线程 markEOF 置位)。此后不再要求攒满
@@ -165,6 +170,12 @@ final class VideoJitterBuffer: @unchecked Sendable {
         return frames.count
     }
 
+    /// Frames refused at the frame cap since the last flush (see append).
+    var droppedIncomingCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return droppedIncomingFrames
+    }
+
     var duration: Double {
         lock.lock(); defer { lock.unlock() }
         guard frames.count >= 2 else { return 0 }
@@ -177,6 +188,24 @@ final class VideoJitterBuffer: @unchecked Sendable {
         var newState: State?
         lock.lock()
 
+        // Hard cap: refuse the incoming frame while the buffer is full; the demux
+        // loop backs off on the same condition (count >= maxFrameCount) so this is
+        // rare, and the refusal is counted instead of silent.
+        //
+        // It must NOT be resolved by dropping the oldest frame (the previous
+        // policy): frames[0] is the display loop's next frame, so evicting it made
+        // every overflow advance the buffer front further ahead of the audio clock.
+        // The front then had to be pulled back by the freeze-ahead guard while
+        // audio caught up — the 晃动/卡顿 regression (2026-10-12, real device:
+        // 18-24fps against 23.976fps content). Duration-based dropping is also
+        // intentionally removed for VOD — the demux loop's throttle (pts >
+        // audioPos + 2.0 → sleep) is the pacing mechanism.
+        guard frames.count < maxFrameCountLocked else {
+            droppedIncomingFrames += 1
+            lock.unlock()
+            return
+        }
+
         // Insert in PTS-sorted order so pop() always returns the next display frame.
         // VTVideoDecoder returns B-frames in decode order (not display order); without
         // sorting, jitterBuffer PTS values are scrambled, causing backwards progress
@@ -186,11 +215,6 @@ final class VideoJitterBuffer: @unchecked Sendable {
         let size = frame.byteSize
         bufferedBytesLocked += size
         if size > frameBytesHint { frameBytesHint = size }
-
-        // Safety cap: drop oldest frame only if count exceeds absolute maximum.
-        // Duration-based dropping is intentionally removed for VOD — backpressure
-        // in the demux loop (duration >= maxDuration → sleep) is the right mechanism.
-        if frames.count > maxFrameCountLocked { bufferedBytesLocked -= frames.removeFirst().byteSize }
 
         let dur = frames.count >= 2 ? frames.last!.pts - frames.first!.pts : 0
         if _state == .buffering, !frames.isEmpty {
@@ -259,6 +283,7 @@ final class VideoJitterBuffer: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         frames.removeAll()
         bufferedBytesLocked = 0
+        droppedIncomingFrames = 0
         _state = .buffering
         eofReached = false
         bufferingStart = ProcessInfo.processInfo.systemUptime

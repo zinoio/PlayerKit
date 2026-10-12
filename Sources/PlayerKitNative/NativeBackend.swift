@@ -326,6 +326,23 @@ public final class NativeBackend: PlayerBackend {
     private nonisolated(unsafe) var framesSinceLastLog = 0
     private nonisolated(unsafe) var ticksSinceLastLog = 0
     private nonisolated(unsafe) var lastLogTime: Double = 0
+    // [diag] tick path attribution (晃动 localization): a tick that doesn't
+    // display a frame ends as a guard drain, a freeze-ahead stall, or a
+    // syncController denial — these counters say which, per log window.
+    private nonisolated(unsafe) var tickDrainLag = 0
+    private nonisolated(unsafe) var tickStallAhead = 0
+    private nonisolated(unsafe) var tickCheckDeny = 0
+    private nonisolated(unsafe) var tickNoFrame = 0
+    private nonisolated(unsafe) var tickGuardSkip = 0
+    private nonisolated(unsafe) var tickGuardSkipSample = 0
+    private nonisolated(unsafe) var tickStallSample = 0
+    /// How far behind audio the frames the skip-behind guard drained were
+    /// (audioTime − pts) — shallow (~40-80ms) means normal pacing overshoot,
+    /// deep (100ms+) means something let audio run away.
+    private nonisolated(unsafe) var drainDepthStats = SyncDiagStats()
+    /// Decoded frames appended into the jitter buffer (supply-side count; the
+    /// loss is display-side iff appends ≈ source fps×elapsed ≫ displayed).
+    private nonisolated(unsafe) var diagAppendsSinceLog = 0
     // Diagnostic: see the gap-detection note in displayNextFrame().
     private nonisolated(unsafe) var lastTickWallTime: Double?
     private let tickGapWarnThreshold: Double = 0.05
@@ -363,6 +380,105 @@ public final class NativeBackend: PlayerBackend {
     /// `state` directly. Written before it's read (setRate assigns both).
     /// Guarded by displayLoopLock.
     private nonisolated(unsafe) var displayRate: Double = 1.0
+
+    /// [diag] Per-displayed-frame `pts - audioTime` distribution, drained into
+    /// the 5s logSync line. The single 5s sample cannot show an oscillating
+    /// Runtime switch for the periodic `[diag]` os_log lines: the 5s A/V
+    /// offset / tick attribution / display-order windows, the freeze-site and
+    /// guard-skip samples, and the first 200 appends. OFF by default — these
+    /// lines are what localized the 2026-10 晃动 regressions and stay
+    /// available for field debugging, but a production player should not emit
+    /// them.
+    ///
+    /// Only the log OUTPUT is gated: the distributions behind it (and the
+    /// `drainDiag*` APIs the measurement tests read) always run. Turn it on
+    /// with the `PLAYERKIT_DIAG=1` environment variable, or set it from the
+    /// host app before playback starts.
+    ///
+    /// `[diag] seek videoLand` is deliberately NOT gated: one line per seek,
+    /// and seek-landing accuracy is itself something we track (zyno#117).
+    public nonisolated(unsafe) static var diagLoggingEnabled =
+        ProcessInfo.processInfo.environment["PLAYERKIT_DIAG"] == "1"
+
+    /// offset (user-reported 晃动/字幕-vs-声音, 2026-10-12) — the window stats
+    /// (stddev / maxJump / signFlips) make one visible. Guarded by
+    /// displayLoopLock. Units: seconds.
+    private nonisolated(unsafe) var avOffsetStats = SyncDiagStats()
+    /// [diag] Display-order integrity: distribution of the PTS interval between
+    /// consecutive DISPLAYED frames (track-switch 画面来回晃/闪 localization,
+    /// 2026-10-13). With B-frames the jitter buffer's PTS-sorted insertion is
+    /// what restores display order; if the PTS pipeline is disturbed (see
+    /// diagPTSRewriteCount) frames display in decode order and this interval
+    /// stops sitting at the source frame duration — it alternates (e.g.
+    /// 20.8/62.5ms at 23.976fps) or goes negative instead of a flat ~41.7ms.
+    /// Intervals outside ±1s are treated as seek discontinuities and dropped.
+    /// Guarded by displayLoopLock. Units: seconds.
+    private nonisolated(unsafe) var shownGapStats = SyncDiagStats()
+    private nonisolated(unsafe) var lastShownDiagPTS: Double = -.infinity
+    /// [diag] Frames whose PTS the demux-side PTSValidator REWROTE (synthesized
+    /// blind-clock PTS, >5s anomaly). A rewritten PTS no longer reflects the
+    /// frame's true display time, so PTS-ordered insertion can no longer undo
+    /// decoder reorder — the count is the direct signature of that failure.
+    /// Reset per log window. Guarded by displayLoopLock.
+    private nonisolated(unsafe) var diagPTSRewriteCount = 0
+    /// [diag] Seek-landing capture: target set in _seek, consumed by the
+    /// one-shot log on the first displayed frame after it. Guarded by
+    /// displayLoopLock.
+    private nonisolated(unsafe) var pendingSeekLandTarget: Double?
+    private nonisolated(unsafe) var seekLandLogged = true
+
+    /// [diag] Drain the live per-frame offset window (jitter measurement tests
+    /// and tooling; production reads it via the 5s logSync line instead).
+    func drainDiagAvOffset() -> SyncDiagStats {
+        displayLoopLock.withLock { () -> SyncDiagStats in
+            let s = avOffsetStats
+            avOffsetStats.reset()
+            return s
+        }
+    }
+
+    /// [diag] Drain the AudioQueue per-callback granularity window.
+    func drainAudioQueueDiag() -> SyncDiagStats {
+        audioClock.drainAdvanceDiag()
+    }
+
+    /// [diag] Drain the AudioUnitOutput queue-health snapshot (enqueue/start/
+    /// pause/resume counts + instantaneous paused/buffered state).
+    func drainOutputQueueDiag() -> AudioUnitOutput.QueueDiag {
+        if let out = audioUnitOutput { return out.drainQueueDiag() }
+        return AudioUnitOutput.QueueDiag()
+    }
+
+    /// [diag] Display-tick path attribution + append count since last drain.
+    /// Tells you WHERE frames die: `drainLag` = popped by the skip-behind
+    /// guard, `stallAhead` = ticks held by freeze-ahead, `checkDeny` = ticks
+    /// denied by SyncController pacing, `appends` = frames supplied by decode.
+    struct TickDiag {
+        var drainLag = 0
+        var stallAhead = 0
+        var checkDeny = 0
+        var noFrame = 0
+        var guardSkip = 0
+        var drainDepth = SyncDiagStats()
+        var appends = 0
+    }
+
+    nonisolated func drainTickDiag() -> TickDiag {
+        displayLoopLock.withLock { () -> TickDiag in
+            let t = TickDiag(drainLag: tickDrainLag, stallAhead: tickStallAhead,
+                             checkDeny: tickCheckDeny, noFrame: tickNoFrame,
+                             guardSkip: tickGuardSkip, drainDepth: drainDepthStats,
+                             appends: diagAppendsSinceLog)
+            tickDrainLag = 0
+            tickStallAhead = 0
+            tickCheckDeny = 0
+            tickNoFrame = 0
+            tickGuardSkip = 0
+            drainDepthStats.reset()
+            diagAppendsSinceLog = 0
+            return t
+        }
+    }
 
     /// Guards render configuration (`colorParams`, `rendererStrategy`) and the
     /// frame-sink list: written on the main actor (stream open / addFrameSink),
@@ -1323,6 +1439,15 @@ public final class NativeBackend: PlayerBackend {
                         pts = rawPTS
                     } else {
                         pts = ptsValidator.validate(rawPTS)
+                        // [diag] count rewritten PTS (blind clock / anomaly path)
+                        // — see diagPTSRewriteCount. A rewritten PTS is a
+                        // synthesized uniform timestamp, so the frame's true
+                        // display time is gone and decoder reorder can no longer
+                        // be undone by PTS-sorted insertion (track-switch
+                        // 画面来回晃 localization, 2026-10-13).
+                        if rawPTS.isFinite, abs(pts - rawPTS) > 0.0005 {
+                            displayLoopLock.withLock { self.diagPTSRewriteCount += 1 }
+                        }
                     }
                     // Track download progress (highest video PTS read so far)
                     if rawPTS.isFinite && rawPTS > maxDownloadedPts { maxDownloadedPts = rawPTS }
@@ -1381,12 +1506,13 @@ public final class NativeBackend: PlayerBackend {
                             diagBounded = false
                         }
                         diagAppendCount += 1
-                        if diagAppendCount <= 200 {
+                        if diagAppendCount <= 200, Self.diagLoggingEnabled {
                             let regressed = framePts < diagLastAppendedPts
                             logger.info("[diag] append#\(diagAppendCount) framePts=\(String(format:"%.3f",framePts)) decoderPts=\(frame.pts.map { String(format:"%.3f",$0) } ?? "nil") bounded=\(diagBounded) rawPTS=\(String(format:"%.3f",rawPTS)) REGRESSED=\(regressed)")
                         }
                         diagLastAppendedPts = framePts
                         jitter.append(.init(pixelBuffer: frame.pixelBuffer, pts: framePts, metadata: frame.metadata))
+                        displayLoopLock.withLock { self.diagAppendsSinceLog += 1 }
                         let ptsCopy = framePts
                         DispatchQueue.main.async { [weak self] in
                             guard let self = self else { return }
@@ -1396,10 +1522,13 @@ public final class NativeBackend: PlayerBackend {
                     }
                     // Throttle: keep video demux within 2s of the audio clock.
                     // HW decode runs ~4× real-time; without throttling the demux
-                    // would advance 30+ seconds ahead of audio. maxFrameCount then
-                    // evicts old frames, leaving the jitter buffer with only
-                    // far-future frames — needsClockCalibration resets audioClock
-                    // to that far-future PTS, causing A/V desync / black screen.
+                    // would advance 30+ seconds ahead of audio and the jitter
+                    // buffer would fill with far-future frames —
+                    // needsClockCalibration resets audioClock to that far-future
+                    // PTS, causing A/V desync / black screen. (The demux
+                    // free-running on start — audio clock still 0, this guard
+                    // inactive — is also what arms the frame-count back-pressure
+                    // below.)
                     //
                     // We sleep AT MOST 50ms per video packet so the outer loop
                     // continues reading audio/subtitle packets in between, keeping
@@ -1458,6 +1587,24 @@ public final class NativeBackend: PlayerBackend {
                     // while the frame budget is used up; short sleep only, so the loop
                     // keeps reading the audio packets interleaved with the video.
                     if jitter.isFull {
+                        Thread.sleep(forTimeInterval: 0.010)
+                    }
+
+                    // Frame-count back-pressure (2026-10-12 晃动 fix). The frame
+                    // cap must hold the demux loop back exactly like the byte
+                    // budget above — and the buffer must never have to drop
+                    // frames to respect it. It used to: append() evicted the
+                    // OLDEST frame on overflow, i.e. the display loop's next
+                    // frame, so a full buffer advanced its front ahead of the
+                    // audio clock at supply rate and the freeze-ahead guard
+                    // held the picture until audio caught up (device: 18-24fps
+                    // vs 23.976fps content). VideoJitterBuffer.append now
+                    // refuses the incoming frame and counts it
+                    // (droppedIncomingCount); this sleep keeps that refusal
+                    // rare by pacing the supply to the drain rate once the
+                    // buffer is full. Short sleep only, so audio packets
+                    // interleaved after this one are still read.
+                    if jitter.count >= jitter.maxFrameCount {
                         Thread.sleep(forTimeInterval: 0.010)
                     }
 
@@ -1911,18 +2058,36 @@ public final class NativeBackend: PlayerBackend {
             (needsClockCalibration, audioClockReady)
         }
         if syncController.hasDisplayedFrame, !stillNeedsCal, clockReady {
-            // Guard window scales with the playback rate (zyno#99): at rate r
-            // the steady-state sync target holds the front frame at
-            // audioTime + displayLatencyCompensation×r (see SyncController
-            // computeDelay), so the window must stay above that — a fixed
-            // 60ms freezes the picture permanently at 2× (comp×r = 100ms).
-            let guardWindow = 0.06 * max(1.0, playbackRate)
+            // Guard window = compensation + 2 frames, scaled by max(1, rate)
+            // — see SyncController.guardWindow. The old fixed 60ms sat 10ms
+            // above the steady-state transient (comp 50ms + one frame), so
+            // normal pacing grazed the freeze threshold and any supply hiccup
+            // froze the picture: device-measured 18-24fps against 23.976fps
+            // content (2026-10-12 晃动). The guard is a safety net; pacing
+            // belongs to SyncController.
+            let guardWindow = syncController.guardWindow(rate: playbackRate)
             // Drain frames significantly behind audio
             while let lagging = jitterBuffer.peek(at: 0), lagging.pts < audioTime - guardWindow {
                 jitterBuffer.pop()
+                displayLoopLock.withLock {
+                    tickDrainLag += 1
+                    drainDepthStats.record(audioTime - lagging.pts)
+                }
             }
             // Freeze-ahead: if the front frame is ahead of audio, stall
             if let ahead = jitterBuffer.peek(at: 0), ahead.pts > audioTime + guardWindow {
+                displayLoopLock.withLock {
+                    tickStallAhead += 1
+                    // [diag] freeze-site sample: what front/audio actually were
+                    // each time the guard held the picture (every 450th stall).
+                    tickStallSample += 1
+                    if tickStallSample >= 450 {
+                        tickStallSample = 0
+                        if Self.diagLoggingEnabled {
+                            logger.warning("[diag] stall: front=\(String(format: "%.3f", ahead.pts), privacy: .public) audio=\(String(format: "%.3f", audioTime), privacy: .public) gap=\(String(format: "%.0f", (ahead.pts - audioTime) * 1000), privacy: .public)ms q=\(self.jitterBuffer.count, privacy: .public)")
+                        }
+                    }
+                }
                 let pos = Duration.milliseconds(Int64(audioTime * 1000))
                 let due = displayLoopLock.withLock { (pos - lastNotifiedPos) >= .milliseconds(500) }
                 if due {
@@ -1930,6 +2095,20 @@ public final class NativeBackend: PlayerBackend {
                     applyDisplayUpdate(DisplayUIUpdate(position: pos, generation: playGeneration, notify: true))
                 }
                 return
+            }
+        } else {
+            // [diag] the guard branch didn't run — record why via a periodic
+            // sample (per-tick counters alone can't say which condition failed).
+            displayLoopLock.withLock {
+                tickGuardSkip += 1
+                tickGuardSkipSample += 1
+                if tickGuardSkipSample >= 450 {
+                    tickGuardSkipSample = 0
+                    if Self.diagLoggingEnabled {
+                        let front = jitterBuffer.peek(at: 0)
+                        logger.warning("[diag] guardSkip: hasDisplayed=\(self.syncController.hasDisplayedFrame, privacy: .public) stillNeedsCal=\(stillNeedsCal, privacy: .public) clockReady=\(clockReady, privacy: .public) front=\(String(format: "%.3f", front?.pts ?? -1), privacy: .public) audio=\(String(format: "%.3f", audioTime), privacy: .public) q=\(self.jitterBuffer.count, privacy: .public)")
+                    }
+                }
             }
         }
 
@@ -1940,7 +2119,10 @@ public final class NativeBackend: PlayerBackend {
             displayLoopLock.withLock { audioClockReady = true }
         }
 
-        guard let frame = jitterBuffer.peek(at: 0) else { return }
+        guard let frame = jitterBuffer.peek(at: 0) else {
+            displayLoopLock.withLock { tickNoFrame += 1 }
+            return
+        }
 
         let followingPTS = jitterBuffer.peek(at: 1)?.pts
 
@@ -1980,6 +2162,7 @@ public final class NativeBackend: PlayerBackend {
         }
 
         guard shouldShow else {
+            if clockReady { displayLoopLock.withLock { tickCheckDeny += 1 } }
             // 旁路 pacing 等待时视频帧已在正确位置,用帧 PTS 而非 audioTime
             // (音频卡死时恒为 0,会把进度条打回 0)。
             let pos = Duration.milliseconds(Int64((clockReady ? audioTime : frame.pts) * 1000))
@@ -2021,6 +2204,22 @@ public final class NativeBackend: PlayerBackend {
         }
         let firstFrameRendered: Bool = displayLoopLock.withLock {
             displayedVideoFrames += 1; framesSinceLastLog += 1
+            // [diag] every displayed frame feeds the offset distribution; the
+            // first frame after a seek also logs the video landing error.
+            avOffsetStats.record(popped.pts - audioTime)
+            // [diag] display-order integrity: interval between consecutive
+            // displayed frames' PTS. Continuous playback sits at the source
+            // frame duration; decode-order display (broken PTS) alternates or
+            // goes negative. ±1s guard drops seek jumps — see shownGapStats.
+            let shownGap = popped.pts - lastShownDiagPTS
+            if shownGap.isFinite, shownGap > -1.0, shownGap < 1.0 {
+                shownGapStats.record(shownGap)
+            }
+            lastShownDiagPTS = popped.pts
+            if !seekLandLogged, let target = pendingSeekLandTarget {
+                seekLandLogged = true
+                logger.info("[diag] seek videoLand=\(String(format:"%+.3f", popped.pts - target), privacy: .public)s target=\(String(format:"%.3f", target), privacy: .public)s pts=\(String(format:"%.3f", popped.pts), privacy: .public)s")
+            }
             return displayedVideoFrames == 1
         }
 
@@ -2098,12 +2297,46 @@ public final class NativeBackend: PlayerBackend {
         let diff = Int((pts - audioTime) * 1000)
         let subCueCount = subtitleLock.withLock { subtitleCues.count }
         let subImgCount = subtitleImageLock.withLock { subtitleImageCues.count }
+        // [diag] drain the per-frame offset + AudioQueue-granularity windows
+        // (display thread — same lock discipline as the record sites).
+        let av = displayLoopLock.withLock { () -> SyncDiagStats in
+            let s = avOffsetStats
+            avOffsetStats.reset()
+            return s
+        }
+        let aq = audioClock.drainAdvanceDiag()
+        let tick = drainTickDiag()
+        // [diag] display-order integrity window + PTS rewrites since last log.
+        let (shown, rewrites) = displayLoopLock.withLock { () -> (SyncDiagStats, Int) in
+            let s = shownGapStats
+            shownGapStats.reset()
+            let r = diagPTSRewriteCount
+            diagPTSRewriteCount = 0
+            return (s, r)
+        }
         // state/demuxer reads + the cacheSpeed write stay on the main actor;
         // the whole log line hops (5s cadence — the hop costs nothing).
         DispatchQueue.main.async { [weak self] in
             guard let self, self.playGeneration == gen else { return }
             let subStreamIdx = self.demuxer?.subtitleStreamIndex ?? -1
-            logger.info("q=\(self.jitterBuffer.count) dur=\(Int(self.jitterBuffer.duration*1000))ms fps=\(String(format:"%.1f",fps)) diff=\(diff)ms a=\(String(format:"%.2f",audioTime))s v=\(String(format:"%.2f",pts))s buf=\(self.state.isBuffering) subStream=\(subStreamIdx) subCues=\(subCueCount) subImgCues=\(subImgCount)")
+            let (tickCount, qCount): (Int, Int) = displayLoopLock.withLock { (self.ticksSinceLastLog, self.jitterBuffer.count) }
+            logger.info("q=\(qCount, privacy: .public) dur=\(Int(self.jitterBuffer.duration*1000), privacy: .public)ms fps=\(String(format:"%.1f",fps), privacy: .public) ticks=\(tickCount, privacy: .public) diff=\(diff, privacy: .public)ms a=\(String(format:"%.2f",audioTime), privacy: .public)s v=\(String(format:"%.2f",pts), privacy: .public)s buf=\(self.state.isBuffering, privacy: .public) subStream=\(subStreamIdx, privacy: .public) subCues=\(subCueCount, privacy: .public) subImgCues=\(subImgCount, privacy: .public)")
+            // [diag] window distributions. av: per-frame pts-audioTime (ms);
+            // aq: per-callback consumed output samples. maxJump/flips large =
+            // pacing oscillation (晃动 signature); steady offset = healthy.
+            // All periodic [diag] lines are gated by diagLoggingEnabled (off
+            // in production).
+            if Self.diagLoggingEnabled {
+                logger.info("[diag] av[n=\(av.count, privacy: .public) mean=\(String(format:"%+.1f", av.mean*1000), privacy: .public)ms sd=\(String(format:"%.1f", av.stddev*1000), privacy: .public)ms min=\(String(format:"%+.1f", av.min*1000), privacy: .public)ms max=\(String(format:"%+.1f", av.max*1000), privacy: .public)ms jump=\(String(format:"%.1f", av.maxJump*1000), privacy: .public)ms flips=\(av.signFlips, privacy: .public)] aq[n=\(aq.count, privacy: .public) mean=\(String(format:"%.0f", aq.mean), privacy: .public) min=\(String(format:"%.0f", aq.min), privacy: .public) max=\(String(format:"%.0f", aq.max), privacy: .public) jump=\(String(format:"%.0f", aq.maxJump), privacy: .public)]")
+                // [diag] where ticks went: drain=skip-behind pops, stall=freeze-ahead
+                // ticks, deny=SyncController refusals, appends=decode supply.
+                logger.info("[diag] tick[drain=\(tick.drainLag, privacy: .public) stall=\(tick.stallAhead, privacy: .public) deny=\(tick.checkDeny, privacy: .public) noFrame=\(tick.noFrame, privacy: .public) guardSkip=\(tick.guardSkip, privacy: .public) appends=\(tick.appends, privacy: .public) depth[n=\(tick.drainDepth.count, privacy: .public) mean=\(String(format:"%.0f", tick.drainDepth.mean*1000), privacy: .public)ms max=\(String(format:"%.0f", tick.drainDepth.max*1000), privacy: .public)ms]]")
+                // [diag] display-order integrity (2026-10-13): gap = pts interval
+                // between displayed frames. Healthy 23.976fps content: min≈max≈41.7ms.
+                // Decode-order display (broken PTS): min≈20.8 / max≈62.5 (or negative).
+                // rewrites = frames whose PTS the validator synthesized this window.
+                logger.info("[diag] show[n=\(shown.count, privacy: .public) mean=\(String(format:"%.1f", shown.mean*1000), privacy: .public)ms min=\(String(format:"%.1f", shown.min*1000), privacy: .public)ms max=\(String(format:"%.1f", shown.max*1000), privacy: .public)ms jump=\(String(format:"%.1f", shown.maxJump*1000), privacy: .public)ms] rewrites=\(rewrites, privacy: .public)")
+            }
 
             // Throughput: bytes read since last sample / elapsed.
             let (bytesDelta, tpElapsed): (Int64, Double) = displayLoopLock.withLock {
@@ -2346,6 +2579,12 @@ public final class NativeBackend: PlayerBackend {
     private func _seek(to: Duration, synchronousDemuxerSeek: Bool) {
         let secs = to.secondsDouble
         logger.info("seek to \(String(format:"%.1f",secs))s")
+        // [diag] arm the seek-landing capture: the first displayed frame of the
+        // new position logs pts - target (videoLand).
+        displayLoopLock.withLock {
+            pendingSeekLandTarget = secs
+            seekLandLogged = false
+        }
         // 捕获自增后的值:连续快速 seek(拖动多次/连按快进)时,后面异步执行的
         // performDemuxerSeek 要靠这个值判断"我是不是已经被更新的 seek 取代了"
         // (2026-09-03 用户反馈连续 seek 后音视频差出几十秒实锤——旧代码里
@@ -2633,17 +2872,39 @@ public final class NativeBackend: PlayerBackend {
             recreateAudioOutput()
             return
         }
+        // Millisecond precision: components.seconds alone truncates to whole
+        // seconds, seeking up to 1s behind the position being watched (and
+        // anchoring audioClock there).
         let posSecs = Double(state.position.components.seconds)
+            + Double(state.position.components.attoseconds) / 1e18
         _ = demuxer.seek(to: posSecs)
         if let stream = demuxer.audioStream {
             audioDecoder = FFmpegAudioDecoder(stream: stream, sampleRate: 44100, channels: 2)
         }
+        // Flush the video pipeline INSIDE demuxLock, same as performDemuxerSeek:
+        // the demux loop is blocked here, so no post-landing frame can slip in
+        // and be wiped by the flush, and no pre-switch frame in flight in the
+        // decoder can survive past it.
+        videoDecoder?.flush()
+        jitterBuffer.flush()
+        // The demuxer has just jumped physically. The demux loop resets the
+        // PTSValidator ONLY on a physicalSeekGeneration change (see
+        // performDemuxerSeek) — without this bump the validator keeps the
+        // pre-switch baseline, reads the landing keyframe as a >5s anomaly and
+        // enters its blind clock: every subsequent PTS is SYNTHESIZED as
+        // (+1 frame duration), so the jitter buffer's PTS-ordered insertion
+        // degenerates to decode order and B-frames display out of order. On
+        // fast motion the picture then visibly rocks back and forth, and it
+        // never recovers — predicted and real timestamps advance at the same
+        // rate, so the |pts - predict| < 1s exit can never fire — until a real
+        // seek resets the validator (2026-10-13 切音轨后画面来回晃: the
+        // validator reset is exactly why seek "fixed" it).
+        physicalSeekGeneration += 1
         seekLock.withLock { seekSerial += 1; seekLandedSerial = seekSerial }   // seeked synchronously above
         demuxLock.unlock()
 
-        // 4. Flush video pipeline
-        videoDecoder?.flush()
-        jitterBuffer.flush()
+        // 4. Flush the rest of the pipeline (the video decoders and the jitter
+        // buffer were flushed under demuxLock above).
         syncController.reset()
         displayLoopLock.withLock { lastBypassPopTime = 0 }
         _renderer.flush()

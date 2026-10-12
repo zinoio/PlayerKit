@@ -91,7 +91,38 @@ public final class AudioUnitOutput: AudioOutputBackend {
     /// different amounts of audio per codec.
     private var bufferedSamples = 0
 
+    // [diag] cumulative queue-health counters (晃动 localization 2026-10-12):
+    // enqueues/starts/pauses/resumes since last drain — distinguishes "queue
+    // never fed" (enqueues≈callbacks, both tiny) from "queue repeatedly
+    // paused/started" (starts≫callbacks) as the reason the audio clock crawls.
+    private var diagEnqueues = 0
+    private var diagStarts = 0
+    private var diagPauses = 0
+    private var diagResumes = 0
+
     public let supportsPassthrough: Bool = false
+
+    /// [diag] Queue health since last drain: control-call counts + the
+    /// instantaneous paused/buffered state.
+    struct QueueDiag {
+        var enqueues = 0
+        var starts = 0
+        var pauses = 0
+        var resumes = 0
+        var pausedNow = false
+        var bufferedSamplesNow = 0
+        var bufferedFramesNow = 0
+    }
+
+    func drainQueueDiag() -> QueueDiag {
+        lock.lock(); defer { lock.unlock() }
+        let d = QueueDiag(enqueues: diagEnqueues, starts: diagStarts, pauses: diagPauses,
+                          resumes: diagResumes, pausedNow: paused,
+                          bufferedSamplesNow: bufferedSamples,
+                          bufferedFramesNow: bufferedFrameCount)
+        diagEnqueues = 0; diagStarts = 0; diagPauses = 0; diagResumes = 0
+        return d
+    }
 
     public var bufferedDuration: Double {
         // Approximate: assume 1024 samples per frame at the output sample rate.
@@ -254,6 +285,7 @@ public final class AudioUnitOutput: AudioOutputBackend {
         lock.lock()
         let queue = audioQueue
         if !paused { paused = true }
+        diagPauses += 1
         lock.unlock()
         guard queue != nil else { return }
         controlQueue.async { [weak self] in
@@ -267,6 +299,7 @@ public final class AudioUnitOutput: AudioOutputBackend {
         lock.lock()
         let queue = audioQueue
         if paused { paused = false }
+        diagResumes += 1
         lock.unlock()
         guard queue != nil else {
             // 音频队列尚不存在时被要求恢复:start() 未跑或队列已 dispose。
@@ -326,9 +359,11 @@ public final class AudioUnitOutput: AudioOutputBackend {
         AudioQueueEnqueueBuffer(queue, buf, 0, nil)
         if Self.tracksPlayedContent { contentFifo.append((contentPts, Double(frame.sampleCount) / Double(max(1, clock.sampleRate)))) }
         enqueuedFrames += 1
+        diagEnqueues += 1
         bufferedFrameCount += 1
         bufferedSamples += frame.sampleCount
         let shouldRestart = !paused
+        if shouldRestart { diagStarts += 1 }
         lock.unlock()
 
         // Only (re)start if not deliberately paused by the buffering state machine.

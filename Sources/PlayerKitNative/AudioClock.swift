@@ -47,9 +47,26 @@ final class AudioClock: @unchecked Sendable {
         guard bytesPerSample > 0, sampleRate > 0 else { return }
         let maxPerCall = Int64(Double(sampleRate) * maxAdvanceSeconds)
         let outputSamples = min(Int64(byteCount / bytesPerSample), maxPerCall)
-        let scaled = Int64(Double(outputSamples) * max(0.25, min(4.0, rate)))
-        lock.withLock { _consumedSamples += scaled }
+        lock.withLock {
+            // [diag] callback granularity distribution (晃动 localization):
+            // a healthy queue fires ~23ms AAC buffers steadily; batched /
+            // stalled callbacks show up as a wide max/min or a large maxJump.
+            advanceDiag.record(Double(outputSamples))
+            _consumedSamples += Int64(Double(outputSamples) * max(0.25, min(4.0, rate)))
+        }
     }
+
+    /// [diag] Per-callback consumed-output-sample distribution since the last
+    /// drain (see SyncDiagStats). Returns and resets atomically.
+    func drainAdvanceDiag() -> SyncDiagStats {
+        lock.withLock {
+            let s = advanceDiag
+            advanceDiag.reset()
+            return s
+        }
+    }
+
+    private var advanceDiag = SyncDiagStats()
 
     /// Called by AudioQueue callback when a primer (silence) buffer is consumed.
     /// Identical to advance() but also decrements _primerPendingSamples so that

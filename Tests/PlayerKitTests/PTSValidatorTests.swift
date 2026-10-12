@@ -63,4 +63,42 @@ final class PTSValidatorTests: XCTestCase {
         let result = v.validate(2.04)  // 直接通过,不再走盲钟增量
         XCTAssertEqual(result, 2.04, accuracy: 0.001)
     }
+
+    // MARK: - Persistent-offset blind lock (2026-10-13 切轨后画面来回晃)
+
+    /// A physical jump the validator is NOT told about (no reset/rebase) locks
+    /// it into the blind clock FOREVER when the jump is a pure offset: the
+    /// synthesized prediction and the real timestamps advance at the same rate,
+    /// so |pts − predict| never drops below recoveryWindow. Every frame's PTS
+    /// is then synthesized, PTS-ordered insertion degenerates to decode order,
+    /// and B-frames display out of order — the picture rocks back and forth on
+    /// fast motion. This is why a demuxer jump MUST bump
+    /// physicalSeekGeneration (performDemuxerSeek and, since this fix,
+    /// selectAudioTrack).
+    func testUnresetOffsetLocksBlindClockPermanently() {
+        var v = PTSValidator(frameDuration: 1.0 / 24.0)
+        _ = v.validate(100.0)  // pre-switch baseline
+        // Landing 6s behind (seek byte-estimate error) — every real packet is
+        // ~6s below the synthesized prediction.
+        var rewritten = 0
+        for i in 0..<240 {
+            let real = 94.0 + Double(i) / 24.0
+            if abs(v.validate(real) - real) > 0.0005 { rewritten += 1 }
+        }
+        XCTAssertEqual(rewritten, 240, "offset-blind lock must rewrite every frame — the failure this guards against")
+    }
+
+    /// The same jump WITH a reset (what a physical-seek generation bump buys)
+    /// passes through cleanly: the landing frame re-baselines the validator.
+    func testResetAdoptsTheJumpedBaseline() {
+        var v = PTSValidator(frameDuration: 1.0 / 24.0)
+        _ = v.validate(100.0)
+        v.reset()
+        var rewritten = 0
+        for i in 0..<240 {
+            let real = 94.0 + Double(i) / 24.0
+            if abs(v.validate(real) - real) > 0.0005 { rewritten += 1 }
+        }
+        XCTAssertEqual(rewritten, 0, "after reset the jumped timeline is the new truth")
+    }
 }
