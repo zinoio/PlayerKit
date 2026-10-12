@@ -664,23 +664,30 @@ final class FFmpegDemuxer: @unchecked Sendable {
             if maxStreamDur > 0 { duration = maxStreamDur }
         }
         let containerDur = duration
-        // Seek to the end of THIS connection and read the last PTS — same technique
-        // libmpv uses internally.  open() already runs on a background thread, so
-        // this does not block the UI.  Uses a single Range request on the existing
-        // HTTP connection; no second 115 session is opened.
+        // Duration resolution order, most→least trusted:
         //
-        // Skipped when:
-        // - The caller already has a known duration (from Jellyfin API metadata)
-        // - The URL is a network stream AND the container already reports a valid
-        //   duration. For remote files (especially 4K HEVC on CDNs with moov at
-        //   the end), seekRefine requires 2-3 extra HTTP round-trips (seek-to-end
-        //   → read packets → seek-back) that can add 5-15s of latency. The container
-        //   duration from the moov atom is accurate enough for playback; the small
-        //   refinement (fixing placeholder durations) is not worth the wait.
-        if !skipDurationProbe && !(isNetwork && containerDur > 0) {
+        // 1. Caller-provided knownDurationSecs (MPLS clip duration / library
+        //    metadata) whenever one exists — it is real measured metadata, and
+        //    MultiClipDemuxer always supplies it per clip.
+        // 2. The accurate end-of-stream PTS probe (seekRefine) — ALWAYS for raw
+        //    MPEG-TS (BDMV/ISO clips), whose "container duration" is not a
+        //    container field at all but ffmpeg's bitrate extrapolation over the
+        //    header bytes. Observed on a UHD BD ISO: the estimate ran 91,845s
+        //    for a ~2h main feature (12.7× over), poisoning both the byte-ratio
+        //    seek target and seekByByteOffset's refinement step size (12.7× too
+        //    small → 3 refinement rounds crawled 149s→454s toward a 1819s
+        //    target and gave up: user-visible "seek lands ~22min early").
+        // 3. Container duration for real containers (MP4 moov / MKV) on network
+        //    streams, where a seek-to-end probe costs 2-3 extra HTTP
+        //    round-trips (5-15s) that the accurate moov value doesn't justify.
+        if let known = knownDurationSecs, known > 0, skipDurationProbe || isNetwork {
+            duration = known
+            ctx.pointee.duration = Int64(known * Double(AV_TIME_BASE))
+            logger.info("duration: caller-known \(String(format: "%.1f", known), privacy: .public)s (container est. \(String(format: "%.1f", containerDur), privacy: .public)s)")
+        } else if !skipDurationProbe && !(isNetwork && containerDur > 0 && !isRawIndexlessStream) {
             duration = seekRefine(ctx: ctx, hint: duration)
             if duration != containerDur {
-                logger.info("duration refined: \(String(format: "%.1f", containerDur))s → \(String(format: "%.1f", self.duration))s")
+                logger.info("duration refined: \(String(format: "%.1f", containerDur), privacy: .public)s → \(String(format: "%.1f", self.duration), privacy: .public)s")
             }
         } else {
             if skipDurationProbe {
@@ -694,12 +701,8 @@ final class FFmpegDemuxer: @unchecked Sendable {
                 // seeking silently no-ops back to the start. Stamping the caller's
                 // already-known duration onto ctx->duration fixes the estimate
                 // without paying for a seek-to-end round trip.
-                if let known = knownDurationSecs, known > 0 {
-                    duration = known
-                    ctx.pointee.duration = Int64(known * Double(AV_TIME_BASE))
-                }
             } else {
-                logger.info("duration probe skipped (network stream with container duration=\(String(format: "%.1f", containerDur))s)")
+                logger.info("duration probe skipped (network stream with container duration=\(String(format: "%.1f", containerDur), privacy: .public)s)")
             }
         }
         logger.info("videoIdx=\(self.videoStreamIndex) audioIdx=\(self.audioStreamIndex) duration=\(String(format: "%.1f", self.duration))s")
