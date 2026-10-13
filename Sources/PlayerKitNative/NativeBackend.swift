@@ -828,6 +828,52 @@ public final class NativeBackend: PlayerBackend {
         }
     }
 
+    /// adopt 预热会话(zyno#108):跳过 new+open,直接 _finishOpen —— 切集
+    /// 只剩解码器初始化(数十 ms)。prepared 不可消费(已 adopt/已 abandon)
+    /// 时 throw,此时当前会话未被破坏(stop() 尚未执行),调用方可回退普通
+    /// play()。放在本文件内:state 的 private setter 与 _finishOpen 仅同
+    /// 文件可见。
+    public func play(prepared: PreparedMedia, seekTo: Duration? = nil,
+                     knownDuration: Duration? = nil) throws {
+        // Consume FIRST: on failure this play() must leave the current
+        // session untouched (stop() below is irreversible).
+        guard let demuxer = prepared.consume() else {
+            throw PreparedMediaError.notConsumable
+        }
+
+        // Capture the rate BEFORE stop(): stop() ends with `state = PlayerState()`
+        // (rate back to 1.0), so a capture after it always reads 1.0.
+        let previousRate = state.rate
+        stop()
+        state = PlayerState()
+        // Rate is a user preference — it survives open (see play(url:)).
+        state.rate = previousRate
+        state.isBuffering = true
+        notifyStateChange()
+
+        let url: URL
+        let headers: [String: String]
+        switch prepared.source {
+        case .url(let u, let h):
+            url = u
+            headers = h
+        case .reader:
+            url = URL(string: "custom-io://reader")!
+            headers = [:]
+        }
+
+        logger.notice("play (prepared, adopted demuxer)")
+
+        // Invalidate any in-flight open from a previous play() — the adopt
+        // path is synchronous on the main actor, so unlike play(url:) there
+        // is no gen to check against: the old open's completion callback sees
+        // a mismatched generation and closes its demuxer.
+        playGeneration += 1
+
+        _finishOpen(demuxer: demuxer, url: url, headers: headers,
+                    seekTo: seekTo, knownDuration: knownDuration)
+    }
+
     private func _finishOpen(demuxer: any PacketDemuxing, url: URL, headers: [String: String],
                               seekTo: Duration?, knownDuration: Duration?) {
         let t0 = Date()
