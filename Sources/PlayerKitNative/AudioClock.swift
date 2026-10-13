@@ -12,9 +12,68 @@ final class AudioClock: @unchecked Sendable {
     /// primer callbacks cancel out rather than spuriously advancing audioTime.
     private var _primerPendingSamples: Int64 = 0
 
+    // MARK: - Audio delay (zyno#104)
+
+    /// User-facing audio delay in CONTENT seconds, signed. d<0 (audio earlier)
+    /// is a pure clock offset — sync delays the video to `audioTime` (mpv
+    /// semantics), no content is touched. d>0 is physically implemented by the
+    /// output-side delay line, whose LIVE held amount is reported back here via
+    /// setExternalHold(). Guarded by lock.
+    private var _delaySecs: Double = 0
+
+    /// Seconds of decoded audio currently held by the output delay line
+    /// (always ≥ 0; 0 when d ≤ 0 — no line). Reported live by the line's pump
+    /// so the clock reads the shift actually in effect, not the target: during
+    /// the line's initial fill the hold grows gradually and sync pulls the
+    /// picture along smoothly instead of jumping. Guarded by lock.
+    private var _externalHoldSecs: Double = 0
+
+    /// Apply a user audio delay. Call together with AudioUnitOutput's
+    /// setDelayTarget() (which owns the physical hold for d>0). Safe mid-play.
+    func setDelay(_ secs: Double) {
+        let v = secs.isFinite ? secs : 0
+        lock.withLock { _delaySecs = v }
+    }
+
+    /// Called by the delay line whenever its held amount changes (push/drain/
+    /// flush). `secs` is CONTENT-domain hold (the line reports wall seconds,
+    /// AudioUnitOutput scales by the playback rate before calling).
+    func setExternalHold(_ secs: Double) {
+        lock.withLock { _externalHoldSecs = max(0, secs.isFinite ? secs : 0) }
+    }
+
+    /// Negative part of the delay (min(0, d)) for callers that bypass this
+    /// clock — the passthrough master-clock read sites in NativeBackend apply
+    /// the same offset to the injected backend's playbackTime.
+    var negativeHold: Double {
+        lock.withLock { min(0, _delaySecs) }
+    }
+
+    /// Whether any real (non-primer) output has been consumed. The display
+    /// loop's clock-ready test must use this — with d<0 audioTime starts at
+    /// −|d| and would never cross the old `audioTime > 0.001` test until |d|
+    /// seconds had actually played.
+    var hasConsumedOutput: Bool {
+        lock.withLock { _consumedSamples > Int64(0.001 * Double(sampleRate)) }
+    }
+
     /// Current playback position in seconds. Safe to call from any thread.
+    ///
+    /// zyno#104: `consumed` always tracks the position being HEARD (AudioQueue
+    /// callbacks). The user-facing position must be the FEED (picture) side:
+    /// d>0's delay line holds |d| between heard and feed — the live hold is
+    /// added back so sync locks the picture to the feed while sound lags it;
+    /// d<0 subtracts |d| so sync delays the picture behind the heard audio.
+    /// A static offset baked in at reset() cannot express this: an output-side
+    /// hold cancelled by a clock subtraction would leave sync pulling the
+    /// picture back to the heard position (feedback loop), i.e. no relative
+    /// shift at all.
     var audioTime: Double {
-        lock.withLock { Double(max(0, _consumedSamples)) / Double(sampleRate) }
+        lock.withLock {
+            Double(max(0, _consumedSamples)) / Double(sampleRate)
+                + _externalHoldSecs
+                + min(0, _delaySecs)
+        }
     }
 
     /// Single-callback advance cap. AudioQueue normally fires one callback per

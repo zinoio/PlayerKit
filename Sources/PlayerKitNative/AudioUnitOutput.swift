@@ -28,6 +28,16 @@ public final class AudioUnitOutput: AudioOutputBackend {
     /// clock.advancePrimer() so _primerPendingSamples stays accurate.
     private var pendingPrimerCallbacks: Int = 0
 
+    // MARK: Audio delay (zyno#104)
+
+    /// Physical hold for d>0: frames park here before the real queue. See
+    /// AudioDelayLine. Guarded by its own lock; ordering output lock → line
+    /// lock only (the line never calls back in).
+    private let delayLine = AudioDelayLine()
+    /// User audio delay in CONTENT seconds (≥ 0 here — the negative half is a
+    /// pure clock offset owned by AudioClock). Guarded by lock.
+    private var _delayTargetContent: Double = 0
+
     // Test seams (off by default; production never sets them). With
     // `tracksPlayedContent` on, the source-content PTS of every enqueued buffer is
     // queued (buffers complete in order) and, as buffers finish playing, the content
@@ -129,8 +139,12 @@ public final class AudioUnitOutput: AudioOutputBackend {
         Double(bufferedFrameCount) * 1024.0 / Double(clock.sampleRate)
     }
 
-    init(clock: AudioClock) {
+    init(clock: AudioClock, delaySecs: Double = 0) {
         self.clock = clock
+        _delayTargetContent = max(0, delaySecs.isFinite ? delaySecs : 0)
+        // Wall target is (re)derived from the rate in setPlaybackRate/start();
+        // the output starts at rate 1.0 so content == wall here.
+        delayLine.setTarget(_delayTargetContent)
     }
 
     deinit { stop() }
@@ -177,6 +191,7 @@ public final class AudioUnitOutput: AudioOutputBackend {
         let sr = sampleRate > 0 ? sampleRate : 44100
         let ch = channels > 0 ? channels : 2
         _channels = ch
+        delayLine.configure(sampleRate: sr)
 
         var format = AudioStreamBasicDescription(
             mSampleRate: Float64(sr),
@@ -255,6 +270,11 @@ public final class AudioUnitOutput: AudioOutputBackend {
         bufferedSamples = 0
         contentFifo.removeAll(); playedContentEndPTS = .nan
         lock.unlock()
+        // Seek/stop/track-switch all land here: drop the held-back frames so
+        // stale pre-seek audio can't play from the new position, and zero the
+        // clock's hold with it. (stop()/flush()/start() all route through.)
+        delayLine.flush()
+        clock.setExternalHold(0)
         return (old, finalEnqueued)
     }
 
@@ -317,7 +337,61 @@ public final class AudioUnitOutput: AudioOutputBackend {
         }
     }
 
+    /// Line-aware entry (zyno#104). With no delay target (the default) this is
+    /// a direct pass-through — zero behavior change. With d>0 the frame parks
+    /// in AudioDelayLine and only frames the pump releases reach the queue.
+    /// The line runs OUTSIDE the output lock (it never calls back in; see its
+    /// doc) — releasing it into enqueueDirect per frame re-takes the lock.
     func enqueue(_ frame: PCMFrame, contentPts: Double = .nan) {
+        lock.lock()
+        let targetContent = _delayTargetContent
+        let rate = _playbackRate
+        lock.unlock()
+        guard targetContent > 0.0005, rate > 0 else {
+            enqueueDirect(frame, contentPts: contentPts)
+            return
+        }
+        // Frames arriving here are rate-scaled (wall) audio — the tempo
+        // processor runs upstream — so the content target ÷ rate gives the
+        // wall hold. The clock reads the hold back in CONTENT seconds
+        // (wall × rate), keeping the picture on the feed timeline while the
+        // sound lags it.
+        let due = delayLine.push(frame, contentPts: contentPts)
+        _syncHoldToClock()
+        for f in due { enqueueDirect(f.frame, contentPts: f.contentPts) }
+    }
+
+    /// Apply the user audio delay (CONTENT seconds, ≥ 0 meaningful here — the
+    /// negative half is a pure clock offset owned by AudioClock). Called by
+    /// NativeBackend.setAudioDelay and after rebuilding the output (track
+    /// switch / reopen carry the delay across, like setPlaybackRate).
+    func setDelayTarget(contentSecs: Double) {
+        lock.lock()
+        _delayTargetContent = max(0, contentSecs.isFinite ? contentSecs : 0)
+        let rate = _playbackRate
+        lock.unlock()
+        let due = delayLine.setTarget(_delayTargetContent / max(0.25, rate))
+        _syncHoldToClock()
+        for f in due { enqueueDirect(f.frame, contentPts: f.contentPts) }
+    }
+
+    /// Seconds of audio still pending somewhere in this output (queue + delay
+    /// line + unpaid primers). The display loop's end-of-stream free-run uses
+    /// this to tell "audio ended" from "audio still draining".
+    var hasPendingOutput: Bool {
+        lock.lock()
+        let queuePending = bufferedSamples > 0 || pendingPrimerCallbacks > 0
+        lock.unlock()
+        return queuePending || delayLine.heldSeconds > 0.001
+    }
+
+    /// Push the line's current hold to the clock in CONTENT seconds.
+    private func _syncHoldToClock() {
+        lock.lock(); let rate = _playbackRate; lock.unlock()
+        clock.setExternalHold(delayLine.heldSeconds * rate)
+    }
+
+    private func enqueueDirect(_ frame: PCMFrame, contentPts: Double) {
         // Hold the lock across allocate+copy+enqueue so the dispose path can't
         // tear down the queue between the guard and the AudioQueue calls.
         // disposeUnderLock() also takes this lock, so it waits for any in-flight
@@ -342,7 +416,22 @@ public final class AudioUnitOutput: AudioOutputBackend {
         // (measured: 0.555 s at each start, 0.57–0.74 s more after each resume).
         // The default (5 s) is well above any normal buffering window and keeps
         // the accumulation bounded.
-        if paused, Double(bufferedSamples) >= maxPausedBufferSeconds * Double(max(1, clock.sampleRate)) {
+        // The cap is in SECONDS of audio. It used to be "60 buffers", which was
+        // meant as ≈2 s but is only 0.64 s for 512-sample DTS frames — shorter
+        // than the ~1.2–1.4 s the video jitter buffer needs to fill after every
+        // start/resume. Every frame beyond it was silently discarded, so the
+        // audible content jumped ahead of the picture by the dropped span
+        // (measured: 0.555 s at each start, 0.57–0.74 s more after each resume).
+        // The default (5 s) is well above any normal buffering window and keeps
+        // the accumulation bounded. The delay line's hold counts toward the
+        // budget too (zyno#104): at d=+5 the pipeline legitimately parks 5 s in
+        // the line, and the cap must not treat the queue alone as the whole
+        // budget or it would strangle the refill after resume.
+        // (Already under the output lock here; the line lock nests after it.)
+        let lineHold = _delayTargetContent > 0.0005 ? delayLine.heldSeconds : 0
+        if paused,
+           Double(bufferedSamples) / Double(max(1, clock.sampleRate)) + lineHold
+              >= maxPausedBufferSeconds {
             lock.unlock()
             return
         }
@@ -419,7 +508,16 @@ public final class AudioUnitOutput: AudioOutputBackend {
     public func setPlaybackRate(_ rate: Double) {
         lock.lock()
         _playbackRate = max(0.25, min(4.0, rate.isFinite ? rate : 1.0))
+        let targetContent = _delayTargetContent
+        let effective = _playbackRate
         lock.unlock()
+        guard targetContent > 0.0005 else { return }
+        // Re-derive the wall hold for the new rate and release whatever became
+        // due (the line's frames are wall audio of the OLD rate; re-deriving
+        // with the new rate keeps the CONTENT delay the user asked for).
+        let due = delayLine.setTarget(targetContent / max(0.25, effective))
+        _syncHoldToClock()
+        for f in due { enqueueDirect(f.frame, contentPts: f.contentPts) }
     }
 
     /// Proxy for clock.audioTime.
