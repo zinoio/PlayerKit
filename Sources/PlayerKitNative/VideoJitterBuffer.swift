@@ -261,6 +261,12 @@ final class VideoJitterBuffer: @unchecked Sendable {
         return popped
     }
 
+    /// 视频流是否已读到 EOF(demux 线程 markEOF 置位,flush 复位)。
+    /// 显示循环用它判断"音频已结束且排空"的末尾 free-run(zyno#104)。
+    var atEOF: Bool {
+        lock.withLock { eofReached }
+    }
+
     /// 视频流已读取到 EOF。若此刻仍在 .buffering 且已有帧(剩余内容不足
     /// resumeDuration,正常门槛永远无法满足),立即转 .playing 开始渲染,
     /// 避免 seek 到接近末尾时零帧黑屏。

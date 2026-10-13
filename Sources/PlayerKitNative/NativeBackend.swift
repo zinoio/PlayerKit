@@ -166,6 +166,34 @@ public final class NativeBackend: PlayerBackend {
     /// Written once in init(), only read afterwards — safe to access from any thread.
     private nonisolated(unsafe) var _injectedAudioOutput: (any AudioOutputBackend)?
 
+    /// User audio delay in CONTENT seconds, signed, ±5 clamp (zyno#104).
+    /// Session-level by design: deliberately NOT part of PlayerState (state
+    /// rebuilds on stop(); the delay must survive across play() calls — same
+    /// reasoning as the previousRate capture). Written/read on the main actor
+    /// (UI + output construction); the display thread reads the negative half
+    /// through AudioClock.negativeHold, which is lock-guarded.
+    public private(set) var audioDelay: Double = 0
+
+    /// Apply a user audio delay (zyno#104). d>0 physically holds decoded audio
+    /// in AudioUnitOutput's delay line (sound lags the picture); d<0 is a pure
+    /// clock offset — sync delays the picture (mpv semantics, no content
+    /// change). Instant mid-play; survives seek/pause/track-switch/stop.
+    ///
+    /// Passthrough caveat: the PRO renderer's clock is anchored to packet PTS
+    /// (its schedule shifts with any entry-side hold), so a PlayerKit-side hold
+    /// is inaudible there and a positive delay is NOT applied on the passthrough
+    /// path — needs a PassthroughOutput.setDelay (PRO-side anchor offset); the
+    /// negative half works via the master-clock offset below.
+    public func setAudioDelay(_ secs: Double) {
+        let clamped = min(5.0, max(-5.0, secs.isFinite ? secs : 0))
+        audioDelay = clamped
+        audioClock.setDelay(clamped)
+        audioUnitOutput?.setDelayTarget(contentSecs: max(0, clamped))
+        if clamped > 0, _injectedAudioOutput != nil, isPassthroughActive {
+            logger.warning("[audio-delay] +\(clamped)s requested while passthrough is active: not applied on this path (PRO backend), PCM-only for now")
+        }
+    }
+
     private var demuxer: (any PacketDemuxing)?
     /// VT may fail on extreme-parameter streams (e.g. 4K@120fps).
     /// When that happens the demux loop hot-swaps in a software FFmpegVideoDecoder.
@@ -191,7 +219,11 @@ public final class NativeBackend: PlayerBackend {
 
     // A/V sync modules
     private let audioClock = AudioClock()
-    private var audioUnitOutput: AudioUnitOutput?
+    /// Swapped on the main actor (open/track-switch/seek); the display thread
+    /// reads it for the end-of-stream free-run probe (hasPendingOutput) —
+    /// nonisolated(unsafe) like videoDecoder/isPassthroughActive, writes stay
+    /// on main by convention, reads are lock-guarded inside AudioUnitOutput.
+    private nonisolated(unsafe) var audioUnitOutput: AudioUnitOutput?
     /// Playback-rate time-stretch, fed between the audio decoder and the
     /// AudioUnitOutput on the audioDecodeQueue (rate≠1 only; 1x bypasses).
     private let audioTempo = PlaybackTempoProcessor()
@@ -1199,7 +1231,7 @@ public final class NativeBackend: PlayerBackend {
         if let as_ = demuxer.audioStream,
            let dec = FFmpegAudioDecoder(stream: as_, sampleRate: 44100, channels: 2) {
             audioDecoder = dec
-            let out = AudioUnitOutput(clock: audioClock)
+            let out = AudioUnitOutput(clock: audioClock, delaySecs: audioDelay)
             audioUnitOutput = out
             isPassthroughActive = false
             logger.info("audio: \(dec.outputSampleRate)Hz \(dec.outputChannels)ch")
@@ -1613,7 +1645,10 @@ public final class NativeBackend: PlayerBackend {
                         // read-ahead against the passthrough renderer's clock
                         // instead, or the demux loop would enqueue the entire
                         // file's audio into the renderer at decode speed.
-                        audioPos = pt
+                        // zyno#104: apply the negative-half clock offset so the
+                        // read-ahead tracks the picture (which sync delays by
+                        // |d|), same as the PCM path's audioTime.
+                        audioPos = pt + audioClock.negativeHold
                         passthroughWallClockAnchor = nil
                     } else if _injectedAudioOutput != nil && isPassthroughActive {
                         // Passthrough clock unavailable (backend without a
@@ -1628,6 +1663,7 @@ public final class NativeBackend: PlayerBackend {
                         // no audio, ~20x drift).
                         if let anchor = passthroughWallClockAnchor {
                             audioPos = anchor.pts + CACurrentMediaTime() - anchor.wall
+                                + audioClock.negativeHold
                         } else if pts.isFinite {
                             passthroughWallClockAnchor = (CACurrentMediaTime(), pts)
                             audioPos = pts
@@ -2100,7 +2136,12 @@ public final class NativeBackend: PlayerBackend {
         let audioTime: Double
         if _injectedAudioOutput != nil && isPassthroughActive,
            let pt = _injectedAudioOutput?.playbackTime, pt.isFinite, pt >= 0 {
-            audioTime = pt
+            // zyno#104: the renderer's timebase is anchored to packet PTS (=
+            // what is audible); the negative-half delay offsets the master
+            // clock so sync holds the picture |d| behind the sound — the same
+            // hold AudioClock applies on the PCM path. Positive d has no
+            // PlayerKit-side physical hold here (see setAudioDelay's doc).
+            audioTime = pt + audioClock.negativeHold
         } else {
             audioTime = audioClock.audioTime
         }
@@ -2121,6 +2162,12 @@ public final class NativeBackend: PlayerBackend {
         let (stillNeedsCal, clockReady) = displayLoopLock.withLock {
             (needsClockCalibration, audioClockReady)
         }
+        // Audio stream finished and the output fully drained (PCM path only —
+        // the passthrough renderer's pending state is not observable here).
+        // Nothing advances the clock anymore: sync's reference is dead, so the
+        // tail must free-run instead of freezing (see both uses below).
+        let audioEnded = !isPassthroughActive && jitterBuffer.atEOF
+            && !(audioUnitOutput?.hasPendingOutput ?? false)
         if syncController.hasDisplayedFrame, !stillNeedsCal, clockReady {
             // Guard window = compensation + 2 frames, scaled by max(1, rate)
             // — see SyncController.guardWindow. The old fixed 60ms sat 10ms
@@ -2138,8 +2185,13 @@ public final class NativeBackend: PlayerBackend {
                     drainDepthStats.record(audioTime - lagging.pts)
                 }
             }
-            // Freeze-ahead: if the front frame is ahead of audio, stall
-            if let ahead = jitterBuffer.peek(at: 0), ahead.pts > audioTime + guardWindow {
+            // Freeze-ahead: if the front frame is ahead of audio, stall —
+            // unless the audio has ended and drained (zyno#104 d<0 tail; also
+            // the pre-existing short-audio-file edge): freezing would hold the
+            // last frames forever and keep position short of the real end, so
+            // audioEnded falls through to the source-paced free-run below.
+            if let ahead = jitterBuffer.peek(at: 0), ahead.pts > audioTime + guardWindow,
+               !audioEnded {
                 displayLoopLock.withLock {
                     tickStallAhead += 1
                     // [diag] freeze-site sample: what front/audio actually were
@@ -2152,7 +2204,9 @@ public final class NativeBackend: PlayerBackend {
                         }
                     }
                 }
-                let pos = Duration.milliseconds(Int64(audioTime * 1000))
+                // Clamp: with d<0 (zyno#104) audioTime legitimately starts
+                // negative; the seek bar must not.
+                let pos = Duration.milliseconds(Int64(max(0, audioTime) * 1000))
                 let due = displayLoopLock.withLock { (pos - lastNotifiedPos) >= .milliseconds(500) }
                 if due {
                     displayLoopLock.withLock { lastNotifiedPos = pos }
@@ -2179,7 +2233,11 @@ public final class NativeBackend: PlayerBackend {
         // Detect when audioClock has started advancing (primer callbacks fired).
         // Until then, bypass syncController timing and display frames as fast as
         // they're decoded so video doesn't stall waiting for audio to catch up.
-        if !clockReady, audioTime > 0.001 {
+        // zyno#104: consume-based, not audioTime-based — with d<0 audioTime
+        // starts at −|d| and would only cross 0 after |d| seconds had played,
+        // leaving the display free-running (unsynced) through the entire
+        // negative window instead of holding the picture there.
+        if !clockReady, audioClock.hasConsumedOutput {
             displayLoopLock.withLock { audioClockReady = true }
         }
 
@@ -2196,14 +2254,31 @@ public final class NativeBackend: PlayerBackend {
         // frames indefinitely → "首帧后不播放" bug.
         let (shouldShow, delay): (Bool, Double)
         if clockReady {
-            (shouldShow, delay) = syncController.check(
-                nextPTS: frame.pts,
-                followingPTS: followingPTS,
-                audioTime: audioTime,
-                now: now,
-                serial: serial,
-                rate: playbackRate
-            )
+            if audioEnded {
+                // EOF free-run (see audioEnded above): pace the remaining
+                // frames at source PTS intervals — the same pacing the
+                // pre-clock bypass uses — until the tail has played out and
+                // position lands on the real end (upstream completion fires).
+                let srcGap = followingPTS.map { max(0.01, min(0.5, $0 - frame.pts)) }
+                    ?? (1.0 / 25.0)
+                let due = displayLoopLock.withLock {
+                    if now - lastBypassPopTime >= srcGap {
+                        lastBypassPopTime = now
+                        return true
+                    }
+                    return false
+                }
+                (shouldShow, delay) = (due, 0)
+            } else {
+                (shouldShow, delay) = syncController.check(
+                    nextPTS: frame.pts,
+                    followingPTS: followingPTS,
+                    audioTime: audioTime,
+                    now: now,
+                    serial: serial,
+                    rate: playbackRate
+                )
+            }
         } else {
             // 旁路不再每 tick 弹帧:音频时钟卡死时 audioClockReady 永远为
             // false,原来每个显示驱动 tick 都直接弹帧 —— macOS 双驱动
@@ -2229,7 +2304,7 @@ public final class NativeBackend: PlayerBackend {
             if clockReady { displayLoopLock.withLock { tickCheckDeny += 1 } }
             // 旁路 pacing 等待时视频帧已在正确位置,用帧 PTS 而非 audioTime
             // (音频卡死时恒为 0,会把进度条打回 0)。
-            let pos = Duration.milliseconds(Int64((clockReady ? audioTime : frame.pts) * 1000))
+            let pos = Duration.milliseconds(Int64(max(0, clockReady ? audioTime : frame.pts) * 1000))
             let due = displayLoopLock.withLock { (pos - lastNotifiedPos) >= .milliseconds(500) }
             if due {
                 displayLoopLock.withLock { lastNotifiedPos = pos }
@@ -2982,7 +3057,7 @@ public final class NativeBackend: PlayerBackend {
         // in-flight process(), and the demux loop is blocked on demuxLock.
         audioTempo.reset(sampleRate: sr, channels: ch)
         audioClock.reset(to: posSecs, sampleRate: sr)
-        audioUnitOutput = AudioUnitOutput(clock: audioClock)
+        audioUnitOutput = AudioUnitOutput(clock: audioClock, delaySecs: audioDelay)
         audioUnitOutput?.start(sampleRate: sr, channels: ch)
         // A fresh output starts at rate 1.0 — reapply the current rate or a
         // track switch silently drops playback speed.
@@ -3080,7 +3155,7 @@ public final class NativeBackend: PlayerBackend {
     }
 
     private func recreateAudioOutput() {
-        audioUnitOutput = AudioUnitOutput(clock: audioClock)
+        audioUnitOutput = AudioUnitOutput(clock: audioClock, delaySecs: audioDelay)
         if let dec = audioDecoder {
             audioUnitOutput?.start(sampleRate: dec.outputSampleRate, channels: dec.outputChannels)
             audioUnitOutput?.pause()
