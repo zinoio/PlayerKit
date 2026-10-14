@@ -42,11 +42,21 @@ final class AudioClock: @unchecked Sendable {
         lock.withLock { _externalHoldSecs = max(0, secs.isFinite ? secs : 0) }
     }
 
-    /// Negative part of the delay (min(0, d)) for callers that bypass this
-    /// clock — the passthrough master-clock read sites in NativeBackend apply
-    /// the same offset to the injected backend's playbackTime.
+    /// Negative part of the delay (min(0, d)) — PCM-path semantic twin of
+    /// fullDelay. Kept for callers that want the legacy negative-only offset.
     var negativeHold: Double {
         lock.withLock { min(0, _delaySecs) }
+    }
+
+    /// Full signed delay (zyno#127) for the passthrough master-clock read
+    /// sites. The PRO renderer schedules output by packet PTS, so no
+    /// entry-side hold can shift what is audible there — the shift lives
+    /// entirely in the clock: sync locks the picture to `playbackTime + d`,
+    /// which makes the picture run d ahead (d>0, sound audibly lags) or
+    /// behind (d<0, sound leads). Positive and negative are symmetric here,
+    /// unlike the PCM path where d>0 needs the output-side delay line.
+    var fullDelay: Double {
+        lock.withLock { _delaySecs }
     }
 
     /// Whether any real (non-primer) output has been consumed. The display

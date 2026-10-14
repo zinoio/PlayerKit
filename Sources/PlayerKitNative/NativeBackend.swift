@@ -170,8 +170,8 @@ public final class NativeBackend: PlayerBackend {
     /// Session-level by design: deliberately NOT part of PlayerState (state
     /// rebuilds on stop(); the delay must survive across play() calls — same
     /// reasoning as the previousRate capture). Written/read on the main actor
-    /// (UI + output construction); the display thread reads the negative half
-    /// through AudioClock.negativeHold, which is lock-guarded.
+    /// (UI + output construction); the display thread reads it through
+    /// AudioClock (audioTime / fullDelay), which is lock-guarded.
     public private(set) var audioDelay: Double = 0
 
     /// Apply a user audio delay (zyno#104). d>0 physically holds decoded audio
@@ -179,19 +179,17 @@ public final class NativeBackend: PlayerBackend {
     /// clock offset — sync delays the picture (mpv semantics, no content
     /// change). Instant mid-play; survives seek/pause/track-switch/stop.
     ///
-    /// Passthrough caveat: the PRO renderer's clock is anchored to packet PTS
-    /// (its schedule shifts with any entry-side hold), so a PlayerKit-side hold
-    /// is inaudible there and a positive delay is NOT applied on the passthrough
-    /// path — needs a PassthroughOutput.setDelay (PRO-side anchor offset); the
-    /// negative half works via the master-clock offset below.
+    /// Passthrough (zyno#127): the PRO renderer schedules by packet PTS, so
+    /// the shift lives entirely in the master clock — read sites apply
+    /// AudioClock.fullDelay (the WHOLE signed d, symmetric both ways) to the
+    /// injected backend's playbackTime. The renderer side needs no change and
+    /// holds no delay state, so track/output rebuilds keep the target
+    /// automatically.
     public func setAudioDelay(_ secs: Double) {
         let clamped = min(5.0, max(-5.0, secs.isFinite ? secs : 0))
         audioDelay = clamped
         audioClock.setDelay(clamped)
         audioUnitOutput?.setDelayTarget(contentSecs: max(0, clamped))
-        if clamped > 0, _injectedAudioOutput != nil, isPassthroughActive {
-            logger.warning("[audio-delay] +\(clamped)s requested while passthrough is active: not applied on this path (PRO backend), PCM-only for now")
-        }
     }
 
     private var demuxer: (any PacketDemuxing)?
@@ -1645,10 +1643,11 @@ public final class NativeBackend: PlayerBackend {
                         // read-ahead against the passthrough renderer's clock
                         // instead, or the demux loop would enqueue the entire
                         // file's audio into the renderer at decode speed.
-                        // zyno#104: apply the negative-half clock offset so the
-                        // read-ahead tracks the picture (which sync delays by
-                        // |d|), same as the PCM path's audioTime.
-                        audioPos = pt + audioClock.negativeHold
+                        // zyno#127: apply the full signed delay as a clock
+                        // offset (read-ahead tracks the picture, which runs
+                        // d ahead for d>0 and |d| behind for d<0), same
+                        // semantics as the PCM path's audioTime.
+                        audioPos = pt + audioClock.fullDelay
                         passthroughWallClockAnchor = nil
                     } else if _injectedAudioOutput != nil && isPassthroughActive {
                         // Passthrough clock unavailable (backend without a
@@ -1663,7 +1662,7 @@ public final class NativeBackend: PlayerBackend {
                         // no audio, ~20x drift).
                         if let anchor = passthroughWallClockAnchor {
                             audioPos = anchor.pts + CACurrentMediaTime() - anchor.wall
-                                + audioClock.negativeHold
+                                + audioClock.fullDelay
                         } else if pts.isFinite {
                             passthroughWallClockAnchor = (CACurrentMediaTime(), pts)
                             audioPos = pts
@@ -2136,12 +2135,15 @@ public final class NativeBackend: PlayerBackend {
         let audioTime: Double
         if _injectedAudioOutput != nil && isPassthroughActive,
            let pt = _injectedAudioOutput?.playbackTime, pt.isFinite, pt >= 0 {
-            // zyno#104: the renderer's timebase is anchored to packet PTS (=
-            // what is audible); the negative-half delay offsets the master
-            // clock so sync holds the picture |d| behind the sound — the same
-            // hold AudioClock applies on the PCM path. Positive d has no
-            // PlayerKit-side physical hold here (see setAudioDelay's doc).
-            audioTime = pt + audioClock.negativeHold
+            // zyno#127: the renderer's timebase is anchored to packet PTS (=
+            // what is audible), so the WHOLE signed delay lives in the master
+            // clock: sync holds the picture d ahead of the sound for d>0
+            // (audible lag) and |d| behind for d<0 (sound leads) — symmetric,
+            // and identical to the PCM path's negative half. No PRO-side
+            // change: PassthroughOutput's playbackTime stays a pure timebase
+            // read, so the offset survives output/track rebuilds for free
+            // (it lives in audioClock, which outlives them).
+            audioTime = pt + audioClock.fullDelay
         } else {
             audioTime = audioClock.audioTime
         }
