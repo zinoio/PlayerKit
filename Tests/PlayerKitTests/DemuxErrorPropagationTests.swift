@@ -25,7 +25,7 @@ final class DemuxErrorPropagationTests: XCTestCase {
         static let brokenCode = 1152
         private let data: Data
         private let error = NSError(
-            domain: "io.reflex.PlayerKitTests.reader",
+            domain: "io.zyno.PlayerKitTests.reader",
             code: ThrowingAtEndReader.brokenCode,
             userInfo: [NSLocalizedDescriptionKey: "reader broken (simulated risk-control blackhole)"])
         init(data: Data) { self.data = data }

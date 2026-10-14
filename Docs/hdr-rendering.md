@@ -231,7 +231,7 @@ CI SDR: coded=1918x1036                          ← 走 8-bit CI SDR pipeline
 | `PlayerKit/Sources/PlayerKitNative/FFmpegVideoDecoder.swift` | FFmpeg SW/HW 解码,提取 `FrameMetadata` |
 | `PlayerKit/Sources/PlayerKitNative/VTVideoDecoder.swift` | VT 直解,返回 `FrameMetadata()` 空 |
 | `PlayerKitPro/Sources/PlayerKitPro/EDRRenderer.swift` | Metal 10-bit HDR pipeline + 5 种 tone-map algorithm(EDR 直出) |
-| `PlayerKitPro/Sources/PlayerKitPro/ToneMapProcessor.swift` | HDR → SDR tone-map processor,同 5 种 algorithm(SDR target;reflex 客户端经 `toneMapperProvider` 注入) |
+| `PlayerKitPro/Sources/PlayerKitPro/ToneMapProcessor.swift` | HDR → SDR tone-map processor,同 5 种 algorithm(SDR target;Zyno 客户端经 `toneMapperProvider` 注入) |
 
 ## 新增 HDR 格式时的流程
 

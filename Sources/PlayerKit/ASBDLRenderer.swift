@@ -3,7 +3,7 @@ import CoreVideo
 import QuartzCore
 import os
 
-private let logger = Logger(subsystem: "io.reflex.PlayerKit", category: "asbdl")
+private let logger = Logger(subsystem: "io.zyno.PlayerKit", category: "asbdl")
 
 /// Result of tone-mapping processing: the processed pixel buffer and the
 /// color params that describe it. When tone mapping converts HDR → SDR,

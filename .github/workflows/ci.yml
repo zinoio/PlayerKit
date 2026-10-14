@@ -68,7 +68,7 @@ jobs:
             --additional-symbol-graph-dir .build/*/symbolgraph \
             --output-dir .build/docs \
             --fallback-display-name PlayerKit \
-            --fallback-bundle-identifier io.reflex.PlayerKit
+            --fallback-bundle-identifier io.zyno.PlayerKit
       - name: Package docs archive
         run: tar -czf PlayerKit-docs.tar.gz -C .build docs
       - name: Upload docs artifact
