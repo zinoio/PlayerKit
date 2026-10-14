@@ -73,6 +73,23 @@ final class AudioDelayTests: XCTestCase {
         XCTAssertEqual(clock.negativeHold, -0.7, accuracy: 0.0001)
     }
 
+    /// zyno#127:透传主时钟读 fullDelay——完整带符号 d,正负对称。
+    /// 透传 renderer 按包 PTS 排程,偏移只能活在时钟里:sync 锁画面到
+    /// `playbackTime + d`,d>0 画面领先 d(声音可闻延后),d<0 落后 |d|。
+    func testFullDelayExposesWholeSignedValue() {
+        let clock = AudioClock()
+        clock.setDelay(1.5)
+        XCTAssertEqual(clock.fullDelay, 1.5, accuracy: 0.0001,
+                       "d>0 必须完整透出(负半轴属性会裁成 0,透传正 d 就失效)")
+        clock.setDelay(-0.7)
+        XCTAssertEqual(clock.fullDelay, -0.7, accuracy: 0.0001)
+        clock.setDelay(0)
+        XCTAssertEqual(clock.fullDelay, 0.0, accuracy: 0.0001)
+        // 非 finite 输入被 setDelay 归零,读数不炸。
+        clock.setDelay(.nan)
+        XCTAssertEqual(clock.fullDelay, 0.0, accuracy: 0.0001)
+    }
+
     // MARK: - AudioDelayLine 泵规则
 
     func testZeroTargetIsPassThrough() {
