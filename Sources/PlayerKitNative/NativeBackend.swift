@@ -1513,7 +1513,7 @@ public final class NativeBackend: PlayerBackend {
 
                 packetCount += 1
                 let pktSize = Int(result.packet.pointee.size)
-                if pktSize > 0 { throughputLock.withLock { totalBytesRead += Int64(pktSize) } }
+                if pktSize > 0 { throughputLock.withLock { self.totalBytesRead += Int64(pktSize) } }
                 let streamIndex = result.streamIndex
                 let packet = result.packet
                 // Set true by the audio branch when it hands packet ownership
