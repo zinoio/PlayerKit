@@ -537,6 +537,9 @@ public final class NativeBackend: PlayerBackend {
     private nonisolated(unsafe) var totalBytesRead: Int64 = 0
     private nonisolated(unsafe) var lastBytesLogged: Int64 = 0
     private nonisolated(unsafe) var lastThroughputTime: Double = 0
+    /// 吞吐计数专用叶子锁:totalBytesRead 在 demux 线程累加、display 线程采样。
+    /// 不与 displayLoopLock 混用(避免锁序问题),只护这三个计数变量(zyno#145)。
+    private nonisolated(unsafe) let throughputLock = NSLock()
     /// Highest PTS (seconds) of packets read by the demux loop — used to compute bufferedDuration.
     private nonisolated(unsafe) var maxDownloadedPts: Double = 0
 
@@ -1510,7 +1513,7 @@ public final class NativeBackend: PlayerBackend {
 
                 packetCount += 1
                 let pktSize = Int(result.packet.pointee.size)
-                if pktSize > 0 { totalBytesRead += Int64(pktSize) }
+                if pktSize > 0 { throughputLock.withLock { totalBytesRead += Int64(pktSize) } }
                 let streamIndex = result.streamIndex
                 let packet = result.packet
                 // Set true by the audio branch when it hands packet ownership
@@ -2480,12 +2483,21 @@ public final class NativeBackend: PlayerBackend {
             }
 
             // Throughput: bytes read since last sample / elapsed.
-            let (bytesDelta, tpElapsed): (Int64, Double) = displayLoopLock.withLock {
-                (self.totalBytesRead - self.lastBytesLogged, now - self.lastThroughputTime)
+            // zyno#145 基线守卫:stop() 会把 lastThroughputTime 清 0,而 now 是
+            // CACurrentMediaTime(开机秒数)。没有守卫时,开播/切集后的首个窗口
+            // 分母是"开机至今",速度恒 ≈0 并持续一个采样周期(~5s)。首样本只记
+            // 基线不写值,从第二个采样起窗口才有效。
+            let (bytesDelta, tpElapsed, hasBaseline): (Int64, Double, Bool) = throughputLock.withLock {
+                (self.totalBytesRead - self.lastBytesLogged, now - self.lastThroughputTime, self.lastThroughputTime > 0)
             }
-            if tpElapsed > 1.0 {
+            if hasBaseline, tpElapsed > 1.0 {
                 self.state.cacheSpeed = Int64(Double(bytesDelta) / tpElapsed)
-                displayLoopLock.withLock {
+                throughputLock.withLock {
+                    self.lastBytesLogged = self.totalBytesRead
+                    self.lastThroughputTime = now
+                }
+            } else if !hasBaseline {
+                throughputLock.withLock {
                     self.lastBytesLogged = self.totalBytesRead
                     self.lastThroughputTime = now
                 }
@@ -2949,8 +2961,10 @@ public final class NativeBackend: PlayerBackend {
             // restart").
             lastNotifiedPos = .zero
             displayedVideoFrames = 0
-            lastBytesLogged = 0
-            lastThroughputTime = 0
+            throughputLock.withLock {
+                lastBytesLogged = 0
+                lastThroughputTime = 0
+            }
             lastSubtitleText = nil
             lastSubtitleImage = nil
         }
