@@ -232,7 +232,7 @@ public final class PlaybackVerifier: VideoRenderer {
     private let wrapped: any VideoRenderer
     private let config: Config
     private let stateLock = NSLock()
-    private let processingQueue = DispatchQueue(label: "io.reflex.PlayerKit.PlaybackVerifier", qos: .utility)
+    private let processingQueue = DispatchQueue(label: "io.zyno.PlayerKit.PlaybackVerifier", qos: .utility)
 
     // Session state — guarded by stateLock.
     private var sessionActive = false

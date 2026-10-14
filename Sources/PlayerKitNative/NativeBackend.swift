@@ -7,7 +7,7 @@ import PlayerKit
 @_exported import CFFmpeg
 import os
 
-private let logger = Logger(subsystem: "io.reflex.PlayerKit", category: "backend")
+private let logger = Logger(subsystem: "io.zyno.PlayerKit", category: "backend")
 
 private extension Duration {
     var secondsDouble: Double {
@@ -213,7 +213,7 @@ public final class NativeBackend: PlayerBackend {
     /// therefore audio sample order — is preserved; flush() call sites are
     /// routed through this same queue (via .sync) so they can't race a
     /// still-in-flight decode() of an earlier packet.
-    private let audioDecodeQueue = DispatchQueue(label: "io.reflex.PlayerKit.audioDecode")
+    private let audioDecodeQueue = DispatchQueue(label: "io.zyno.PlayerKit.audioDecode")
 
     // A/V sync modules
     private let audioClock = AudioClock()
@@ -333,7 +333,7 @@ public final class NativeBackend: PlayerBackend {
     /// P2: dedicated serial queue for the macOS fallback render timer — off-main
     /// like the CVDisplayLink thread that is the primary driver. displayNextFrame
     /// is idempotent (renderGate), so fallback and link never corrupt each other.
-    private let displayFallbackQueue = DispatchQueue(label: "io.reflex.PlayerKit.displayFallback", qos: .userInteractive)
+    private let displayFallbackQueue = DispatchQueue(label: "io.zyno.PlayerKit.displayFallback", qos: .userInteractive)
     #if os(macOS)
     private var cvDisplayLink: CVDisplayLink?
     /// macOS 兜底渲染驱动。CVDisplayLink 在 stop→start 之后可能延迟数秒才恢复
@@ -731,7 +731,7 @@ public final class NativeBackend: PlayerBackend {
             // → 403) reject every clip and the whole concat open fails.
             let listContent = urls.map { concatFileEntry(url: $0, headers: hdrs) }.joined()
             let tmpDir = FileManager.default.temporaryDirectory
-            let listFile = tmpDir.appendingPathComponent("reflex-concat-\(UUID().uuidString).txt")
+            let listFile = tmpDir.appendingPathComponent("zyno-concat-\(UUID().uuidString).txt")
             do {
                 try listContent.write(to: listFile, atomically: true, encoding: .utf8)
             } catch {
@@ -3279,7 +3279,7 @@ public final class NativeBackend: PlayerBackend {
                 rl.run(mode: .common, before: Date(timeIntervalSinceNow: 0.5))
             }
         }
-        thread.name = "io.reflex.PlayerKit.displayLink"
+        thread.name = "io.zyno.PlayerKit.displayLink"
         thread.qualityOfService = QualityOfService.userInteractive
         displayLinkThread = thread
         thread.start()

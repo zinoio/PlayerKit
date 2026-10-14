@@ -5,7 +5,7 @@ import CoreAudio
 import os
 import PlayerKit
 
-private let logger = Logger(subsystem: "io.reflex.PlayerKit", category: "audio.output")
+private let logger = Logger(subsystem: "io.zyno.PlayerKit", category: "audio.output")
 
 public final class AudioUnitOutput: AudioOutputBackend {
     /// Guards `audioQueue`, `running`, `paused`, `bufferedFrameCount`, `enqueuedFrames`.
@@ -68,7 +68,7 @@ public final class AudioUnitOutput: AudioOutputBackend {
     /// AudioQueue call is dispatched here. Serial ⇒ pause→resume order is
     /// preserved; the queue ref is re-read under the lock inside the block so
     /// a stop()/flush() that ran first is skipped.
-    private let controlQueue = DispatchQueue(label: "io.reflex.PlayerKit.audio.control")
+    private let controlQueue = DispatchQueue(label: "io.zyno.PlayerKit.audio.control")
 
     private func currentQueueLocked() -> AudioQueueRef? {
         lock.lock(); defer { lock.unlock() }
