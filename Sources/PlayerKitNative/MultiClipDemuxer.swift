@@ -266,6 +266,11 @@ extension MultiClipDemuxer: PacketDemuxing {
     var subtitleStreamIndex: Int32 { currentDemuxer?.subtitleStreamIndex ?? -1 }
     var downloadedUpToOffset: Int64 { currentDemuxer?.downloadedUpToOffset ?? -1 }
     var totalFileBytes: Int64 { currentDemuxer?.totalFileBytes ?? -1 }
+    /// Read off the post-seek active clip: `seek(to:)` switches clips before
+    /// the local FFmpegDemuxer.seek() runs, so the landing (if the clip's own
+    /// seek produced one — byte-domain BDMV clip seeks do) belongs to
+    /// `currentDemuxer`.
+    var lastSeekLandedPTS: Double? { currentDemuxer?.lastSeekLandedPTS }
     var isPassthroughCodec: Bool { currentDemuxer?.isPassthroughCodec ?? false }
     var isDolbyVision: Bool { currentDemuxer?.isDolbyVision ?? false }
     var doviProfile: UInt8 { currentDemuxer?.doviProfile ?? 0 }

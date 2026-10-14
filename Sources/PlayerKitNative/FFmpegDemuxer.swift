@@ -90,6 +90,13 @@ final class FFmpegDemuxer: @unchecked Sendable {
     /// internal lock.
     private(set) var lastDemuxError: Error?
 
+    /// The video PTS the most recent seek() landed on — set by
+    /// seekByByteOffset (byte-domain seeks probe an actual video PTS), nil
+    /// for index-guided av_seek_frame seeks (no probe is paid) and cleared
+    /// at the start of every seek(). Confined to the demux thread like the
+    /// rest of the mutable demux state.
+    private(set) var lastSeekLandedPTS: Double?
+
     var videoStreamIndex: Int32 { videoStream.map { $0.pointee.index } ?? -1 }
     var audioStreamIndex: Int32 { audioStream.map { $0.pointee.index } ?? -1 }
     /// Highest byte offset available in the reader's buffer. -1 if unknown (URL-based stream).
@@ -820,6 +827,7 @@ final class FFmpegDemuxer: @unchecked Sendable {
 
     func seek(to time: Double) -> Bool {
         guard let ctx = formatCtx else { return false }
+        lastSeekLandedPTS = nil
         if isRawIndexlessStream, duration > 0, let pb = ctx.pointee.pb {
             return seekByByteOffset(to: time, ctx: ctx, pb: pb)
         }
@@ -850,6 +858,14 @@ final class FFmpegDemuxer: @unchecked Sendable {
     /// avformat.h's documented way to reset demuxer-internal buffering after
     /// manually repositioning the AVIOContext on a headerless, resyncable
     /// format like MPEG-TS.
+    ///
+    /// zyno#142: the acceptance criterion is now one-sided — a landing is
+    /// final only when it sits AT or BEFORE the target (within `maxBackstep`;
+    /// closer candidates still win a retry round). The old ±1.5 s two-sided
+    /// tolerance let seeks land PAST the target, and once the demux position
+    /// is past it no fine-seek stage can recover — decode-and-discard needs a
+    /// backward landing to discard forward from. The landing PTS is published
+    /// via `lastSeekLandedPTS` so NativeBackend can arm the discard.
     private func seekByByteOffset(to time: Double, ctx: UnsafeMutablePointer<AVFormatContext>,
                                   pb: UnsafeMutablePointer<AVIOContext>) -> Bool {
         let totalBytes = avioBridge?.totalBytes ?? -1
@@ -858,6 +874,14 @@ final class FFmpegDemuxer: @unchecked Sendable {
 
         var targetByte = Int64(Double(totalBytes) * min(max(time / duration, 0), 1))
         var landedPTS: Double?
+        // Best (closest-to-target) backward landing across rounds, as a byte
+        // position we can return to without re-probing.
+        var bestBackwardByte: Int64?
+        var bestBackwardPTS: Double = 0
+        // Decode-and-discard cost of a backward landing: (time - landed) of
+        // content decoded at ~4× real-time HW speed before the first frame at
+        // the target shows. 2 s of content ≈ 0.5 s of silent wait.
+        let maxBackstep: Double = 2.0
 
         // A single linear byte-ratio guess is unreliable on VBR content — an
         // action-heavy stretch can run several times the average bitrate of a
@@ -865,12 +889,11 @@ final class FFmpegDemuxer: @unchecked Sendable {
         // guess tens of seconds from the target (observed: 21s overshoot on a
         // GoT remux). Refine against an actually-probed video PTS instead of
         // trusting the ratio blindly: seek, read forward for the first
-        // decodable video PTS, and if it's off from `time` by more than a
-        // small tolerance, correct the byte target using the observed error
-        // (converted via the file's average bitrate) and try again. Each
-        // round's probe reads are simply thrown away — only the final avio
-        // position matters, since the real demux loop starts fresh from
-        // wherever this function leaves pb/ctx.
+        // decodable video PTS, and correct the byte target using the observed
+        // error (converted via the file's average bitrate). Each round's
+        // probe reads are simply thrown away — only the final avio position
+        // matters, since the real demux loop starts fresh from wherever this
+        // function leaves pb/ctx.
         for attempt in 0..<3 {
             avio_flush(pb)
             guard avio_seek(pb, targetByte, 0 /* SEEK_SET */) >= 0 else {
@@ -884,13 +907,38 @@ final class FFmpegDemuxer: @unchecked Sendable {
             guard let pts = probeVideoPTSSeconds(ctx: ctx) else { break }
             landedPTS = pts
             let errorSecs = pts - time
-            if abs(errorSecs) < 1.5 || attempt == 2 { break }
+            if errorSecs <= 0 {
+                // Backward landing: a candidate. Track the closest one — a
+                // VBR correction round can overshoot backwards, and landing
+                // 2 s before the target costs less discard than 0.5 s
+                // before it.
+                if pts > bestBackwardPTS {
+                    bestBackwardByte = targetByte
+                    bestBackwardPTS = pts
+                }
+                if time - pts <= maxBackstep { break }
+            }
+            if attempt == 2 { break }
             targetByte = min(max(targetByte - Int64(errorSecs * avgBytesPerSecond), 0), totalBytes - 1)
         }
 
-        let ok = landedPTS != nil
-        logger.info("seek to \(String(format: "%.1f", time))s \(ok ? "OK" : "FAILED") (byte-domain target=\(targetByte)/\(totalBytes)\(landedPTS.map { " landed=\(String(format: "%.1f", $0))s" } ?? ""))")
-        return ok
+        // Every round landed past the target but an earlier round landed
+        // before it: return to that round's byte position. One extra
+        // reposition, no further probing — playing from there is guaranteed
+        // to be a backward landing, which the discard stage converges onto
+        // the target.
+        if let landed = landedPTS, landed > time, let bbByte = bestBackwardByte {
+            avio_flush(pb)
+            if avio_seek(pb, bbByte, 0 /* SEEK_SET */) >= 0, avformat_flush(ctx) >= 0 {
+                landedPTS = bestBackwardPTS
+                logger.info("seek to \(String(format: "%.1f", time))s rewound to best backward landing \(String(format: "%.2f", bestBackwardPTS))s")
+            }
+        }
+
+        guard let final = landedPTS else { return false }
+        lastSeekLandedPTS = final
+        logger.info("seek to \(String(format: "%.1f", time))s OK (byte-domain target=\(targetByte)/\(totalBytes) landed=\(String(format: "%.2f", final))s)")
+        return true
     }
 
     /// Reads forward from the current position looking for the first packet

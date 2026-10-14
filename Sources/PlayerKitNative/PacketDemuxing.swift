@@ -48,6 +48,15 @@ protocol PacketDemuxing: AnyObject, Sendable {
     /// former must surface as a playback error, the latter is "played to end".
     var lastDemuxError: Error? { get }
     func seek(to time: Double) -> Bool
+    /// The video PTS the most recent seek() physically landed on, when the
+    /// demuxer knows it. Non-nil only for byte-domain seeks
+    /// (FFmpegDemuxer.seekByByteOffset — raw indexless MPEG-TS / BDMV clips),
+    /// which probe an actual video PTS while converging; index-guided
+    /// av_seek_frame seeks don't pay a probe and report nil. NativeBackend
+    /// uses the gap between this and the requested target to arm
+    /// discard-until-target fine-seek (zyno#142); nil keeps those paths on
+    /// their historical land-on-GOP-boundary behavior.
+    var lastSeekLandedPTS: Double? { get }
     func close()
 }
 

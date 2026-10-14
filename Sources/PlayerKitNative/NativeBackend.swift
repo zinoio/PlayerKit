@@ -248,6 +248,26 @@ public final class NativeBackend: PlayerBackend {
     // seek 后黑屏/位置跳变"。
     private let maxCalibrationGap: Double = 15.0
 
+    // zyno#142 discard-until-target fine-seek. A byte-domain seek (BDMV clip /
+    // raw MPEG-TS) lands on a GOP boundary up to ±2s from the target; the
+    // calibration above then re-anchors audioClock to the LANDING, so the whole
+    // timeline (picture + audible content) starts displaced from what the user
+    // asked for — observed −2.1…+1.8s on a 68GB BD ISO. When the demuxer
+    // reports a backward landing beyond this gap, the backend arms the discard:
+    // audioClock stays anchored at the target and the landing-to-target stretch
+    // is decoded but thrown away (video: display-loop pops; audio: demux-loop
+    // packet drop), so playback starts AT the target.
+    private static let discardArmGap: Double = 0.5
+    /// Video side, read by the display loop / written by performDemuxerSeek
+    /// (which holds demuxLock, NOT displayLoopLock — a dedicated tiny lock
+    /// avoids any lock-order question between the two).
+    private let discardLock = NSLock()
+    private nonisolated(unsafe) var discardVideoUntilPts: Double?
+    /// Audio side. Both writer (performDemuxerSeek) and reader (demux loop
+    /// audio branch) hold demuxLock, so a plain variable is as safe as the
+    /// other demux-loop state next to it.
+    private nonisolated(unsafe) var discardAudioUntilPts: Double?
+
     // Subtitle cue buffer — written from demux loop, read from display loop.
     private struct SubtitleCue {
         let startPts: Double
@@ -1485,6 +1505,12 @@ public final class NativeBackend: PlayerBackend {
                         logger.error("immediate EOF, recovering to 0")
                         dLock.lock()
                         _ = demuxer.seek(to: 0)
+                        // Disarm any fine-seek discard armed by the seek that just
+                        // failed — frames now come from 0, everything left of the
+                        // old target must display or the recovery plays as a black
+                        // screen up to that target.
+                        discardAudioUntilPts = nil
+                        discardLock.withLock { self.discardVideoUntilPts = nil }
                         self.videoDecoder?.flush()
                         // Routed through audioDecodeQueue so this can't race a
                         // still-in-flight decode() of an earlier packet on that
@@ -1729,7 +1755,17 @@ public final class NativeBackend: PlayerBackend {
                         usePassthrough = false
                     }
 
-                    if usePassthrough {
+                    // zyno#142: drop audio packets inside the discard window
+                    // without decoding — audioClock is anchored at the seek
+                    // target and must stay there until the first surviving
+                    // sample, or audible content would start at the GOP-boundary
+                    // landing (the displaced timeline fine-seek removes).
+                    // Comparison is `<`, so the first packet at/after the
+                    // target passes and the flag simply goes inert.
+                    if let until = discardAudioUntilPts,
+                       NativeBackend.ptsFromPacket(packet, demuxer: demuxer) < until {
+                        dLock.unlock()  // falls through to the tail av_packet_free
+                    } else if usePassthrough {
                         isPassthroughActive = true
                         // Passthrough path: route compressed packets directly to
                         // AVSampleBufferAudioRenderer (PRO backend).
@@ -2110,6 +2146,32 @@ public final class NativeBackend: PlayerBackend {
         // large gap, skip calibration and let the freeze-ahead guard hold
         // video until the real audioClock catches up instead — a one-time
         // stall, but it converges on what's actually audible.
+        // zyno#142: drain the discard window BEFORE the calibration block
+        // peeks. Frames left of the target are already decoded — pop them
+        // without displaying. While the discard is active this tick does
+        // nothing else: the calibration below peeking a GOP-boundary frame
+        // would re-anchor audioClock at the landing (the ±2s displacement this
+        // stage exists to remove), and the pre-clock bypass would display
+        // those frames. Once the queue front reaches the target the flag
+        // clears, calibration sees a ≈0 gap (no-op), and the normal path
+        // takes over. The audio side drops packets in the demux loop
+        // (discardAudioUntilPts), so audioClock — anchored at the target by
+        // the seek reset — stays put until the first surviving sample lands.
+        while true {
+            let until = discardLock.withLock { discardVideoUntilPts }
+            guard let until else { break }
+            if let front = jitterBuffer.peek(at: 0), front.pts < until {
+                jitterBuffer.pop()
+                continue
+            }
+            if jitterBuffer.peek(at: 0) != nil {
+                discardLock.withLock { discardVideoUntilPts = nil }
+                logger.info("fine-seek: discard window drained, first frame at target")
+            }
+            break
+        }
+        if discardLock.withLock({ discardVideoUntilPts }) != nil { return }
+
         let (needsCalibration, forceCalibration) = displayLoopLock.withLock {
             (needsClockCalibration, forceClockCalibration)
         }
@@ -2867,6 +2929,20 @@ public final class NativeBackend: PlayerBackend {
             return
         }
         _ = demuxer?.seek(to: secs)
+        // zyno#142: arm discard-until-target from the demuxer's reported
+        // landing. Only byte-domain seeks report one (index-guided seeks
+        // report nil → flags cleared → historical behavior, MKV/MP4 untouched).
+        // A landing PAST the target can't be discarded back — the content is
+        // already behind us; accept it as-is (seekByByteOffset itself steers
+        // away from that, see its one-sided acceptance criterion).
+        if let landed = demuxer?.lastSeekLandedPTS, landed <= secs, secs - landed > Self.discardArmGap {
+            backend?.discardLock.withLock { backend?.discardVideoUntilPts = secs }
+            backend?.discardAudioUntilPts = secs
+            logger.info("fine-seek: discard \(String(format: "%.2f", secs - landed), privacy: .public)s (landed=\(String(format: "%.2f", landed), privacy: .public) target=\(String(format: "%.2f", secs), privacy: .public))")
+        } else {
+            backend?.discardLock.withLock { backend?.discardVideoUntilPts = nil }
+            backend?.discardAudioUntilPts = nil
+        }
         videoDecoder?.flush()
         // Routed through audioDecodeQueue so this can't race a still-in-flight
         // decode() of a pre-seek packet on that queue.
@@ -2932,14 +3008,17 @@ public final class NativeBackend: PlayerBackend {
         demuxer?.close(); demuxer = nil
         videoDecoder = nil; audioDecoder = nil
         // No seek can be pending on a stream that no longer exists; never leave the
-        // frame gate (SeekFrameGate) closed for the next session.
+        // frame gate (SeekFrameGate) closed or a fine-seek discard window armed
+        // for the next session.
         seekLock.withLock { seekLandedSerial = seekSerial }
+        discardAudioUntilPts = nil
         demuxLock.unlock()
         jitterBuffer.flush()
         syncController.reset()
         displayLoopLock.withLock {
             lastBypassPopTime = 0
             forceClockCalibration = false
+            discardLock.withLock { discardVideoUntilPts = nil }
             // Un-poison the status pipeline: without this, a position reported by a
             // previous (e.g. frozen/free-wheeling) session persists here and every
             // `(pos - lastNotifiedPos) >= 500ms` gate in displayNextFrame stays
@@ -3019,6 +3098,20 @@ public final class NativeBackend: PlayerBackend {
         let posSecs = Double(state.position.components.seconds)
             + Double(state.position.components.attoseconds) / 1e18
         _ = demuxer.seek(to: posSecs)
+        // zyno#142: same fine-seek arming as performDemuxerSeek — the track
+        // switch re-seek lands on a GOP boundary too, and without the discard
+        // the timeline re-anchors at the new landing (a second displacement
+        // stacked on whatever the user already had). demuxLock is held, same
+        // regime as the arming in performDemuxerSeek.
+        if let landed = demuxer.lastSeekLandedPTS, landed <= posSecs,
+           posSecs - landed > Self.discardArmGap {
+            discardLock.withLock { discardVideoUntilPts = posSecs }
+            discardAudioUntilPts = posSecs
+            logger.info("fine-seek (track switch): discard \(String(format: "%.2f", posSecs - landed), privacy: .public)s (landed=\(String(format: "%.2f", landed), privacy: .public))")
+        } else {
+            discardLock.withLock { discardVideoUntilPts = nil }
+            discardAudioUntilPts = nil
+        }
         if let stream = demuxer.audioStream {
             audioDecoder = FFmpegAudioDecoder(stream: stream, sampleRate: 44100, channels: 2)
         }
