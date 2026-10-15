@@ -289,6 +289,8 @@ public final class NativeBackend: PlayerBackend {
     private nonisolated(unsafe) var lastSubtitleImage: CGImage? = nil
 
     private nonisolated(unsafe) var subtitleDecoder: FFmpegSubtitleDecoder?
+    // libass typeset renderer for ASS/SSA streams (zyno#158); nil → legacy text cues.
+    private nonisolated(unsafe) var assRenderer: ASSRenderer?
 
     // Pipeline control
     private let demuxLock = NSLock()
@@ -1227,13 +1229,19 @@ public final class NativeBackend: PlayerBackend {
             }
         }
 
-        // Initialize graphic subtitle decoder for PGS/VOBSUB streams
+        // Initialize graphic subtitle decoder for PGS/VOBSUB streams, and the
+        // libass typeset renderer for ASS/SSA (zyno#158).
         subtitleDecoder = nil
+        assRenderer = nil
         if let defaultSubStream = demuxer.subtitleStream {
             let codecId = defaultSubStream.pointee.codecpar.pointee.codec_id
+            let vSize = CGSize(width: codedVideoWidth, height: codedVideoHeight)
             if codecId == AV_CODEC_ID_HDMV_PGS_SUBTITLE || codecId == AV_CODEC_ID_DVD_SUBTITLE {
-                let vSize = CGSize(width: codedVideoWidth, height: codedVideoHeight)
                 subtitleDecoder = FFmpegSubtitleDecoder(stream: defaultSubStream, videoSize: vSize)
+            } else if codecId == AV_CODEC_ID_ASS || codecId == AV_CODEC_ID_SSA {
+                let r = Self.makeASSRenderer(stream: defaultSubStream, videoSize: vSize)
+                assRenderer = r
+                logger.notice("[sub] ASS renderer \(r != nil ? "created" : "unavailable (no extradata)")")
             }
         }
 
@@ -1824,13 +1832,28 @@ public final class NativeBackend: PlayerBackend {
                     let codecId = stream?.pointee.codecpar.pointee.codec_id
                     let codecName = codecId.map { String(cString: avcodec_get_name($0)) } ?? "nil"
                     if codecId == AV_CODEC_ID_ASS || codecId == AV_CODEC_ID_SSA {
-                        let cue = Self.parseASSCue(packet: packet, stream: stream)
+                        // Typeset path (zyno#158): feed the raw Matroska event
+                        // to libass.  Falls back to the legacy tag-stripped
+                        // text cue when the stream has no extradata (renderer
+                        // never built) or the packet carries no usable PTS.
+                        let r = self.assRenderer
+                        let tb = stream?.pointee.time_base ?? AVRational(num: 0, den: 0)
+                        let tbSecs = tb.den > 0 ? Double(tb.num) / Double(tb.den) : 0
+                        let nopts = Int64(bitPattern: 0x8000000000000000)
+                        let ptsValid = r != nil && tbSecs > 0
+                            && packet.pointee.pts != nopts
+                            && packet.pointee.size > 0
+                            && packet.pointee.data != nil
+                        let pts = Double(packet.pointee.pts) * tbSecs
+                        let dur = packet.pointee.duration > 0 ? Double(packet.pointee.duration) * tbSecs : 5.0
                         dLock.unlock()
-                        if let cue {
+                        if ptsValid {
+                            let data = Data(bytes: packet.pointee.data!, count: Int(packet.pointee.size))
+                            r?.processPacket(data, ptsSecs: pts, durationSecs: dur)
+                            logger.debug("[sub] ASS packet → libass: pts=\(String(format:"%.2f",pts)) dur=\(String(format:"%.2f",dur))")
+                        } else if let cue = Self.parseASSCue(packet: packet, stream: stream) {
                             self.subtitleLock.withLock { self.subtitleCues.append(cue) }
-                            logger.debug("[sub] ASS cue appended: pts=\(String(format:"%.2f",cue.startPts))-\(String(format:"%.2f",cue.endPts)) text=\(cue.text.prefix(30))")
-                        } else {
-                            logger.warning("[sub] ASS parseASSCue returned nil (streamIdx=\(streamIndex))")
+                            logger.debug("[sub] ASS cue appended (text fallback): pts=\(String(format:"%.2f",cue.startPts))-\(String(format:"%.2f",cue.endPts)) text=\(cue.text.prefix(30))")
                         }
                     } else if codecId == AV_CODEC_ID_SUBRIP || codecId == AV_CODEC_ID_TEXT {
                         // AV_CODEC_ID_TEXT carries raw UTF-8 with no HTML tags; routing here is safe
@@ -1938,6 +1961,26 @@ public final class NativeBackend: PlayerBackend {
     /// The Text field (index 8) may contain ASS override tags ({...}) and hardcoded
     /// line-break sequences (\N / \n). We strip tags and convert breaks to newlines.
     /// Timing comes from packet.pts/duration scaled by the subtitle stream timebase.
+    /// Builds a libass renderer for an ASS/SSA subtitle stream.  Nil when the
+    /// stream carries no extradata (bare packet streams) — callers then fall
+    /// back to the legacy text-cue path.  startOffsetSecs mirrors
+    /// FFmpegSubtitleDecoder's start_time normalization.
+    private nonisolated static func makeASSRenderer(
+        stream: UnsafeMutablePointer<AVStream>, videoSize: CGSize) -> ASSRenderer? {
+        guard let par = stream.pointee.codecpar else { return nil }
+        guard let ex = par.pointee.extradata, par.pointee.extradata_size > 0 else { return nil }
+        let exData = Data(bytes: ex, count: Int(par.pointee.extradata_size))
+        let tb = stream.pointee.time_base
+        let nopts = Int64(bitPattern: 0x8000000000000000)
+        let offset: Double
+        if stream.pointee.start_time != nopts, tb.den > 0 {
+            offset = Double(stream.pointee.start_time) * Double(tb.num) / Double(tb.den)
+        } else {
+            offset = 0
+        }
+        return ASSRenderer(extradata: exData, videoSize: videoSize, startOffsetSecs: offset)
+    }
+
     private nonisolated static func parseASSCue(
         packet: UnsafeMutablePointer<AVPacket>,
         stream: UnsafeMutablePointer<AVStream>?
@@ -2459,16 +2502,32 @@ public final class NativeBackend: PlayerBackend {
         let activeSub: String? = subtitleLock.withLock {
             subtitleCues.first { $0.startPts <= displayPts && displayPts < $0.endPts }?.text
         }
-        let (newImage, newRect): (CGImage?, CGRect) = subtitleImageLock.withLock {
-            // Prune expired cues so first(where:) doesn't scan a growing list.
-            // Keep only cues whose endPts hasn't passed yet.
-            if subtitleImageCues.count > 4 {
-                subtitleImageCues.removeAll { $0.endPts < displayPts - 1.0 }
+        let assR = self.assRenderer
+        let (newImage, newRect): (CGImage?, CGRect)
+        if let assR {
+            // ASS typeset rendering against the displayed frame's video PTS.
+            // libass's detect_change keeps the Frame instance stable across
+            // calls without content change, so the identity check below still
+            // suppresses redundant UI hops.
+            if let f = assR.renderFrame(ptsSecs: displayPts) {
+                newImage = f.image
+                newRect = f.rect
+            } else {
+                newImage = nil
+                newRect = .zero
             }
-            if let c = subtitleImageCues.first(where: { $0.startPts <= displayPts && displayPts < $0.endPts }) {
-                return (c.image, c.rect)
+        } else {
+            (newImage, newRect) = subtitleImageLock.withLock {
+                // Prune expired cues so first(where:) doesn't scan a growing list.
+                // Keep only cues whose endPts hasn't passed yet.
+                if subtitleImageCues.count > 4 {
+                    subtitleImageCues.removeAll { $0.endPts < displayPts - 1.0 }
+                }
+                if let c = subtitleImageCues.first(where: { $0.startPts <= displayPts && displayPts < $0.endPts }) {
+                    return (c.image, c.rect)
+                }
+                return (nil, .zero)
             }
-            return (nil, .zero)
         }
         let (textChanged, imageChanged) = displayLoopLock.withLock { () -> (Bool, Bool) in
             let t = activeSub != lastSubtitleText
@@ -2811,6 +2870,7 @@ public final class NativeBackend: PlayerBackend {
         displayLoopLock.withLock { lastSubtitleText = nil }
         state.currentSubtitleText = nil
         subtitleImageLock.withLock { subtitleImageCues.removeAll() }
+        assRenderer?.flushEvents()   // drop queued ASS events left of the seek target
         displayLoopLock.withLock { lastSubtitleImage = nil }
         state.currentSubtitleImage = nil
         state.currentSubtitleImageRect = .zero
@@ -3062,6 +3122,7 @@ public final class NativeBackend: PlayerBackend {
         state.currentSubtitleImage = nil
         state.currentSubtitleImageRect = .zero
         subtitleDecoder = nil
+        assRenderer = nil
         chapters = []  // container chapters are per-session (zyno#101)
         state = PlayerState()
     }
@@ -3239,6 +3300,7 @@ public final class NativeBackend: PlayerBackend {
         }
 
         subtitleDecoder = nil
+        assRenderer = nil
         if let resolvedTrackId = trackId {
             let nb = Int(demuxer.formatContext?.pointee.nb_streams ?? 0)
             for i in 0..<nb {
@@ -3251,6 +3313,13 @@ public final class NativeBackend: PlayerBackend {
                         videoSize: CGSize(width: codedVideoWidth, height: codedVideoHeight)
                     )
                     logger.notice("[sub] PGS/DVD decoder created: \(self.subtitleDecoder != nil ? "OK" : "FAILED")")
+                } else if codecId == AV_CODEC_ID_ASS || codecId == AV_CODEC_ID_SSA {
+                    let r = Self.makeASSRenderer(
+                        stream: s,
+                        videoSize: CGSize(width: codedVideoWidth, height: codedVideoHeight)
+                    )
+                    assRenderer = r
+                    logger.notice("[sub] ASS renderer \(r != nil ? "created" : "unavailable (no extradata)")")
                 }
                 break
             }

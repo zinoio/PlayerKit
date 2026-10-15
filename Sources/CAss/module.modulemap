@@ -1,0 +1,9 @@
+module CAss {
+    header "include/ass/ass.h"
+    header "include/ass/ass_types.h"
+    link "ass"
+    link "freetype"
+    link "fribidi"
+    link "harfbuzz"
+    export *
+}
