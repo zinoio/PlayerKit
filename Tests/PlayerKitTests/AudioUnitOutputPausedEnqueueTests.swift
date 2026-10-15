@@ -76,14 +76,14 @@ final class AudioUnitOutputPausedEnqueueTests: XCTestCase {
         Thread.sleep(forTimeInterval: 1.6)  // long enough to play everything that was kept
         let cap = 0.5
         XCTAssertGreaterThan(clock.audioTime, cap - 0.06, "the allowed 0.5 s must be played")
-        // Upper margin must clear one enqueued frame (+10.7 ms): the cap check
-        // runs before each enqueue, so the kept total can legitimately reach
-        // cap + several frames depending on scheduler timing — on slower CI
-        // runners it has been observed at cap + 6 frames (0.5653 s), tripping
-        // the old +0.06 margin intermittently (Nightly, also on main). The
-        // protective intent is untouched: a broken cap plays the offered
-        // 2.13 s, far beyond cap + 0.09.
-        XCTAssertLessThan(clock.audioTime, cap + 0.09,
+        // Upper margin must clear scheduler-timing overshoot: the cap check
+        // runs before each enqueue, so the kept total can legitimately exceed
+        // cap by several frames depending on when the count snapshot lands —
+        // on loaded CI runners observed at cap + 6 frames (0.5653 s) and once
+        // at cap + 10 frames (0.608 s, Nightly, also on main; zyno#111).  The
+        // margin stays far below any real cap breakage: a broken cap plays the
+        // offered 2.13 s, 2.8× beyond cap + 0.25.
+        XCTAssertLessThan(clock.audioTime, cap + 0.25,
                           "audio beyond maxPausedBufferSeconds must be dropped, not accumulated")
     }
 
