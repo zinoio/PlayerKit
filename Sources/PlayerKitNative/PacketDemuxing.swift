@@ -39,6 +39,10 @@ protocol PacketDemuxing: AnyObject, Sendable {
     var audioIsAtmos: Bool { get }
     var sampleAspectRatio: Double { get }
     func selectAudioStream(by id: Int) -> Bool
+    /// 所有音频流下标;`setCachedAudioStreams` 让这些备选音轨的包也被解复用返回
+    /// (zyno#171 切轨免 seek)。默认实现:不支持(多片段等),返回空/不做事。
+    var audioStreamIndices: [Int32] { get }
+    func setCachedAudioStreams(_ indices: Set<Int32>)
     func selectSubtitleStream(by id: Int?)
     func readPacket() -> (streamIndex: Int32, packet: UnsafeMutablePointer<AVPacket>, didSwitchClip: Bool)?
     /// The reader/media error behind the most recent readPacket() failure,
@@ -61,3 +65,8 @@ protocol PacketDemuxing: AnyObject, Sendable {
 }
 
 extension FFmpegDemuxer: PacketDemuxing {}
+
+extension PacketDemuxing {
+    var audioStreamIndices: [Int32] { [] }
+    func setCachedAudioStreams(_ indices: Set<Int32>) {}
+}

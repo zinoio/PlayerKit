@@ -5,7 +5,8 @@
 /// 纯值类型、泛型 Payload(生产里是克隆的 AVPacket,测试里是 Int),不依赖 ffmpeg。
 /// 线程安全由调用方保证(生产中只在 demuxLock 内访问)。
 struct AltAudioPacketCache<Payload> {
-    static var defaultWindowSeconds: Double { 20 }
+    /// 实测网络源读超前深度 ≤2.4s(2026-10-16,zyno#171),10s 约 4 倍余量。
+    static var defaultWindowSeconds: Double { 10 }
 
     private struct Entry { let pts: Double; let payload: Payload; let bytes: Int }
 
