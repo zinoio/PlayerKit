@@ -3168,11 +3168,29 @@ public final class NativeBackend: PlayerBackend {
     private nonisolated(unsafe) static let audioSwitchQueue = DispatchQueue(
         label: "com.zyno.playerkit.audio-switch", qos: .userInitiated)
 
+    /// 没有解码器、也无法透传的音轨不能切:解码器建不起来 → 没有 PCM → 音频时钟不走 →
+    /// 视频一直等音频,整个影片冻死(zyno#171 实测 "codec not found")。
+    nonisolated static func audioTrackIsSwitchable(codecID: AVCodecID, passthroughAvailable: Bool) -> Bool {
+        passthroughAvailable || avcodec_find_decoder(codecID) != nil
+    }
+
     public func selectAudioTrack(id: String) {
         // 主线程只做轻量校验(fast fail),重负载段全部在后台队列执行
         guard let demuxer else { return }
         guard let trackId = Int(id) else { return }
         guard trackId != demuxer.audioStreamIndex else { return }
+        if let ctx = demuxer.formatContext {
+            for i in 0..<Int(ctx.pointee.nb_streams) {
+                guard let st = ctx.pointee.streams[i], Int(st.pointee.index) == trackId else { continue }
+                let cid = st.pointee.codecpar.pointee.codec_id
+                if !Self.audioTrackIsSwitchable(codecID: cid,
+                                                passthroughAvailable: _injectedAudioOutput?.supportsPassthrough == true) {
+                    logger.warning("selectAudioTrack id=\(trackId) refused: no decoder for codec \(String(cString: avcodec_get_name(cid)), privacy: .public) — keeping current track")
+                    return
+                }
+                break
+            }
+        }
         logger.info("selectAudioTrack id=\(trackId) — dispatching to background (zyno#171)")
 
         let demuxerRef = demuxer
