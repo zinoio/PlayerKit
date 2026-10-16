@@ -3080,15 +3080,39 @@ public final class NativeBackend: PlayerBackend {
         audioUnitOutput?.setPlaybackRate(clamped)
         notifyStateChange()
     }
+    /// zyno#171: 切轨的重负载段(flush/seek/管线重建)调度到专用串行队列,
+    /// 主线程只做参数校验,不再被 demuxLock + FFmpeg seek 阻塞数百毫秒。
+    private nonisolated(unsafe) static let audioSwitchQueue = DispatchQueue(
+        label: "com.zyno.playerkit.audio-switch", qos: .userInitiated)
+
     public func selectAudioTrack(id: String) {
+        // 主线程只做轻量校验(fast fail),重负载段全部在后台队列执行
         guard let demuxer else { return }
         guard let trackId = Int(id) else { return }
         guard trackId != demuxer.audioStreamIndex else { return }
+        logger.info("selectAudioTrack id=\(trackId) — dispatching to background (zyno#171)")
 
+        let demuxerRef = demuxer
+        Self.audioSwitchQueue.async { [weak self] in
+            guard let self else { return }
+            self.performAudioTrackSwitch(id: id, trackId: trackId, demuxer: demuxerRef)
+        }
+    }
+
+    /// 切轨的重负载段(原 selectAudioTrack 函数体,zyno#171 拆出)。
+    /// 在后台串行队列执行:demuxLock 阻塞 demux 循环是预期行为(切换期间
+    /// 不需要 demux 出帧),主线程不等待。
+    private func performAudioTrackSwitch(id: String, trackId: Int, demuxer: Demuxer) {
         logger.info("selectAudioTrack id=\(trackId)")
+        // zyno#171 diag: per-phase wall time of the (background) track switch.
+        let t0 = DispatchTime.now().uptimeNanoseconds
+        func ms(_ since: UInt64) -> String {
+            String(format: "%.1f", Double(DispatchTime.now().uptimeNanoseconds - since) / 1e6)
+        }
 
         // 1. Stop audio output
         audioUnitOutput?.stop()
+        let tStop = ms(t0)
 
         // 2. Under lock: flush old decoder, switch stream, seek demuxer, create new decoder.
         // All decoder/stream mutations must happen inside demuxLock so the demux loop
@@ -3096,10 +3120,12 @@ public final class NativeBackend: PlayerBackend {
         // pair of (audioStreamIndex, audioDecoder). Creating the decoder outside the lock
         // caused the loop to feed new-stream packets into the stale old decoder.
         demuxLock.lock()
+        let tLock = ms(t0)
         // Routed through audioDecodeQueue so this can't race a still-in-flight
         // decode() of an old-track packet on that queue.
         audioDecodeQueue.sync { audioDecoder?.flush() }
         audioDecoder = nil
+        let tQueue = ms(t0)
         guard demuxer.selectAudioStream(by: trackId) else {
             demuxLock.unlock()
             logger.warning("selectAudioTrack: stream \(trackId) not found, recreating original output")
@@ -3111,7 +3137,9 @@ public final class NativeBackend: PlayerBackend {
         // anchoring audioClock there).
         let posSecs = Double(state.position.components.seconds)
             + Double(state.position.components.attoseconds) / 1e18
+        let tSeek0 = DispatchTime.now().uptimeNanoseconds
         _ = demuxer.seek(to: posSecs)
+        let tSeek = ms(tSeek0)
         // zyno#142: same fine-seek arming as performDemuxerSeek — the track
         // switch re-seek lands on a GOP boundary too, and without the discard
         // the timeline re-anchors at the new landing (a second displacement
@@ -3150,6 +3178,7 @@ public final class NativeBackend: PlayerBackend {
         physicalSeekGeneration += 1
         seekLock.withLock { seekSerial += 1; seekLandedSerial = seekSerial }   // seeked synchronously above
         demuxLock.unlock()
+        let tUnlock = ms(t0)
 
         // 4. Flush the rest of the pipeline (the video decoders and the jitter
         // buffer were flushed under demuxLock above).
@@ -3192,6 +3221,7 @@ public final class NativeBackend: PlayerBackend {
         notifyStateChange()
 
         logger.info("selectAudioTrack done, new decoder sampleRate=\(self.audioDecoder?.outputSampleRate ?? 0)")
+        logger.notice("[diag] audioswitch main=\(Thread.isMainThread, privacy: .public) stop=\(tStop, privacy: .public)ms lock=\(tLock, privacy: .public)ms audioQueue=\(tQueue, privacy: .public)ms seek=\(tSeek, privacy: .public)ms heldLock=\(tUnlock, privacy: .public)ms total=\(ms(t0), privacy: .public)ms")
     }
 
     public func selectSubtitle(id: String?) {
