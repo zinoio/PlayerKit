@@ -99,6 +99,21 @@ final class FFmpegDemuxer: @unchecked Sendable {
 
     var videoStreamIndex: Int32 { videoStream.map { $0.pointee.index } ?? -1 }
     var audioStreamIndex: Int32 { audioStream.map { $0.pointee.index } ?? -1 }
+    /// 所有音频流的下标(zyno#171:决定是否启用备选音轨缓存、缓存哪些流)。
+    var audioStreamIndices: [Int32] {
+        guard let ctx = formatCtx else { return [] }
+        return (0..<Int(ctx.pointee.nb_streams)).compactMap { i in
+            guard let s = ctx.pointee.streams[i],
+                  s.pointee.codecpar.pointee.codec_type == AVMEDIA_TYPE_AUDIO else { return nil }
+            return s.pointee.index
+        }
+    }
+    /// 备选音轨缓存要求保留(不丢弃)的音频流(zyno#171);空 = 只保留选中音轨(默认)。
+    private(set) var cachedAudioStreams: Set<Int32> = []
+    func setCachedAudioStreams(_ indices: Set<Int32>) {
+        cachedAudioStreams = indices
+        applyStreamDiscard()
+    }
     /// Highest byte offset available in the reader's buffer. -1 if unknown (URL-based stream).
     var downloadedUpToOffset: Int64 { avioBridge?.downloadedUpToOffset ?? -1 }
     /// Total file size in bytes. -1 if unknown.
@@ -333,7 +348,7 @@ final class FFmpegDemuxer: @unchecked Sendable {
         guard let ctx = formatCtx else { return }
         let nb = Int(ctx.pointee.nb_streams)
         let keep: Set<Int32> = Set([videoStream, audioStream, subtitleStream]
-            .compactMap { $0?.pointee.index })
+            .compactMap { $0?.pointee.index }).union(cachedAudioStreams)
         for i in 0..<nb {
             guard let s = ctx.pointee.streams[i] else { continue }
             s.pointee.discard = keep.contains(s.pointee.index) ? AVDISCARD_DEFAULT : AVDISCARD_ALL

@@ -69,6 +69,9 @@ final class MultiClipDemuxer: @unchecked Sendable {
     /// clip is currently active.
     var currentDemuxer: FFmpegDemuxer? { current }
 
+    /// zyno#171:备选音轨缓存配置,切片段后对新片段重新生效。
+    fileprivate var cachedAudioStreams: Set<Int32> = []
+
     private func switchTo(clipIndex: Int, localSeekSecs: Double?) throws {
         // Same-clip seek fast path: the clip's demuxer is already fully open,
         // and FFmpegDemuxer.seek positions it byte-domain exactly like the
@@ -129,6 +132,7 @@ final class MultiClipDemuxer: @unchecked Sendable {
             current = demuxer
         }
         currentIndex = clipIndex
+        if !cachedAudioStreams.isEmpty { current?.setCachedAudioStreams(cachedAudioStreams) }
         pendingSwitchFlag = true
         logger.info("switched to clip \(clipIndex) offset=\(String(format: "%.3f", self.timeline.startOffsets[clipIndex]))s\(reusedPreOpened ? " (pre-opened)" : "")")
     }
@@ -281,6 +285,12 @@ extension MultiClipDemuxer: PacketDemuxing {
     var audioIsAtmos: Bool { currentDemuxer?.audioIsAtmos ?? false }
     var sampleAspectRatio: Double { currentDemuxer?.sampleAspectRatio ?? 1.0 }
     func selectAudioStream(by id: Int) -> Bool { currentDemuxer?.selectAudioStream(by: id) ?? false }
+    // zyno#171 备选音轨缓存:转发到当前片段,切片段后对新片段重新生效。
+    var audioStreamIndices: [Int32] { currentDemuxer?.audioStreamIndices ?? [] }
+    func setCachedAudioStreams(_ indices: Set<Int32>) {
+        cachedAudioStreams = indices
+        current?.setCachedAudioStreams(indices)
+    }
     func selectSubtitleStream(by id: Int?) { currentDemuxer?.selectSubtitleStream(by: id) }
     // readPacket()/seek(to:)/close() already have class-level implementations
     // with the same signatures — no delegation needed here.
