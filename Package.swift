@@ -31,9 +31,20 @@ let package = Package(
                 .headerSearchPath("include"),
             ]
         ),
+        // CAss: NativeBackend's libass ASS/SSA subtitle renderer wrapper.
+        // xcframeworks are built by scripts/build_libass.sh → Sources/CAss/xcframeworks/
+        // (freetype + fribidi + libass; CoreText font provider, no fontconfig/harfbuzz).
+        .target(
+            name: "CAss",
+            dependencies: ["AssLibass", "AssFreetype", "AssFribidi", "AssHarfbuzz"],
+            path: "Sources/CAss",
+            cSettings: [
+                .headerSearchPath("include"),
+            ]
+        ),
         .target(
             name: "PlayerKitNative",
-            dependencies: ["PlayerKit", "CFFmpeg"],
+            dependencies: ["PlayerKit", "CFFmpeg", "CAss"],
             path: "Sources/PlayerKitNative",
             linkerSettings: [
                 .linkedFramework("AVFoundation"),
@@ -65,6 +76,13 @@ let package = Package(
         .binaryTarget(name: "FFAvutil",     path: "Sources/CFFmpeg/xcframeworks/libavutil.xcframework"),
         .binaryTarget(name: "FFSwresample", path: "Sources/CFFmpeg/xcframeworks/libswresample.xcframework"),
         .binaryTarget(name: "FFSwscale",    path: "Sources/CFFmpeg/xcframeworks/libswscale.xcframework"),
+
+        // libass + deps — built from source by scripts/build_libass.sh, same
+        // committed-xcframework model as CFFmpeg above.
+        .binaryTarget(name: "AssLibass",   path: "Sources/CAss/xcframeworks/libass.xcframework"),
+        .binaryTarget(name: "AssFreetype", path: "Sources/CAss/xcframeworks/libfreetype.xcframework"),
+        .binaryTarget(name: "AssFribidi",  path: "Sources/CAss/xcframeworks/libfribidi.xcframework"),
+        .binaryTarget(name: "AssHarfbuzz", path: "Sources/CAss/xcframeworks/libharfbuzz.xcframework"),
 
     ]
 )
