@@ -565,6 +565,26 @@ public final class NativeBackend: PlayerBackend {
     /// Highest PTS (seconds) of packets read by the demux loop — used to compute bufferedDuration.
     private nonisolated(unsafe) var maxDownloadedPts: Double = 0
 
+    /// zyno#171: 备选音轨的原始包缓存(切轨命中时免 seek)。只在 demuxLock 内读写;
+    /// 元素是克隆的 AVPacket,淘汰/清空时 av_packet_free。
+    nonisolated(unsafe) var altAudioCache = AltAudioPacketCache<UnsafeMutablePointer<AVPacket>>(
+        bytesOf: { Int($0.pointee.size) },
+        onEvict: { var p: UnsafeMutablePointer<AVPacket>? = $0; av_packet_free(&p) })
+    /// 正在被缓存的备选音频流下标(音轨数超门槛/多片段时为空 = 功能关闭)。
+    nonisolated(unsafe) var altAudioStreams: Set<Int32> = []
+
+    /// 按当前选中音轨重算备选缓存流集合并通知解复用层;调用方须持 demuxLock
+    /// (或在无解复用循环运行时调用,如 open)。
+    private func refreshAltAudioStreams(_ demuxer: any PacketDemuxing) {
+        let all = demuxer.audioStreamIndices
+        if AltAudioCachePolicy.shouldEnable(audioTrackCount: all.count) {
+            altAudioStreams = Set(all.filter { $0 != demuxer.audioStreamIndex })
+        } else {
+            altAudioStreams = []
+        }
+        demuxer.setCachedAudioStreams(altAudioStreams)
+    }
+
     /// Default init: ASBDLRenderer + AudioUnitOutput (PCM).
     public convenience init() throws {
         try self.init(renderer: nil, audioOutput: nil)
@@ -1228,6 +1248,10 @@ public final class NativeBackend: PlayerBackend {
                 }
             }
         }
+
+        // zyno#171: 备选音轨包缓存(音轨 2…4 条才启用)。
+        altAudioCache.removeAll()
+        refreshAltAudioStreams(demuxer)
 
         // Initialize graphic subtitle decoder for PGS/VOBSUB streams, and the
         // libass typeset renderer for ASS/SSA (zyno#158).
@@ -1925,6 +1949,13 @@ public final class NativeBackend: PlayerBackend {
                         logger.warning("[sub] unsupported subtitle codec=\(codecName) streamIdx=\(streamIndex)")
                         dLock.unlock()
                     }
+                } else if altAudioStreams.contains(streamIndex) {
+                    // zyno#171: 备选音轨——克隆进缓存(demuxLock 仍持有),供切轨免 seek。
+                    let pts = Self.ptsFromPacket(packet, demuxer: demuxer)
+                    if pts.isFinite, let clone = av_packet_clone(packet) {
+                        altAudioCache.append(stream: streamIndex, pts: pts, payload: clone)
+                    }
+                    dLock.unlock()
                 } else {
                     dLock.unlock()
                 }
@@ -3001,6 +3032,7 @@ public final class NativeBackend: PlayerBackend {
             return
         }
         _ = demuxer?.seek(to: secs)
+        backend?.altAudioCache.removeAll()   // zyno#171: 旧位置的备选音轨包作废
         // zyno#142: arm discard-until-target from the demuxer's reported
         // landing. Only byte-domain seeks report one (index-guided seeks
         // report nil → flags cleared → historical behavior, MKV/MP4 untouched).
@@ -3077,6 +3109,7 @@ public final class NativeBackend: PlayerBackend {
         // next play() re-anchors its clock to the new stream (playbackTime).
         _injectedAudioOutput?.flush()
         demuxLock.lock()
+        altAudioCache.removeAll(); altAudioStreams = []   // zyno#171
         demuxer?.close(); demuxer = nil
         videoDecoder = nil; audioDecoder = nil
         // No seek can be pending on a stream that no longer exists; never leave the
@@ -3208,6 +3241,9 @@ public final class NativeBackend: PlayerBackend {
         let tSeek0 = DispatchTime.now().uptimeNanoseconds
         _ = demuxer.seek(to: posSecs)
         let tSeek = ms(tSeek0)
+        // zyno#171: 物理 seek 之后旧缓存作废;旧轨变备选、新轨不再缓存。
+        altAudioCache.removeAll()
+        refreshAltAudioStreams(demuxer)
         // zyno#142: same fine-seek arming as performDemuxerSeek — the track
         // switch re-seek lands on a GOP boundary too, and without the discard
         // the timeline re-anchors at the new landing (a second displacement
