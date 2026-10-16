@@ -65,6 +65,19 @@ final class AltAudioPacketCacheTests: XCTestCase {
         XCTAssertTrue(c.packets(stream: 2, from: 0).isEmpty)
     }
 
+    func testTakeReturnsPacketsFromPositionAndEmptiesStream() {
+        var (c, ev) = make()
+        for i in 0..<6 { c.append(stream: 2, pts: Double(i), payload: i + 1) }
+        c.append(stream: 3, pts: 0, payload: 100)
+        let taken = c.take(stream: 2, from: 3)
+        XCTAssertEqual(taken.map(\.pts), [3, 4, 5])
+        XCTAssertEqual(taken.map(\.payload), [4, 5, 6], "归调用方所有,不触发 onEvict")
+        XCTAssertEqual(ev.items.sorted(), [1, 2, 3], "from 之前的包被淘汰释放")
+        XCTAssertTrue(c.packets(stream: 2, from: 0).isEmpty)
+        XCTAssertEqual(c.packets(stream: 3, from: 0).count, 1, "别的流不受影响")
+        XCTAssertEqual(c.totalBytes, 100)
+    }
+
     func testPolicyGate() {
         XCTAssertFalse(AltAudioCachePolicy.shouldEnable(audioTrackCount: 0))
         XCTAssertFalse(AltAudioCachePolicy.shouldEnable(audioTrackCount: 1), "单音轨没有备选")

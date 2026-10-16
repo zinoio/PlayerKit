@@ -318,7 +318,9 @@ public final class NativeBackend: PlayerBackend {
     /// 位置逐帧爬向新位置而不是直接跳过去(2026-09-03 用户反馈"画面抖动"/
     /// seek 后卡顿实锤)。只在 performDemuxerSeek 真正调用 demuxer.seek()
     /// 那一刻(持有 demuxLock)才 +1,由 demuxLock 保护,不需要额外的锁。
-    private nonisolated(unsafe) var physicalSeekGeneration: Int64 = 0
+    nonisolated(unsafe) private(set) var physicalSeekGeneration: Int64 = 0
+    /// 最近一次切音轨走的路径("fast"/"slow"),供测试与诊断读取(zyno#171)。
+    nonisolated(unsafe) private(set) var lastAudioSwitchPath: String?
     /// Set true after seek()/play(), cleared on first frame render + audioClock advance.
     /// While true, freeze-ahead guard is bypassed so primer callbacks have time to
     /// fire and advance audioClock past 0 — without this, seek-to-0 freezes because
@@ -1831,23 +1833,9 @@ public final class NativeBackend: PlayerBackend {
                         let packetPts = trackContent ? Self.ptsFromPacket(packet, demuxer: demuxer) : .nan
                         let outputRate = Double(currentDec?.outputSampleRate ?? 48000)
                         audioDecodeQueue.async {
-                            let pcm = currentDec?.decode(packet: packet)
-                            if let pcm {
-                                // Playback rate: time-stretch the decoded PCM
-                                // before it reaches the AudioQueue (zyno#99).
-                                // Emits 0..n frames; 1x bypasses untouched.
-                                let stretched = self.audioTempo.process(pcm)
-                                var contentPts = Double.nan
-                                if trackContent {
-                                    contentPts = packetPts.isFinite ? packetPts : self.playedContentTrackerEnd
-                                    self.playedContentTrackerEnd = contentPts + Double(pcm.sampleCount) / outputRate
-                                }
-                                for out in stretched {
-                                    currentOut?.enqueue(out, contentPts: contentPts)
-                                }
-                            }
-                            var p: UnsafeMutablePointer<AVPacket>? = packet
-                            av_packet_free(&p)
+                            self.decodeAndEnqueueAudio(packet: packet, decoder: currentDec, output: currentOut,
+                                                       trackContent: trackContent, packetPts: packetPts,
+                                                       outputRate: outputRate)
                         }
                     }
                 } else if streamIndex == demuxer.subtitleStreamIndex,
@@ -3189,8 +3177,111 @@ public final class NativeBackend: PlayerBackend {
         let demuxerRef = demuxer
         Self.audioSwitchQueue.async { [weak self] in
             guard let self else { return }
+            if self.performAudioTrackSwitchFast(trackId: trackId, demuxer: demuxerRef) { return }
             self.performAudioTrackSwitch(id: id, trackId: trackId, demuxer: demuxerRef)
         }
+    }
+
+    /// 解码一个音频包并送入输出;在 audioDecodeQueue 上运行,负责释放该包。
+    /// 实时解复用循环与切轨快路径(回放缓存包)共用,保证两条路径的变速/内容时间
+    /// 记账完全一致(zyno#171)。
+    private nonisolated func decodeAndEnqueueAudio(packet: UnsafeMutablePointer<AVPacket>,
+                                                   decoder: FFmpegAudioDecoder?,
+                                                   output: AudioUnitOutput?,
+                                                   trackContent: Bool, packetPts: Double,
+                                                   outputRate: Double) {
+        let pcm = decoder?.decode(packet: packet)
+        if let pcm {
+            // Playback rate: time-stretch the decoded PCM
+            // before it reaches the AudioQueue (zyno#99).
+            // Emits 0..n frames; 1x bypasses untouched.
+            let stretched = audioTempo.process(pcm)
+            var contentPts = Double.nan
+            if trackContent {
+                contentPts = packetPts.isFinite ? packetPts : playedContentTrackerEnd
+                playedContentTrackerEnd = contentPts + Double(pcm.sampleCount) / outputRate
+            }
+            for out in stretched {
+                output?.enqueue(out, contentPts: contentPts)
+            }
+        }
+        var p: UnsafeMutablePointer<AVPacket>? = packet
+        av_packet_free(&p)
+    }
+
+    /// 切轨快路径(zyno#171):新轨的包已在备选缓存里覆盖当前播放位置 → 不 seek、
+    /// 不 flush 视频,只换解码器与音频输出,把缓存包回放给新解码器。返回 false 表示
+    /// 不满足条件(未启用/未命中/透传/暂停中),此时没有任何状态被改变,调用方走慢路径。
+    private func performAudioTrackSwitchFast(trackId: Int, demuxer: any PacketDemuxing) -> Bool {
+        let t0 = DispatchTime.now().uptimeNanoseconds
+        let newStream = Int32(trackId)
+        demuxLock.lock()
+        guard altAudioStreams.contains(newStream), state.isPlaying, !isPassthroughActive else {
+            demuxLock.unlock(); return false
+        }
+        let posSecs = Double(state.position.components.seconds)
+            + Double(state.position.components.attoseconds) / 1e18
+        guard altAudioCache.covers(stream: newStream, at: posSecs, tolerance: 0.3) else {
+            demuxLock.unlock(); return false
+        }
+        let oldStream = Int(demuxer.audioStreamIndex)
+        guard demuxer.selectAudioStream(by: trackId), let stream = demuxer.audioStream else {
+            demuxLock.unlock(); return false
+        }
+        // 新轨若会走透传(压缩比特流直送),缓存回放不覆盖该路径 → 还原选择,走慢路径。
+        if _injectedAudioOutput?.supportsPassthrough == true, demuxer.isPassthroughCodec,
+           abs(state.rate - 1.0) < 0.001 {
+            _ = demuxer.selectAudioStream(by: oldStream)
+            demuxLock.unlock(); return false
+        }
+        logger.info("selectAudioTrack id=\(trackId) — fast path (cache hit, no seek)")
+
+        audioUnitOutput?.stop()
+        audioDecodeQueue.sync { audioDecoder?.flush() }
+        let newDecoder = FFmpegAudioDecoder(stream: stream, sampleRate: 44100, channels: 2)
+        audioDecoder = newDecoder
+        discardAudioUntilPts = nil
+        let cached = altAudioCache.take(stream: newStream, from: posSecs)
+        refreshAltAudioStreams(demuxer)          // 旧轨变备选、新轨不再缓存
+
+        let sr = newDecoder?.outputSampleRate ?? 44100
+        let ch = newDecoder?.outputChannels ?? 2
+        audioTempo.reset(sampleRate: sr, channels: ch)
+        audioClock.reset(to: posSecs, sampleRate: sr)
+        let newOutput = AudioUnitOutput(clock: audioClock, delaySecs: audioDelay)
+        audioUnitOutput = newOutput
+        newOutput.start(sampleRate: sr, channels: ch)
+        newOutput.setPlaybackRate(state.rate)
+        newOutput.pause()
+        let trackContent = AudioUnitOutput.tracksPlayedContent
+        let outputRate = Double(sr)
+        for (pts, packet) in cached {
+            audioDecodeQueue.async {
+                self.decodeAndEnqueueAudio(packet: packet, decoder: newDecoder, output: newOutput,
+                                           trackContent: trackContent, packetPts: trackContent ? pts : .nan,
+                                           outputRate: outputRate)
+            }
+        }
+        displayLoopLock.withLock {
+            needsClockCalibration = true
+            audioClockReady = false
+        }
+        let canResume = jitterBuffer.state == .playing
+        demuxLock.unlock()
+
+        syncController.reset()
+        displayLoopLock.withLock { lastBypassPopTime = 0 }
+        // 视频管线没有被 flush,jitter buffer 仍在 .playing,不会再有 .buffering→.playing
+        // 的跃迁来恢复新输出,这里直接恢复(与 resumingContinuous 路径同理)。
+        if canResume { newOutput.resume() }
+
+        state.selectedAudioTrackId = trackId
+        refreshAudioTracks()
+        notifyStateChange()
+        let ms = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6
+        lastAudioSwitchPath = "fast"
+        logger.notice("[diag] audioswitch path=fast total=\(String(format: "%.1f", ms), privacy: .public)ms cachedPackets=\(cached.count, privacy: .public)")
+        return true
     }
 
     /// 切轨的重负载段(原 selectAudioTrack 函数体,zyno#171 拆出)。
@@ -3325,7 +3416,8 @@ public final class NativeBackend: PlayerBackend {
         notifyStateChange()
 
         logger.info("selectAudioTrack done, new decoder sampleRate=\(self.audioDecoder?.outputSampleRate ?? 0)")
-        logger.notice("[diag] audioswitch main=\(Thread.isMainThread, privacy: .public) stop=\(tStop, privacy: .public)ms lock=\(tLock, privacy: .public)ms audioQueue=\(tQueue, privacy: .public)ms seek=\(tSeek, privacy: .public)ms heldLock=\(tUnlock, privacy: .public)ms total=\(ms(t0), privacy: .public)ms")
+        lastAudioSwitchPath = "slow"
+        logger.notice("[diag] audioswitch path=slow main=\(Thread.isMainThread, privacy: .public) stop=\(tStop, privacy: .public)ms lock=\(tLock, privacy: .public)ms audioQueue=\(tQueue, privacy: .public)ms seek=\(tSeek, privacy: .public)ms heldLock=\(tUnlock, privacy: .public)ms total=\(ms(t0), privacy: .public)ms")
     }
 
     public func selectSubtitle(id: String?) {

@@ -57,6 +57,18 @@ struct AltAudioPacketCache<Payload> {
         return first.pts <= at + tolerance && at <= last.pts + 1.0
     }
 
+    /// 取走该流 pts >= from 的包(所有权交给调用方,不触发 onEvict);
+    /// 更早的包淘汰释放。调用后该流缓存为空。
+    mutating func take(stream: Int32, from: Double) -> [(pts: Double, payload: Payload)] {
+        guard let list = streams.removeValue(forKey: stream) else { return [] }
+        var kept: [(pts: Double, payload: Payload)] = []
+        for e in list {
+            totalBytes -= e.bytes
+            if e.pts >= from { kept.append((e.pts, e.payload)) } else { onEvict(e.payload) }
+        }
+        return kept
+    }
+
     mutating func removeAll() {
         for list in streams.values { for e in list { onEvict(e.payload) } }
         streams.removeAll()
