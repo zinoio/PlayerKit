@@ -79,6 +79,12 @@ CODEC_FLAGS=(
   --enable-decoder=pcm_s24le
   --enable-decoder=pcm_s32le
   --enable-decoder=pcm_f32le
+  # Blu-ray / DVD LPCM (zyno#176): without these a disc's LPCM track hits
+  # "codec not found" → no audio (and the player used to freeze waiting on it).
+  --enable-decoder=pcm_bluray
+  --enable-decoder=pcm_dvd
+  --enable-decoder=pcm_s16be
+  --enable-decoder=pcm_s24be
   --enable-decoder=cook            # RealAudio Cooker (RMVB audio)
   --enable-parser=aac
   --enable-parser=aac_latm
@@ -221,7 +227,6 @@ build_for() {
       --extra-ldflags="$base_ldflags" \
       --disable-shared \
       --enable-static \
-      --enable-nonfree \
       "${CODEC_FLAGS[@]}" \
       "${extra_flags[@]}"
 
