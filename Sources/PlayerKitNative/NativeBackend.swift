@@ -585,6 +585,7 @@ public final class NativeBackend: PlayerBackend {
             altAudioStreams = []
         }
         demuxer.setCachedAudioStreams(altAudioStreams)
+        logger.notice("[diag] altaudio audioTracks=\(all.count, privacy: .public) enabled=\(!self.altAudioStreams.isEmpty, privacy: .public)")
     }
 
     /// Default init: ASBDLRenderer + AudioUnitOutput (PCM).
@@ -3215,6 +3216,9 @@ public final class NativeBackend: PlayerBackend {
     private func performAudioTrackSwitchFast(trackId: Int, demuxer: any PacketDemuxing) -> Bool {
         let t0 = DispatchTime.now().uptimeNanoseconds
         let newStream = Int32(trackId)
+        // 先不持锁判断资格:解复用循环持 demuxLock 读网络,拿锁可能白等数秒(实测 3.4s),
+        // 不合格就别去抢(zyno#171)。持锁后下面会再校验一次。
+        guard altAudioStreams.contains(newStream), state.isPlaying else { return false }
         demuxLock.lock()
         guard altAudioStreams.contains(newStream), state.isPlaying, !isPassthroughActive else {
             demuxLock.unlock(); return false

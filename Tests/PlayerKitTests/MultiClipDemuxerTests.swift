@@ -72,6 +72,23 @@ final class MultiClipDemuxerTests: XCTestCase {
         return try! Data(contentsOf: url)
     }
 
+    /// zyno#171:多片段(蓝光)也要转发备选音轨缓存配置,并在切片段后对新片段重新生效。
+    func testCachedAudioStreamsForwardedAndSurviveClipSwitch() throws {
+        let clip0 = InMemoryReader(data: loadFixture("clip0_5s"))
+        let clip1 = InMemoryReader(data: loadFixture("clip1_5s"))
+        let demuxer = MultiClipDemuxer(clips: [(clip0, 5.0), (clip1, 5.0)])!
+        try demuxer.open()
+        XCTAssertEqual(demuxer.audioStreamIndices, demuxer.currentDemuxer?.audioStreamIndices)
+        XCTAssertFalse(demuxer.audioStreamIndices.isEmpty)
+
+        demuxer.setCachedAudioStreams([7])
+        XCTAssertEqual(demuxer.currentDemuxer?.cachedAudioStreams, [7])
+
+        XCTAssertTrue(demuxer.seek(to: 6.0))               // 切到第 2 个片段
+        XCTAssertEqual(demuxer.currentDemuxer?.cachedAudioStreams, [7],
+                       "新片段的解复用器应继承备选音轨缓存配置")
+    }
+
     func testInitFailsWithMismatchedEmptyClips() {
         XCTAssertNil(MultiClipDemuxer(clips: []))
     }

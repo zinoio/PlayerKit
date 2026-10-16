@@ -109,7 +109,7 @@ final class FFmpegDemuxer: @unchecked Sendable {
         }
     }
     /// 备选音轨缓存要求保留(不丢弃)的音频流(zyno#171);空 = 只保留选中音轨(默认)。
-    private var cachedAudioStreams: Set<Int32> = []
+    private(set) var cachedAudioStreams: Set<Int32> = []
     func setCachedAudioStreams(_ indices: Set<Int32>) {
         cachedAudioStreams = indices
         applyStreamDiscard()
