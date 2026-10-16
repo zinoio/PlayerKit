@@ -3163,13 +3163,20 @@ public final class NativeBackend: PlayerBackend {
     /// 切轨的重负载段(原 selectAudioTrack 函数体,zyno#171 拆出)。
     /// 在后台串行队列执行:demuxLock 阻塞 demux 循环是预期行为(切换期间
     /// 不需要 demux 出帧),主线程不等待。
-    private func performAudioTrackSwitch(id: String, trackId: Int, demuxer: Demuxer) {
+    private func performAudioTrackSwitch(id: String, trackId: Int, demuxer: any PacketDemuxing) {
         logger.info("selectAudioTrack id=\(trackId)")
         // zyno#171 diag: per-phase wall time of the (background) track switch.
         let t0 = DispatchTime.now().uptimeNanoseconds
         func ms(_ since: UInt64) -> String {
             String(format: "%.1f", Double(DispatchTime.now().uptimeNanoseconds - since) / 1e6)
         }
+
+        // zyno#171 diag: how far the demuxer has read ahead of the playhead —
+        // sizes the alt-audio packet cache window (see AltAudioPacketCache).
+        let readHead = maxDownloadedPts
+        let playhead = Double(state.position.components.seconds)
+            + Double(state.position.components.attoseconds) / 1e18
+        logger.notice("[diag] audioswitch readahead=\(String(format: "%.1f", readHead - playhead), privacy: .public)s readHead=\(String(format: "%.1f", readHead), privacy: .public) playhead=\(String(format: "%.1f", playhead), privacy: .public)")
 
         // 1. Stop audio output
         audioUnitOutput?.stop()
