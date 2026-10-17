@@ -61,6 +61,30 @@ final class AudioTrackSwitchFastPathTests: XCTestCase {
         XCTAssertTrue(backend.altAudioStreams.contains(where: { $0 != other }), "旧轨应变成备选")
     }
 
+    /// zyno#196:切走后**立即**切回旧轨也应命中快路径——当前音轨的包持续进缓存,
+    /// 切走瞬间缓存里已有"播放位置到读头"的旧轨包,不需要重新积累。
+    func testImmediateSwitchBackHitsFastPath() async throws {
+        let (backend, renderer) = try await start()
+        defer { Task { @MainActor in backend.stop() } }
+        _ = await waitUntil { renderer.count > 5 && backend.altAudioCache.totalBytes > 0 }
+        let first = backend.altAudioStreams.first!
+        try await Task.sleep(nanoseconds: 600_000_000)         // 让备选缓存覆盖当前位置
+        await MainActor.run { backend.selectAudioTrack(id: String(first)) }
+        _ = await waitUntil { backend.lastAudioSwitchPath != nil }
+        XCTAssertEqual(backend.lastAudioSwitchPath, "fast")
+        let original = backend.altAudioStreams.first!          // 旧轨变备选
+        await MainActor.run { backend.selectAudioTrack(id: String(original)) }  // 立即切回
+        var done = false
+        let deadline = Date().addingTimeInterval(10)
+        while Date() < deadline {
+            let selected = await MainActor.run { backend.state.selectedAudioTrackId }
+            if selected == Int(original) { done = true; break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        XCTAssertTrue(done, "切回应完成")
+        XCTAssertEqual(backend.lastAudioSwitchPath, "fast", "立刻切回旧轨也应命中快路径(zyno#196)")
+    }
+
     func testSwitchBackAndForthKeepsWorking() async throws {
         let (backend, renderer) = try await start()
         defer { Task { @MainActor in backend.stop() } }
