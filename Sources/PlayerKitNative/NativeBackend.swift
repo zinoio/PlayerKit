@@ -574,6 +574,9 @@ public final class NativeBackend: PlayerBackend {
         onEvict: { var p: UnsafeMutablePointer<AVPacket>? = $0; av_packet_free(&p) })
     /// 正在被缓存的备选音频流下标(音轨数超门槛/多片段时为空 = 功能关闭)。
     nonisolated(unsafe) var altAudioStreams: Set<Int32> = []
+    /// zyno#196: 当前音轨包克隆进缓存的总开关(与 AltAudioCachePolicy.shouldEnable
+    /// 同步)。单音轨/超上限轨数文件没有切轨缓存的意义,不为它们付克隆开销。
+    nonisolated(unsafe) var altCacheEnabled = false
 
     /// 按当前选中音轨重算备选缓存流集合并通知解复用层;调用方须持 demuxLock
     /// (或在无解复用循环运行时调用,如 open)。
@@ -581,8 +584,10 @@ public final class NativeBackend: PlayerBackend {
         let all = demuxer.audioStreamIndices
         if AltAudioCachePolicy.shouldEnable(audioTrackCount: all.count) {
             altAudioStreams = Set(all.filter { $0 != demuxer.audioStreamIndex })
+            altCacheEnabled = true
         } else {
             altAudioStreams = []
+            altCacheEnabled = false
         }
         demuxer.setCachedAudioStreams(altAudioStreams)
         logger.notice("[diag] altaudio audioTracks=\(all.count, privacy: .public) enabled=\(!self.altAudioStreams.isEmpty, privacy: .public)")
@@ -1828,6 +1833,14 @@ public final class NativeBackend: PlayerBackend {
                         // read, matching the previous synchronous behavior.
                         let currentDec = self.audioDecoder
                         let currentOut = self.audioUnitOutput
+                        // zyno#196: 当前音轨的包也克隆进缓存。切走瞬间缓存里已有
+                        // "播放位置到读头"的旧轨包,立刻切回就能命中快路径,不必等
+                        // 它变回备选后重新积累。透传/discard 分支不缓存:前者快路径
+                        // 本就不支持,后者是 seek 落点前将被丢弃的内容。
+                        let cachePts = Self.ptsFromPacket(packet, demuxer: demuxer)
+                        if altCacheEnabled, cachePts.isFinite, let clone = av_packet_clone(packet) {
+                            altAudioCache.append(stream: streamIndex, pts: cachePts, payload: clone)
+                        }
                         dLock.unlock()
                         handedOffPacket = true
                         let trackContent = AudioUnitOutput.tracksPlayedContent
@@ -3098,7 +3111,7 @@ public final class NativeBackend: PlayerBackend {
         // next play() re-anchors its clock to the new stream (playbackTime).
         _injectedAudioOutput?.flush()
         demuxLock.lock()
-        altAudioCache.removeAll(); altAudioStreams = []   // zyno#171
+        altAudioCache.removeAll(); altAudioStreams = []; altCacheEnabled = false   // zyno#171
         demuxer?.close(); demuxer = nil
         videoDecoder = nil; audioDecoder = nil
         // No seek can be pending on a stream that no longer exists; never leave the

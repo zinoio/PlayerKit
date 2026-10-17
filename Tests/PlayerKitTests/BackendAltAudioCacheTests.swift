@@ -44,6 +44,33 @@ final class BackendAltAudioCacheTests: XCTestCase {
         XCTAssertEqual(backend.altAudioStreams.count, 1)
     }
 
+    /// zyno#196:当前音轨的包也进缓存并覆盖播放位置——切走瞬间旧轨缓存已就绪,
+    /// 立刻切回才能命中快路径,不必等它变回备选后重新积累。
+    func testCurrentTrackPacketsAreCached() async throws {
+        let backend = try await makeBackend()
+        defer { Task { @MainActor in backend.stop() } }
+        await MainActor.run {
+            backend.play(reader: InMemoryReader(data: fixture("two_audio_60s", "mkv")),
+                         seekTo: nil, knownDuration: .seconds(60))
+        }
+        let ok = await waitUntil { !backend.altAudioStreams.isEmpty }
+        XCTAssertTrue(ok)
+        var covered = false
+        let deadline = Date().addingTimeInterval(10)
+        while Date() < deadline {
+            let (current, pos) = await MainActor.run {
+                (Int32(backend.state.selectedAudioTrackId ?? -1),
+                 Double(backend.state.position.components.seconds))
+            }
+            if backend.altAudioCache.covers(stream: current, at: pos, tolerance: 0.6) {
+                covered = true
+                break
+            }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertTrue(covered, "当前音轨的包应进缓存并覆盖播放位置")
+    }
+
     func testNoCacheForSingleAudioTrackFile() async throws {
         let backend = try await makeBackend()
         defer { Task { @MainActor in backend.stop() } }
