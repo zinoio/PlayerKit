@@ -139,8 +139,12 @@ public final class AudioUnitOutput: AudioOutputBackend {
         Double(bufferedFrameCount) * 1024.0 / Double(clock.sampleRate)
     }
 
-    init(clock: AudioClock, delaySecs: Double = 0) {
+    /// 输出设备选择(NativeBackend 持有并在多个 AudioUnitOutput 实例间共享);nil = 跟随系统默认。
+    private let deviceSelection: AudioOutputDeviceSelection?
+
+    init(clock: AudioClock, delaySecs: Double = 0, deviceSelection: AudioOutputDeviceSelection? = nil) {
         self.clock = clock
+        self.deviceSelection = deviceSelection
         _delayTargetContent = max(0, delaySecs.isFinite ? delaySecs : 0)
         // Wall target is (re)derived from the rate in setPlaybackRate/start();
         // the output starts at rate 1.0 so content == wall here.
@@ -215,6 +219,21 @@ public final class AudioUnitOutput: AudioOutputBackend {
         }
 
         if Self.mutedForTesting { AudioQueueSetParameter(queue, kAudioQueueParam_Volume, 0) }
+
+        #if os(macOS)
+        // zyno#223:指定输出设备(必须在 AudioQueueStart 之前)。设备已拔出/设置失败时
+        // 记日志并保持跟随系统默认,不让播放没声音。
+        if let uid = deviceSelection?.uid {
+            var cfUID: CFString = uid as CFString
+            let st = withUnsafePointer(to: &cfUID) {
+                AudioQueueSetProperty(queue, kAudioQueueProperty_CurrentDevice, $0,
+                                      UInt32(MemoryLayout<CFString>.size))
+            }
+            if st != noErr {
+                logger.error("AudioQueue CurrentDevice(\(uid, privacy: .public)) failed: \(st) — following system default")
+            }
+        }
+        #endif
 
         // Primer: 3 silence buffers to prevent initial underrun.
         // startPrimer() creates a negative debt and records the pending count so
@@ -538,4 +557,14 @@ private func audioQueueCallback(_ userData: UnsafeMutableRawPointer?,
     let output = Unmanaged<AudioUnitOutput>.fromOpaque(p).takeUnretainedValue()
     output._callbackConsumed(byteCount: Int(buffer.pointee.mAudioDataByteSize))
     AudioQueueFreeBuffer(queue, buffer)
+}
+
+/// 用户选择的输出设备(CoreAudio 设备 UID)。线程安全;`nil` = 跟随系统默认输出。
+final class AudioOutputDeviceSelection: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _uid: String?
+    var uid: String? {
+        get { lock.lock(); defer { lock.unlock() }; return _uid }
+        set { lock.lock(); _uid = newValue; lock.unlock() }
+    }
 }

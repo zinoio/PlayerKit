@@ -229,7 +229,7 @@ public final class NativeBackend: PlayerBackend {
     /// with HDMI/SPDIF). On iOS/tvOS passthrough is disabled and PCM decode
     /// via AudioUnitOutput drives the audioClock normally.
     /// Written at stream open (main actor), read every display tick.
-    private nonisolated(unsafe) var isPassthroughActive = false
+    nonisolated(unsafe) var isPassthroughActive = false
     private let jitterBuffer = VideoJitterBuffer()
     /// P2: ticked from the display thread; internally lock-guarded (see SyncController).
     nonisolated(unsafe) private let syncController = SyncController()
@@ -596,6 +596,33 @@ public final class NativeBackend: PlayerBackend {
     /// Default init: ASBDLRenderer + AudioUnitOutput (PCM).
     public convenience init() throws {
         try self.init(renderer: nil, audioOutput: nil)
+    }
+
+    // MARK: - Output routing (zyno#223 / #224)
+
+    /// 输出设备选择,与每个 AudioUnitOutput 实例共享。
+    private let audioDeviceSelection = AudioOutputDeviceSelection()
+
+    /// 当前指定的输出设备 UID;nil = 跟随系统默认输出。
+    public var audioOutputDeviceUID: String? { audioDeviceSelection.uid }
+
+    /// 指定输出设备(macOS)。PCM 与透传两条路径同时切换,并在当前位置重建音频路径。
+    public func setAudioOutputDevice(uid: String?) {
+        guard uid != audioDeviceSelection.uid else { return }
+        audioDeviceSelection.uid = uid
+        _injectedAudioOutput?.setOutputDevice(uid: uid)
+        audioOutputRouteDidChange()
+    }
+
+    /// 音频输出路径在播放中变化(透传开关、输出设备)后调用:
+    /// 复位「透传已激活」标记(否则主时钟仍读已不再收包的透传渲染器,#224),
+    /// 冲掉透传渲染器里已排队的压缩包,并在当前位置做一次 seek——复用现成的
+    /// 「停 PCM 输出 / flush 透传 / 重新对时」流程,让逐包的透传判定与新设备重新生效。
+    public func audioOutputRouteDidChange() {
+        isPassthroughActive = false
+        _injectedAudioOutput?.flush()
+        guard demuxer != nil else { return }
+        _seek(to: state.position, synchronousDemuxerSeek: false)
     }
 
     /// Default init with custom audio output (renderer uses ASBDLRenderer).
@@ -1292,7 +1319,7 @@ public final class NativeBackend: PlayerBackend {
         if let as_ = demuxer.audioStream,
            let dec = FFmpegAudioDecoder(stream: as_, sampleRate: 44100, channels: 2) {
             audioDecoder = dec
-            let out = AudioUnitOutput(clock: audioClock, delaySecs: audioDelay)
+            let out = AudioUnitOutput(clock: audioClock, delaySecs: audioDelay, deviceSelection: audioDeviceSelection)
             audioUnitOutput = out
             isPassthroughActive = false
             logger.info("audio: \(dec.outputSampleRate)Hz \(dec.outputChannels)ch")
@@ -3283,7 +3310,7 @@ public final class NativeBackend: PlayerBackend {
         let ch = newDecoder?.outputChannels ?? 2
         audioTempo.reset(sampleRate: sr, channels: ch)
         audioClock.reset(to: posSecs, sampleRate: sr)
-        let newOutput = AudioUnitOutput(clock: audioClock, delaySecs: audioDelay)
+        let newOutput = AudioUnitOutput(clock: audioClock, delaySecs: audioDelay, deviceSelection: audioDeviceSelection)
         audioUnitOutput = newOutput
         newOutput.start(sampleRate: sr, channels: ch)
         newOutput.setPlaybackRate(state.rate)
@@ -3425,7 +3452,7 @@ public final class NativeBackend: PlayerBackend {
         // in-flight process(), and the demux loop is blocked on demuxLock.
         audioTempo.reset(sampleRate: sr, channels: ch)
         audioClock.reset(to: posSecs, sampleRate: sr)
-        audioUnitOutput = AudioUnitOutput(clock: audioClock, delaySecs: audioDelay)
+        audioUnitOutput = AudioUnitOutput(clock: audioClock, delaySecs: audioDelay, deviceSelection: audioDeviceSelection)
         audioUnitOutput?.start(sampleRate: sr, channels: ch)
         // A fresh output starts at rate 1.0 — reapply the current rate or a
         // track switch silently drops playback speed.
@@ -3533,7 +3560,7 @@ public final class NativeBackend: PlayerBackend {
     }
 
     private func recreateAudioOutput() {
-        audioUnitOutput = AudioUnitOutput(clock: audioClock, delaySecs: audioDelay)
+        audioUnitOutput = AudioUnitOutput(clock: audioClock, delaySecs: audioDelay, deviceSelection: audioDeviceSelection)
         if let dec = audioDecoder {
             audioUnitOutput?.start(sampleRate: dec.outputSampleRate, channels: dec.outputChannels)
             audioUnitOutput?.pause()

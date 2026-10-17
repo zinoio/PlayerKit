@@ -31,9 +31,16 @@ public protocol AudioOutputBackend: AnyObject {
     func flush()
     func pause()
     func resume()
+
+    /// 指定输出设备(macOS;CoreAudio 设备 UID),nil = 跟随系统默认输出。
+    /// 后端应在**下一次**开始输出时生效(调用方随后会重建音频路径)。
+    /// 默认空实现:iOS/tvOS 的输出路由由系统管理,不适用。
+    func setOutputDevice(uid: String?)
 }
 
 public extension AudioOutputBackend {
+    /// Default: output routing is system-managed (iOS/tvOS) or unsupported.
+    func setOutputDevice(uid: String?) {}
     /// Default: no playback clock — NativeBackend falls back to its AudioClock.
     var playbackTime: Double? { nil }
     /// Default: rate is ignored (no real clock or no tempo support). Backends
