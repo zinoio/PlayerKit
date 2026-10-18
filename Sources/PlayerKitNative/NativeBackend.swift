@@ -3651,8 +3651,13 @@ public final class NativeBackend: PlayerBackend {
         let thread = Thread { [weak self] in
             let rl = RunLoop.current
             link.add(to: rl, forMode: .common)
+            // 必须用 .default 驱动 runloop,不能用 .common:.common 是 CFRunLoop 的
+            // 伪模式(commonModes 集合),并非可直接运行的真实模式。link 以 .common
+            // 注册后,.default 本就属于该集合,在 .default 下运行即可服务它。
+            // 用 .common 运行时 CADisplayLink 从不回调,视频 0 帧上屏而音频照常
+            // (iPhone 有声音没画面,zyno#263)。
             while !(self?.displayLoopStopped ?? true) {
-                rl.run(mode: .common, before: Date(timeIntervalSinceNow: 0.5))
+                rl.run(mode: .default, before: Date(timeIntervalSinceNow: 0.5))
             }
         }
         thread.name = "io.zyno.PlayerKit.displayLink"
