@@ -260,4 +260,43 @@ final class VideoJitterBufferTests: XCTestCase {
         XCTAssertFalse(buf.isFull)
         XCTAssertEqual(buf.count, 240, "tiny frames keep the fps x 2 s cap: existing behaviour unchanged")
     }
+
+    // MARK: - Read-ahead vs capacity (2026-10-23)
+    //
+    // The demux loop read up to 2 s ahead of the audio clock regardless of how many
+    // frames the byte budget holds. For 4K 10-bit HDR that is ~48 frames into a
+    // buffer of 28: append() refused the rest permanently and the display loop
+    // showed every ~1.6th frame (14.7 fps against 23.976).
+
+    func testReadAheadIsUnchangedForSmallFrames() {
+        let buf = VideoJitterBuffer()
+        XCTAssertEqual(buf.readAheadSeconds, buf.maxDuration, "no frame seen yet: the flat window")
+        buf.configureFrameRate(24)
+        for i in 0..<30 { buf.append(makeFrame(pts: Double(i) / 24.0)) }
+        XCTAssertEqual(buf.readAheadSeconds, buf.maxDuration, "small frames: the budget never binds, 2 s as before")
+    }
+
+    func testReadAheadFramesFitInTheBufferForLargeFrames() {
+        let buf = VideoJitterBuffer(memoryBudgetBytes: 40 << 20)
+        buf.configureFrameRate(24)
+        buf.append(makeBigFrame(pts: 0))
+        let window = buf.readAheadSeconds
+        XCTAssertLessThan(window, buf.maxDuration, "a byte-bound buffer must shorten the read-ahead")
+        XCTAssertLessThanOrEqual(window * 24.0, Double(buf.maxFrameCount),
+            "a read-ahead window of \(window) s is more frames than the buffer holds (\(buf.maxFrameCount)): the overflow would be refused")
+    }
+
+    func testReadAheadStillLetsAByteBoundBufferStartPlaying() {
+        let buf = VideoJitterBuffer(memoryBudgetBytes: 40 << 20)
+        buf.configureFrameRate(24)
+        buf.append(makeBigFrame(pts: 0))
+        let window = buf.readAheadSeconds
+        var i = 1
+        while Double(i) / 24.0 <= window && buf.state == .buffering {
+            buf.append(makeBigFrame(pts: Double(i) / 24.0))
+            i += 1
+        }
+        XCTAssertEqual(buf.state, .playing,
+            "filling the read-ahead window (\(window) s) must reach the playing threshold, or playback never starts")
+    }
 }
