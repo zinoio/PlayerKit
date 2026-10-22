@@ -66,6 +66,29 @@ final class VideoJitterBuffer: @unchecked Sendable {
         return frames.count >= budgetFramesLocked
     }
 
+    /// How far (seconds of content) the demux loop may read ahead of the audio clock.
+    ///
+    /// The time throttle used a flat `maxDuration` (2 s). With 4K 10-bit HDR the byte
+    /// budget holds only ~20 frames (~0.8 s at 24 fps), so 2 s of read-ahead is ~48
+    /// frames into a buffer that takes 28: `append` refuses the overflow for good and
+    /// the display loop shows every ~1.6th frame (device 2026-10-23: 14.7 fps against
+    /// 23.976, show gaps up to 208 ms, av offset swinging +-100 ms). Keeping the
+    /// read-ahead inside what the budget holds means nothing is ever refused.
+    ///
+    /// Never below what the buffer needs to reach the playing threshold, or playback
+    /// would never start.
+    var readAheadSeconds: Double {
+        lock.lock(); defer { lock.unlock() }
+        guard frameBytesHint > 0 else { return maxDuration }
+        let byBudget = Double(budgetFramesLocked) / framesPerSecondHint * Self.readAheadBudgetFill
+        let floor = resumeDurationLocked + 2.0 / framesPerSecondHint
+        return min(maxDuration, max(byBudget, floor))
+    }
+
+    /// Share of the byte-budget frames the read-ahead may fill; the rest absorbs the
+    /// B-frame reordering the decoder still returns after the throttle trips.
+    private static let readAheadBudgetFill = 0.9
+
     /// How many frames the byte budget allows (Int.max until a frame size is known).
     private var budgetFramesLocked: Int {
         guard frameBytesHint > 0 else { return Int.max }

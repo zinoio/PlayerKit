@@ -1741,9 +1741,13 @@ public final class NativeBackend: PlayerBackend {
                     } else {
                         audioPos = clock.audioTime
                     }
-                    if pts.isFinite && pts > audioPos + 2.0,
+                    // Read-ahead is bounded by what the frame buffer can hold, not a
+                    // flat 2 s: for 4K HDR the byte budget fits well under 2 s of frames
+                    // and the overflow would be refused (dropped) at append.
+                    let readAhead = jitter.readAheadSeconds
+                    if pts.isFinite && pts > audioPos + readAhead,
                        audioPos > lastThrottleAudioPos {
-                        Thread.sleep(forTimeInterval: min(pts - audioPos - 2.0, 0.050))
+                        Thread.sleep(forTimeInterval: min(pts - audioPos - readAhead, 0.050))
                     }
                     lastThrottleAudioPos = audioPos
 
