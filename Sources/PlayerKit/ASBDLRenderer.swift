@@ -91,13 +91,36 @@ public class ASBDLRenderer: VideoRenderer {
         // CATransaction that is never committed (implicit transactions only
         // auto-commit on the main runloop) — the reveal never takes effect and
         // the layer stays hidden forever (black screen with normal audio, plus
-        // "deleted thread with uncommitted CATransaction" at teardown). Wrap
-        // the write in an explicit transaction, which is legal on any thread.
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        displayLayer.isHidden = false
-        CATransaction.commit()
+        // "deleted thread with uncommitted CATransaction" at teardown).
+        //
+        // The write must NOT be wrapped in an explicit begin/commit here either:
+        // an outermost commit on this thread also runs layout for every UIView
+        // whose layout is pending, which touches the Auto Layout engine off-main
+        // and throws (NSISEngine optimize → abort, zyno#337). So reveal only on
+        // the first frame after clear() and do it on the main thread.
+        if needsReveal.withLock({ shouldReveal in
+            guard shouldReveal else { return false }
+            shouldReveal = false
+            return true
+        }) {
+            revealOnMain()
+        }
         displayLayer.enqueue(sbuf)
+    }
+
+    /// True while the layer is hidden by `clear()` and the next rendered frame
+    /// must reveal it. The layer starts visible, so this starts false.
+    private let needsReveal = OSAllocatedUnfairLock(initialState: false)
+
+    private func revealOnMain() {
+        DispatchQueue.main.async { [weak self] in
+            // clear() may have run again before this block got to execute.
+            guard let self, !self.needsReveal.withLock({ $0 }) else { return }
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            self.displayLayer.isHidden = false
+            CATransaction.commit()
+        }
     }
 
     private func attachColorParams(_ pb: CVPixelBuffer, colorParams: VideoColorParams) {
@@ -126,6 +149,7 @@ public class ASBDLRenderer: VideoRenderer {
     public func clear() {
         displayLayer.flushAndRemoveImage()
         // Show black to satisfy the protocol "show black" contract.
+        needsReveal.withLock { $0 = true }
         displayLayer.isHidden = true
     }
 
