@@ -264,6 +264,11 @@ public final class NativeBackend: PlayerBackend {
     /// avoids any lock-order question between the two).
     private let discardLock = NSLock()
     private nonisolated(unsafe) var discardVideoUntilPts: Double?
+    /// zyno#358: true while the audio clock is anchored AT the fine-seek target (the
+    /// discard was armed for the current seek). Guarded by `discardLock` like
+    /// `discardVideoUntilPts` (never `displayLoopLock` under demuxLock). Read by the display
+    /// loop's calibration decision, see ClockCalibrationPolicy.
+    private nonisolated(unsafe) var audioAnchoredAtTarget = false
     /// Audio side. Both writer (performDemuxerSeek) and reader (demux loop
     /// audio branch) hold demuxLock, so a plain variable is as safe as the
     /// other demux-loop state next to it.
@@ -1338,6 +1343,8 @@ public final class NativeBackend: PlayerBackend {
         // 位置的帧混流,表现为播放卡死在旧帧、音视频时钟差出几十秒
         // (2026-09-02 用户反馈"播放不出来"实锤)。同步执行不影响体验——
         // demuxer.open() 本身已经是秒级的网络探测延迟,多等这一下无感知。
+        // zyno#358: a fresh session starts un-anchored; the seek below re-arms it if it fine-seeks.
+        discardLock.withLock { audioAnchoredAtTarget = false }
         if let seekTo { _seek(to: seekTo, synchronousDemuxerSeek: true) }
 
         startDemuxLoop()
@@ -1554,7 +1561,7 @@ public final class NativeBackend: PlayerBackend {
                         // old target must display or the recovery plays as a black
                         // screen up to that target.
                         discardAudioUntilPts = nil
-                        discardLock.withLock { self.discardVideoUntilPts = nil }
+                        discardLock.withLock { self.discardVideoUntilPts = nil; self.audioAnchoredAtTarget = false }
                         self.videoDecoder?.flush()
                         // Routed through audioDecodeQueue so this can't race a
                         // still-in-flight decode() of an earlier packet on that
@@ -2260,8 +2267,14 @@ public final class NativeBackend: PlayerBackend {
             (needsClockCalibration, forceClockCalibration)
         }
         if needsCalibration, let firstFrame = jitterBuffer.peek(at: 0) {
-            if forceCalibration
-                || abs(firstFrame.pts - audioClock.audioTime) < maxCalibrationGap {
+            // zyno#358: when the audio is anchored at the fine-seek target, never relabel the
+            // clock FORWARD to a first frame that landed after the target (see ClockCalibrationPolicy).
+            let audioAnchored = discardLock.withLock { audioAnchoredAtTarget }
+            if ClockCalibrationPolicy.shouldCalibrate(firstFramePts: firstFrame.pts,
+                                                      audioTime: audioClock.audioTime,
+                                                      force: forceCalibration,
+                                                      audioAnchoredAtTarget: audioAnchored,
+                                                      maxGap: maxCalibrationGap) {
                 audioClock.calibrate(to: firstFrame.pts, sampleRate: audioDecoder?.outputSampleRate ?? 44100)
             }
             displayLoopLock.withLock {
@@ -2871,6 +2884,7 @@ public final class NativeBackend: PlayerBackend {
             displayLoopLock.withLock {
                 needsClockCalibration = true
                 audioClockReady = false
+                discardLock.withLock { audioAnchoredAtTarget = false }   // zyno#358: resume does not fine-seek
             }
         }
         state.isPlaying = true; notifyStateChange()
@@ -2948,6 +2962,7 @@ public final class NativeBackend: PlayerBackend {
         displayLoopLock.withLock {
             needsClockCalibration = true
             audioClockReady = false
+            discardLock.withLock { audioAnchoredAtTarget = false }   // zyno#358: the seek re-arms it below if it fine-seeks
         }
         // 立即把 position 置为 seek 目标并通知:seek 到首帧渲染之间
         // displayNextFrame 不更新 position(渲染恢复后才写实际落点),
@@ -3047,11 +3062,11 @@ public final class NativeBackend: PlayerBackend {
         // already behind us; accept it as-is (seekByByteOffset itself steers
         // away from that, see its one-sided acceptance criterion).
         if let landed = demuxer?.lastSeekLandedPTS, FineSeekPolicy.shouldArm(landed: landed, target: secs) {
-            backend?.discardLock.withLock { backend?.discardVideoUntilPts = secs }
+            backend?.discardLock.withLock { backend?.discardVideoUntilPts = secs; backend?.audioAnchoredAtTarget = true }
             backend?.discardAudioUntilPts = secs
             logger.info("fine-seek: discard \(String(format: "%.2f", secs - landed), privacy: .public)s (landed=\(String(format: "%.2f", landed), privacy: .public) target=\(String(format: "%.2f", secs), privacy: .public))")
         } else {
-            backend?.discardLock.withLock { backend?.discardVideoUntilPts = nil }
+            backend?.discardLock.withLock { backend?.discardVideoUntilPts = nil; backend?.audioAnchoredAtTarget = false }
             backend?.discardAudioUntilPts = nil
         }
         videoDecoder?.flush()
@@ -3130,7 +3145,7 @@ public final class NativeBackend: PlayerBackend {
         displayLoopLock.withLock {
             lastBypassPopTime = 0
             forceClockCalibration = false
-            discardLock.withLock { discardVideoUntilPts = nil }
+            discardLock.withLock { discardVideoUntilPts = nil; audioAnchoredAtTarget = false }
             // Un-poison the status pipeline: without this, a position reported by a
             // previous (e.g. frozen/free-wheeling) session persists here and every
             // `(pos - lastNotifiedPos) >= 500ms` gate in displayNextFrame stays
@@ -3305,6 +3320,7 @@ public final class NativeBackend: PlayerBackend {
         displayLoopLock.withLock {
             needsClockCalibration = true
             audioClockReady = false
+            discardLock.withLock { audioAnchoredAtTarget = false }   // zyno#358: fast switch does not seek
         }
         let canResume = jitterBuffer.state == .playing
         demuxLock.unlock()
@@ -3382,11 +3398,11 @@ public final class NativeBackend: PlayerBackend {
         // regime as the arming in performDemuxerSeek.
         if let landed = demuxer.lastSeekLandedPTS,
            FineSeekPolicy.shouldArm(landed: landed, target: posSecs) {
-            discardLock.withLock { discardVideoUntilPts = posSecs }
+            discardLock.withLock { discardVideoUntilPts = posSecs; audioAnchoredAtTarget = true }
             discardAudioUntilPts = posSecs
             logger.info("fine-seek (track switch): discard \(String(format: "%.2f", posSecs - landed), privacy: .public)s (landed=\(String(format: "%.2f", landed), privacy: .public))")
         } else {
-            discardLock.withLock { discardVideoUntilPts = nil }
+            discardLock.withLock { discardVideoUntilPts = nil; audioAnchoredAtTarget = false }
             discardAudioUntilPts = nil
         }
         if let stream = demuxer.audioStream {
