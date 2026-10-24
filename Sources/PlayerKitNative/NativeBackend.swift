@@ -253,11 +253,12 @@ public final class NativeBackend: PlayerBackend {
     // calibration above then re-anchors audioClock to the LANDING, so the whole
     // timeline (picture + audible content) starts displaced from what the user
     // asked for — observed −2.1…+1.8s on a 68GB BD ISO. When the demuxer
-    // reports a backward landing beyond this gap, the backend arms the discard:
-    // audioClock stays anchored at the target and the landing-to-target stretch
-    // is decoded but thrown away (video: display-loop pops; audio: demux-loop
-    // packet drop), so playback starts AT the target.
-    private static let discardArmGap: Double = 0.5
+    // reports a backward landing (FineSeekPolicy.shouldArm), the backend arms the
+    // discard: audioClock stays anchored at the target and the landing-to-target
+    // stretch is decoded but thrown away (video: display-loop pops; audio:
+    // demux-loop packet drop), so playback starts AT the target. Armed for EVERY
+    // backward landing, not only large ones (zyno#358): audio and video must
+    // start together at the target, see FineSeekPolicy.
     /// Video side, read by the display loop / written by performDemuxerSeek
     /// (which holds demuxLock, NOT displayLoopLock — a dedicated tiny lock
     /// avoids any lock-order question between the two).
@@ -3045,7 +3046,7 @@ public final class NativeBackend: PlayerBackend {
         // A landing PAST the target can't be discarded back — the content is
         // already behind us; accept it as-is (seekByByteOffset itself steers
         // away from that, see its one-sided acceptance criterion).
-        if let landed = demuxer?.lastSeekLandedPTS, landed <= secs, secs - landed > Self.discardArmGap {
+        if let landed = demuxer?.lastSeekLandedPTS, FineSeekPolicy.shouldArm(landed: landed, target: secs) {
             backend?.discardLock.withLock { backend?.discardVideoUntilPts = secs }
             backend?.discardAudioUntilPts = secs
             logger.info("fine-seek: discard \(String(format: "%.2f", secs - landed), privacy: .public)s (landed=\(String(format: "%.2f", landed), privacy: .public) target=\(String(format: "%.2f", secs), privacy: .public))")
@@ -3379,8 +3380,8 @@ public final class NativeBackend: PlayerBackend {
         // the timeline re-anchors at the new landing (a second displacement
         // stacked on whatever the user already had). demuxLock is held, same
         // regime as the arming in performDemuxerSeek.
-        if let landed = demuxer.lastSeekLandedPTS, landed <= posSecs,
-           posSecs - landed > Self.discardArmGap {
+        if let landed = demuxer.lastSeekLandedPTS,
+           FineSeekPolicy.shouldArm(landed: landed, target: posSecs) {
             discardLock.withLock { discardVideoUntilPts = posSecs }
             discardAudioUntilPts = posSecs
             logger.info("fine-seek (track switch): discard \(String(format: "%.2f", posSecs - landed), privacy: .public)s (landed=\(String(format: "%.2f", landed), privacy: .public))")
