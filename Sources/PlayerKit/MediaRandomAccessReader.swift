@@ -48,9 +48,39 @@ public protocol MediaRandomAccessReader: AnyObject, Sendable {
     /// (which happens for container formats that embed duration in their headers).
     /// Return -1 if unknown (default).
     var knownTotalBytes: Int64 { get }
+
+    /// zyno#360: abort every in-flight `read` and make reads that start before
+    /// the matching `resumeReads(after:)` throw `MediaReadInterrupted`.
+    ///
+    /// Used by an audio-track switch: the demux loop holds `demuxLock` across
+    /// `readPacket()` (a blocking network read for cloud sources), so without
+    /// this the switch waits out the whole read before it can reconfigure the
+    /// pipeline (measured 8.3 s on a 115 BD).
+    ///
+    /// Contract: thread-safe, idempotent, and a no-op after `close()`. Must not
+    /// invalidate the session — the same reader serves the switch's own seek.
+    /// Readers that cannot interrupt (local files, ISO, test fakes) keep the
+    /// default no-op and simply make the switch wait, exactly as before.
+    /// Returns a generation token; a stale token must not clear a newer
+    /// interruption.
+    func interruptPendingReads() -> UInt64
+
+    /// Clear the interruption armed by `interruptPendingReads()` when `token`
+    /// is still the current generation. Called once the switch holds
+    /// `demuxLock`, so the seek's own reads proceed normally.
+    func resumeReads(after token: UInt64)
+}
+
+/// zyno#360: thrown from `read` when an in-flight read was interrupted for an
+/// audio-track switch. The demux loop treats it as a deliberate pause, not as
+/// a playback failure and never as EOF.
+public struct MediaReadInterrupted: Error, Sendable {
+    public init() {}
 }
 
 public extension MediaRandomAccessReader {
     var downloadedUpToOffset: Int64 { -1 }
     var knownTotalBytes: Int64 { -1 }
+    func interruptPendingReads() -> UInt64 { 0 }
+    func resumeReads(after token: UInt64) {}
 }

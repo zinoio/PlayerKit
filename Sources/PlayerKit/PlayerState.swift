@@ -9,6 +9,10 @@ public struct PlayerState: @unchecked Sendable {
     public var isPlaying:   Bool     = false
     /// Whether the player is currently buffering.
     public var isBuffering: Bool     = false
+    /// zyno#360: an audio-track switch is in progress (the backend is
+    /// reconfiguring decoders/output; the picture may be stalled). Drives the
+    /// player's "switching audio track" loading overlay.
+    public var isSwitchingAudioTrack: Bool = false
     /// Total duration buffered and available for playback.
     public var bufferedDuration: Duration = .zero
     /// Current playback position.

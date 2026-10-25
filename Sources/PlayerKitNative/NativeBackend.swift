@@ -300,6 +300,10 @@ public final class NativeBackend: PlayerBackend {
 
     // Pipeline control
     private let demuxLock = NSLock()
+    /// zyno#360: pauses the demux loop while an audio-track switch reconfigures
+    /// the pipeline, so the switch's `demuxLock.lock()` doesn't wait out an
+    /// in-flight network read (measured 8276.8 ms on a 115 BD).
+    private let audioSwitchGate = AudioSwitchGate()
     /// Guards ONLY the demux-loop state flags (`demuxLoopRunning`, `demuxLoopDemuxer`,
     /// `demuxCancelled`). It is never held across I/O, so main-thread lifecycle
     /// calls (pause/resume/startDemuxLoop) can take it without ever waiting on the
@@ -1530,8 +1534,32 @@ public final class NativeBackend: PlayerBackend {
                     lastSeenPhysicalGen = currentPhysicalGen
                 }
 
+                // zyno#360: never start a read while an audio-track switch is
+                // pending. The switch is about to take demuxLock; a fresh
+                // blocking read here would add another whole network read to
+                // its wait (the same exposure the fast path's pre-lock check
+                // guards against). The switch ends the gate after releasing
+                // the lock, then this loop resumes from the new position.
+                if self.audioSwitchGate.isPending {
+                    dLock.unlock()
+                    self.audioSwitchGate.waitUntilSwitchFinishes(cancelled: { self.demuxCancelled })
+                    continue
+                }
+
                 guard let result = demuxer.readPacket() else {
                     dLock.unlock()
+                    // zyno#360: an interrupted read is a deliberate pause, not
+                    // an I/O failure and never EOF — the switch will seek to
+                    // the selected track's position, then this loop resumes.
+                    // `lastDemuxInterrupted` also covers a late abort that
+                    // lands after the switch already cleared the gate.
+                    if demuxer.lastDemuxInterrupted || self.audioSwitchGate.isPending {
+                        if Self.diagLoggingEnabled {
+                            logger.info("[diag] demux read interrupted for audio switch — waiting")
+                        }
+                        self.audioSwitchGate.waitUntilSwitchFinishes(cancelled: { self.demuxCancelled })
+                        continue
+                    }
                     // Real read failure (network blackhole, risk-control
                     // block, gone cloud file) — surface it, never read it
                     // as EOF: the markEOF() tail below would end playback
@@ -3239,6 +3267,26 @@ public final class NativeBackend: PlayerBackend {
         let demuxerRef = demuxer
         Self.audioSwitchQueue.async { [weak self] in
             guard let self else { return }
+            // zyno#360: cover both paths with the gate and the user-facing
+            // switching state. The gate makes the demux loop stop starting
+            // new reads as soon as the switch is queued; the fast path can
+            // still bail to the slow path without releasing it.
+            self.audioSwitchGate.begin()
+            // PlayerState lives on the main actor; the gate above is the part
+            // that must be set synchronously on this queue (it decides whether
+            // the demux loop starts another read). The UI flag can follow a
+            // frame later.
+            Task { @MainActor [weak self] in
+                self?.state.isSwitchingAudioTrack = true
+                self?.notifyStateChange()
+            }
+            defer {
+                self.audioSwitchGate.end()
+                Task { @MainActor [weak self] in
+                    self?.state.isSwitchingAudioTrack = false
+                    self?.notifyStateChange()
+                }
+            }
             if self.performAudioTrackSwitchFast(trackId: trackId, demuxer: demuxerRef) { return }
             self.performAudioTrackSwitch(id: id, trackId: trackId, demuxer: demuxerRef)
         }
@@ -3377,24 +3425,42 @@ public final class NativeBackend: PlayerBackend {
         // (which holds demuxLock while processing audio packets) always sees a consistent
         // pair of (audioStreamIndex, audioDecoder). Creating the decoder outside the lock
         // caused the loop to feed new-stream packets into the stale old decoder.
+        // Millisecond precision: components.seconds alone truncates to whole
+        // seconds, seeking up to 1s behind the position being watched (and
+        // anchoring audioClock there). Computed before the stream guard because
+        // the failure path re-seeks to it (zyno#360).
+        let posSecs = Double(state.position.components.seconds)
+            + Double(state.position.components.attoseconds) / 1e18
+
+        // zyno#360: interrupt the demux loop's in-flight network read BEFORE
+        // contending for demuxLock — otherwise this lock() waits out the whole
+        // read (measured 8276.8 ms on a 115 BD). The demux loop treats the
+        // interrupted read as a pause and waits for the gate to end.
+        let interruptToken = demuxer.interruptPendingReads()
         demuxLock.lock()
         let tLock = ms(t0)
+        // The seek below probes the reader again (byte-domain TS seeks call
+        // av_read_frame repeatedly), so reads must work before it runs. The
+        // gate keeps the demux loop from reading concurrently.
+        demuxer.resumeReads(after: interruptToken)
         // Routed through audioDecodeQueue so this can't race a still-in-flight
         // decode() of an old-track packet on that queue.
         audioDecodeQueue.sync { audioDecoder?.flush() }
         audioDecoder = nil
         let tQueue = ms(t0)
         guard demuxer.selectAudioStream(by: trackId) else {
+            // zyno#360: the interrupted read may have left the AVIO context
+            // mid-packet. Re-seek to the current position — and publish the
+            // physical seek exactly like the success path does — so the
+            // resumed demux loop reads from a known-good point.
+            _ = demuxer.seek(to: posSecs)
+            physicalSeekGeneration += 1
+            seekLock.withLock { seekSerial += 1; seekLandedSerial = seekSerial }
             demuxLock.unlock()
             logger.warning("selectAudioTrack: stream \(trackId) not found, recreating original output")
             recreateAudioOutput()
             return
         }
-        // Millisecond precision: components.seconds alone truncates to whole
-        // seconds, seeking up to 1s behind the position being watched (and
-        // anchoring audioClock there).
-        let posSecs = Double(state.position.components.seconds)
-            + Double(state.position.components.attoseconds) / 1e18
         let tSeek0 = DispatchTime.now().uptimeNanoseconds
         _ = demuxer.seek(to: posSecs)
         let tSeek = ms(tSeek0)
@@ -3483,7 +3549,7 @@ public final class NativeBackend: PlayerBackend {
 
         logger.info("selectAudioTrack done, new decoder sampleRate=\(self.audioDecoder?.outputSampleRate ?? 0)")
         lastAudioSwitchPath = "slow"
-        logger.notice("[diag] audioswitch path=slow main=\(Thread.isMainThread, privacy: .public) stop=\(tStop, privacy: .public)ms lock=\(tLock, privacy: .public)ms audioQueue=\(tQueue, privacy: .public)ms seek=\(tSeek, privacy: .public)ms heldLock=\(tUnlock, privacy: .public)ms total=\(ms(t0), privacy: .public)ms")
+        logger.notice("[diag] audioswitch path=slow main=\(Thread.isMainThread, privacy: .public) stop=\(tStop, privacy: .public)ms lock=\(tLock, privacy: .public)ms audioQueue=\(tQueue, privacy: .public)ms seek=\(tSeek, privacy: .public)ms heldLock=\(tUnlock, privacy: .public)ms interrupted=\(interruptToken != 0, privacy: .public) total=\(ms(t0), privacy: .public)ms")
     }
 
     public func selectSubtitle(id: String?) {
