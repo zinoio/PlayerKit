@@ -417,6 +417,25 @@ public final class NativeBackend: PlayerBackend {
     /// Decoded frames appended into the jitter buffer (supply-side count; the
     /// loss is display-side iff appends ≈ source fps×elapsed ≫ displayed).
     private nonisolated(unsafe) var diagAppendsSinceLog = 0
+    // [diag] zyno#380: demux read-ahead throttle accounting. When the jitter
+    // buffer's PTS span (`dur`) grows without bound after a big fine-seek
+    // discard, these counters say whether the throttle even fired and what it
+    // saw — a 50ms-per-packet sleep may not hold a demux/decode loop that can
+    // otherwise run well above real time.
+    private nonisolated(unsafe) var diagThrottlePackets = 0
+    private nonisolated(unsafe) var diagThrottleSleeps = 0
+    private nonisolated(unsafe) var diagThrottleSleepMs: Double = 0
+    private nonisolated(unsafe) var diagThrottleAudioStallSkips = 0
+    private nonisolated(unsafe) var diagThrottleLastPts: Double = 0
+    private nonisolated(unsafe) var diagThrottleLastAudio: Double = 0
+    private nonisolated(unsafe) var diagThrottleLastReadAhead: Double = 0
+    private nonisolated(unsafe) var diagThrottleLastGapMs: Double = 0
+    /// Largest backward step of the pacing clock within the window. A few ms
+    /// is the delay/lead controller's normal wobble — the old per-packet
+    /// "clock advanced?" test treated any such wobble as an audio stall and
+    /// skipped the read-ahead throttle (zyno#380).
+    private nonisolated(unsafe) var diagThrottleMaxDropMs: Double = 0
+    private nonisolated(unsafe) var diagBackPressureSleeps = 0
     // Diagnostic: see the gap-detection note in displayNextFrame().
     private nonisolated(unsafe) var lastTickWallTime: Double?
     private let tickGapWarnThreshold: Double = 0.05
@@ -550,6 +569,48 @@ public final class NativeBackend: PlayerBackend {
             tickGuardSkip = 0
             drainDepthStats.reset()
             diagAppendsSinceLog = 0
+            return t
+        }
+    }
+
+    /// [diag] Demux read-ahead throttle snapshot since the last drain
+    /// (zyno#380). `packets` = video packets through the throttle site,
+    /// `sleeps`/`sleepMs` = how many actually slept and for how long,
+    /// `audioStallSkips` = wanted to throttle but the audio clock had not
+    /// advanced (the deadlock-avoidance bypass), `backPressure` = sleeps at
+    /// the jitter buffer's byte/frame caps, and `lastGapMs` = the last
+    /// pts − audioTime − readAhead the throttle saw.
+    struct ThrottleDiag {
+        var packets = 0
+        var sleeps = 0
+        var sleepMs: Double = 0
+        var audioStallSkips = 0
+        var backPressure = 0
+        var lastPts: Double = 0
+        var lastAudio: Double = 0
+        var lastReadAhead: Double = 0
+        var lastGapMs: Double = 0
+        var maxDropMs: Double = 0
+    }
+
+    nonisolated func drainThrottleDiag() -> ThrottleDiag {
+        displayLoopLock.withLock { () -> ThrottleDiag in
+            let t = ThrottleDiag(packets: diagThrottlePackets,
+                                 sleeps: diagThrottleSleeps,
+                                 sleepMs: diagThrottleSleepMs,
+                                 audioStallSkips: diagThrottleAudioStallSkips,
+                                 backPressure: diagBackPressureSleeps,
+                                 lastPts: diagThrottleLastPts,
+                                 lastAudio: diagThrottleLastAudio,
+                                 lastReadAhead: diagThrottleLastReadAhead,
+                                 lastGapMs: diagThrottleLastGapMs,
+                                 maxDropMs: diagThrottleMaxDropMs)
+            diagThrottlePackets = 0
+            diagThrottleSleeps = 0
+            diagThrottleSleepMs = 0
+            diagThrottleAudioStallSkips = 0
+            diagThrottleMaxDropMs = 0
+            diagBackPressureSleeps = 0
             return t
         }
     }
@@ -1475,6 +1536,10 @@ public final class NativeBackend: PlayerBackend {
             var diagAppendCount = 0
             var diagLastAppendedPts = -Double.infinity
             var lastThrottleAudioPos: Double = 0
+            // Wall time the audio clock last moved forward. The read-ahead
+            // throttle's deadlock bypass keys on this (a real stall), not on
+            // "did the clock move since the previous video packet".
+            var lastAudioAdvanceWall = CACurrentMediaTime()
 
             let frameDuration: Double
             if let vs = demuxer.videoStream {
@@ -1753,9 +1818,53 @@ public final class NativeBackend: PlayerBackend {
                     // flat 2 s: for 4K HDR the byte budget fits well under 2 s of frames
                     // and the overflow would be refused (dropped) at append.
                     let readAhead = jitter.readAheadSeconds
-                    if pts.isFinite && pts > audioPos + readAhead,
-                       audioPos > lastThrottleAudioPos {
-                        Thread.sleep(forTimeInterval: min(pts - audioPos - readAhead, 0.050))
+                    let throttleGap = pts - audioPos - readAhead
+                    let wantsThrottle = pts.isFinite && throttleGap > 0
+                    let nowWall = CACurrentMediaTime()
+                    let audioDelta = audioPos - lastThrottleAudioPos
+                    if audioDelta > 0 { lastAudioAdvanceWall = nowWall }
+                    // Deadlock-avoidance bypass must key on a REAL stall (the
+                    // clock has not advanced for 0.5s of wall time), not on
+                    // "it did not increase since the previous video packet".
+                    // audioTime wobbles by a few ms (delay/lead controller)
+                    // and the demux can consume several video packets between
+                    // two audio callbacks, so the old per-packet `>` test
+                    // skipped the throttle on ~88% of packets: the demux ran
+                    // away from the audio clock, the buffer filled (dur 2s→8s),
+                    // appends were refused and playback locked at 5-10fps
+                    // (zyno#380, measured via [diag] throttle).
+                    let audioStalled = nowWall - lastAudioAdvanceWall > 0.5
+                    var throttledSleep = 0.0
+                    if wantsThrottle, !audioStalled {
+                        throttledSleep = min(throttleGap, 0.050)
+                        Thread.sleep(forTimeInterval: throttledSleep)
+                    }
+                    // [diag] zyno#380: what the read-ahead cap actually did
+                    // this window. Healthy: slept ≈ pkt, gapMs small, refused
+                    // flat. sleep=0 with a huge gapMs means the condition
+                    // never fired; audioSkip counts only genuine >0.5s stalls.
+                    if Self.diagLoggingEnabled {
+                        displayLoopLock.withLock {
+                            self.diagThrottlePackets += 1
+                            self.diagThrottleLastPts = pts
+                            self.diagThrottleLastAudio = audioPos
+                            self.diagThrottleLastReadAhead = readAhead
+                            self.diagThrottleLastGapMs = wantsThrottle ? throttleGap * 1000 : 0
+                            // Ignore seek resets: jumping backward by seconds
+                            // is the seek, not the delay controller's wobble.
+                            if audioDelta < 0, -audioDelta < 5.0,
+                               -audioDelta * 1000 > self.diagThrottleMaxDropMs {
+                                self.diagThrottleMaxDropMs = -audioDelta * 1000
+                            }
+                            if wantsThrottle {
+                                if audioStalled {
+                                    self.diagThrottleAudioStallSkips += 1
+                                } else {
+                                    self.diagThrottleSleeps += 1
+                                    self.diagThrottleSleepMs += throttledSleep * 1000
+                                }
+                            }
+                        }
                     }
                     lastThrottleAudioPos = audioPos
 
@@ -1768,6 +1877,9 @@ public final class NativeBackend: PlayerBackend {
                     // keeps reading the audio packets interleaved with the video.
                     if jitter.isFull {
                         Thread.sleep(forTimeInterval: 0.010)
+                        if Self.diagLoggingEnabled {
+                            displayLoopLock.withLock { self.diagBackPressureSleeps += 1 }
+                        }
                     }
 
                     // Frame-count back-pressure (2026-10-12 晃动 fix). The frame
@@ -1786,6 +1898,9 @@ public final class NativeBackend: PlayerBackend {
                     // interleaved after this one are still read.
                     if jitter.count >= jitter.maxFrameCount {
                         Thread.sleep(forTimeInterval: 0.010)
+                        if Self.diagLoggingEnabled {
+                            displayLoopLock.withLock { self.diagBackPressureSleeps += 1 }
+                        }
                     }
 
                 } else if streamIndex == demuxer.audioStreamIndex {
@@ -1839,6 +1954,14 @@ public final class NativeBackend: PlayerBackend {
                         // PCM path: decode with FFmpeg and enqueue to AudioUnit,
                         // off the demux/video thread (see audioDecodeQueue's doc
                         // comment). Capture decoder/output now — selectAudioTrack
+                        //
+                        // zyno#380: clear the passthrough flag when the runtime
+                        // fallback (zyno#105) drops back to PCM. It used to stay
+                        // true for the rest of playback, so the read-ahead
+                        // throttle and the display loop kept reading a
+                        // passthrough clock that no longer receives packets —
+                        // the demux then lost its pacing reference.
+                        if isPassthroughActive { isPassthroughActive = false }
                         // may replace self.audioDecoder/audioUnitOutput before
                         // this actually runs on the queue; currentDec/currentOut
                         // stay bound to whatever was current when this packet was
@@ -2653,6 +2776,14 @@ public final class NativeBackend: PlayerBackend {
                 // [diag] where ticks went: drain=skip-behind pops, stall=freeze-ahead
                 // ticks, deny=SyncController refusals, appends=decode supply.
                 logger.info("[diag] tick[drain=\(tick.drainLag, privacy: .public) stall=\(tick.stallAhead, privacy: .public) deny=\(tick.checkDeny, privacy: .public) noFrame=\(tick.noFrame, privacy: .public) guardSkip=\(tick.guardSkip, privacy: .public) appends=\(tick.appends, privacy: .public) depth[n=\(tick.drainDepth.count, privacy: .public) mean=\(String(format:"%.0f", tick.drainDepth.mean*1000), privacy: .public)ms max=\(String(format:"%.0f", tick.drainDepth.max*1000), privacy: .public)ms]]")
+                // [diag] zyno#380: what the read-ahead throttle actually did.
+                // Healthy: slept ≈ pkt with a small gapMs and `refused` flat.
+                // `dur` growing while slept = 0 means the throttle condition
+                // never fired; slept ≪ pkt with a huge gapMs means 50ms per
+                // packet cannot hold a demux that runs above real time.
+                let th = self.drainThrottleDiag()
+                let frontPts = self.jitterBuffer.peek(at: 0)?.pts ?? -1
+                logger.info("[diag] throttle[pkt=\(th.packets, privacy: .public) slept=\(th.sleeps, privacy: .public) sleptMs=\(String(format: "%.0f", th.sleepMs), privacy: .public) audioSkip=\(th.audioStallSkips, privacy: .public) bp=\(th.backPressure, privacy: .public) lastPts=\(String(format: "%.3f", th.lastPts), privacy: .public) lastAudio=\(String(format: "%.3f", th.lastAudio), privacy: .public) ra=\(String(format: "%.2f", th.lastReadAhead), privacy: .public) gapMs=\(String(format: "%.0f", th.lastGapMs), privacy: .public) dropMs=\(String(format: "%.1f", th.maxDropMs), privacy: .public) pass=\(self.isPassthroughActive, privacy: .public) q=\(self.jitterBuffer.count, privacy: .public) dur=\(String(format: "%.2f", self.jitterBuffer.duration), privacy: .public) front=\(String(format: "%.3f", frontPts), privacy: .public) refused=\(self.jitterBuffer.droppedIncomingCount, privacy: .public)]")
                 // [diag] display-order integrity (2026-10-13): gap = pts interval
                 // between displayed frames. Healthy 23.976fps content: min≈max≈41.7ms.
                 // Decode-order display (broken PTS): min≈20.8 / max≈62.5 (or negative).
