@@ -51,6 +51,17 @@ protocol PacketDemuxing: AnyObject, Sendable {
     /// risk-control block, gone cloud file) apart from a natural EOF — the
     /// former must surface as a playback error, the latter is "played to end".
     var lastDemuxError: Error? { get }
+    /// zyno#360: true when the most recent readPacket() returned nil because an
+    /// audio-track switch interrupted the read — a deliberate pause, not a
+    /// failure and never EOF. Default false for demuxers that can't interrupt.
+    var lastDemuxInterrupted: Bool { get }
+    /// zyno#360: abort an in-flight network read before the switch takes
+    /// `demuxLock`. Returns a generation token (0 = reader has no interruption
+    /// support). Default no-op.
+    func interruptPendingReads() -> UInt64
+    /// zyno#360: clear the interruption once the switch holds `demuxLock`, so
+    /// the switch's own seek reads work. Default no-op.
+    func resumeReads(after token: UInt64)
     func seek(to time: Double) -> Bool
     /// The video PTS the most recent seek() physically landed on, when the
     /// demuxer knows it. Non-nil only for byte-domain seeks
@@ -69,4 +80,7 @@ extension FFmpegDemuxer: PacketDemuxing {}
 extension PacketDemuxing {
     var audioStreamIndices: [Int32] { [] }
     func setCachedAudioStreams(_ indices: Set<Int32>) {}
+    var lastDemuxInterrupted: Bool { false }
+    func interruptPendingReads() -> UInt64 { 0 }
+    func resumeReads(after token: UInt64) {}
 }

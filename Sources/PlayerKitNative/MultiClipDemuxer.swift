@@ -28,10 +28,20 @@ final class MultiClipDemuxer: @unchecked Sendable {
     /// error", and their absence means the presentation genuinely ended.
     private var lastSwitchError: Error?
 
+    /// zyno#360: a clip-open aborted by an audio-track switch. The open isn't
+    /// a read, so the active clip's own `lastDemuxInterrupted` can't carry it.
+    private var interruptedDuringOpen = false
+
     /// nil = clean EOF / healthy state; non-nil = why demuxing failed.
     /// Same contract as FFmpegDemuxer.lastDemuxError, threaded through the
     /// active clip plus this class's own clip-switch failures.
     var lastDemuxError: Error? { current?.lastDemuxError ?? lastSwitchError }
+
+    /// zyno#360: the interruption state of whichever read was in flight —
+    /// the active clip's read, or a clip-open aborted by the switch.
+    var lastDemuxInterrupted: Bool {
+        interruptedDuringOpen || (current?.lastDemuxInterrupted ?? false)
+    }
 
     /// A fully-opened demuxer for the next sequential clip, produced in the
     /// background by `preOpenQueue` while the current clip is still playing.
@@ -138,6 +148,7 @@ final class MultiClipDemuxer: @unchecked Sendable {
     }
 
     func readPacket() -> (streamIndex: Int32, packet: UnsafeMutablePointer<AVPacket>, didSwitchClip: Bool)? {
+        interruptedDuringOpen = false
         guard let current else { return nil }
         if let result = current.readPacket() {
             lastSwitchError = nil  // healthy read retires any stale switch failure
@@ -162,11 +173,26 @@ final class MultiClipDemuxer: @unchecked Sendable {
             pendingSwitchFlag = false
             return (result.streamIndex, result.packet, switched)
         }
+        if current.lastDemuxInterrupted {
+            // zyno#360: an audio-track switch interrupted this read — not
+            // EOF. Do not advance to the next clip; the switch seeks the
+            // timeline and the loop resumes afterwards.
+            return nil
+        }
         // Current clip exhausted (EOF) — advance to the next one, if any.
         guard currentIndex + 1 < readers.count else { return nil }
         do {
             try switchTo(clipIndex: currentIndex + 1, localSeekSecs: nil)
         } catch {
+            // zyno#360: a switch aborted the clip-open's reads. Not a clip
+            // failure — the switch re-seeks the timeline afterwards, and the
+            // demux loop must treat this as a pause rather than "demux I/O
+            // error" or EOF.
+            if error is MediaReadInterrupted {
+                interruptedDuringOpen = true
+                logger.info("clip switch interrupted for audio-track switch")
+                return nil
+            }
             // Opening the next clip failed (disc sector gone, cloud file
             // deleted, …). Record it so the backend can surface a real error
             // instead of reading this as "the presentation ended here".
@@ -292,6 +318,9 @@ extension MultiClipDemuxer: PacketDemuxing {
         current?.setCachedAudioStreams(indices)
     }
     func selectSubtitleStream(by id: Int?) { currentDemuxer?.selectSubtitleStream(by: id) }
+    // zyno#360: forward the interruption to the active clip's demuxer/reader.
+    func interruptPendingReads() -> UInt64 { currentDemuxer?.interruptPendingReads() ?? 0 }
+    func resumeReads(after token: UInt64) { currentDemuxer?.resumeReads(after: token) }
     // readPacket()/seek(to:)/close() already have class-level implementations
     // with the same signatures — no delegation needed here.
 }

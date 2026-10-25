@@ -60,6 +60,24 @@ final class AVIOBridge: @unchecked Sendable {
     var downloadedUpToOffset: Int64 { reader.downloadedUpToOffset }
     var totalBytes: Int64 { cachedSize }
 
+    // zyno#360: forward the reader interruption contract so the audio-track
+    // switch can abort the in-flight read before it contends for demuxLock.
+    func interruptPendingReads() -> UInt64 { reader.interruptPendingReads() }
+
+    func resumeReads(after token: UInt64) {
+        reader.resumeReads(after: token)
+        // aviobuf.c sets eof_reached = 1 on ANY read error, not just EOF, and
+        // avio_seek's short-seek path (target within 32 KB ahead) returns
+        // AVERROR_EOF immediately while that flag is set. Left alone, the
+        // interrupted read would make the switch's own seek fail whenever it
+        // moves forward a little — even though the reader is healthy again.
+        // Both fields are part of AVIOContext's public state (avio.h).
+        if let ctx = ioContext {
+            ctx.pointee.eof_reached = 0
+            ctx.pointee.error = 0
+        }
+    }
+
     // The error thrown by the most recent failed reader.read(), surfaced so
     // FFmpegDemuxer.readPacket can report WHY av_read_frame failed (network
     // blackhole, risk-control block, token expired…) instead of a bare -1.

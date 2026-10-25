@@ -90,6 +90,12 @@ final class FFmpegDemuxer: @unchecked Sendable {
     /// internal lock.
     private(set) var lastDemuxError: Error?
 
+    /// zyno#360: true when the most recent readPacket() failure was caused by
+    /// `MediaReadInterrupted` — an audio-track switch aborted the read on
+    /// purpose. The demux loop pauses and retries instead of surfacing a
+    /// "demux I/O error". Cleared at the start of every readPacket().
+    private(set) var lastDemuxInterrupted: Bool = false
+
     /// The video PTS the most recent seek() landed on — set by
     /// seekByByteOffset (byte-domain seeks probe an actual video PTS), nil
     /// for index-guided av_seek_frame seeks (no probe is paid) and cleared
@@ -766,6 +772,7 @@ final class FFmpegDemuxer: @unchecked Sendable {
     /// specially (its PTS is a known-good rebase onto the continuous
     /// timeline, not an anomaly).
     func readPacket() -> (streamIndex: Int32, packet: UnsafeMutablePointer<AVPacket>, didSwitchClip: Bool)? {
+        lastDemuxInterrupted = false
         guard let ctx = formatCtx else { return nil }
         var pkt = av_packet_alloc()
         let ret = av_read_frame(ctx, pkt)
@@ -774,6 +781,13 @@ final class FFmpegDemuxer: @unchecked Sendable {
                 if ret == AVIOBridge.averrorEOF {
                     // Natural end of stream — not an error.
                     lastDemuxError = nil
+                } else if avioBridge?.lastReadError is MediaReadInterrupted {
+                    // zyno#360: an audio-track switch aborted this read on
+                    // purpose. Not a playback error, and never EOF — the
+                    // demux loop pauses and resumes after the switch's seek.
+                    lastDemuxInterrupted = true
+                    lastDemuxError = nil
+                    logger.info("av_read_frame interrupted for audio-track switch")
                 } else {
                     // Prefer the reader's own thrown error (its identity —
                     // domain, code, message — is exactly what the UI needs;
@@ -789,6 +803,10 @@ final class FFmpegDemuxer: @unchecked Sendable {
         lastDemuxError = nil
         return (packet.pointee.stream_index, packet, false)
     }
+
+    // zyno#360: forward the reader interruption contract.
+    func interruptPendingReads() -> UInt64 { avioBridge?.interruptPendingReads() ?? 0 }
+    func resumeReads(after token: UInt64) { avioBridge?.resumeReads(after: token) }
 
     // Probe real duration by opening a SEPARATE context on the same URL and
     // seeking to end.  Never touches the main playback context so the stream
