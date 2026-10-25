@@ -101,6 +101,59 @@ public final class AudioUnitOutput: AudioOutputBackend {
     /// different amounts of audio per codec.
     private var bufferedSamples = 0
 
+    /// Upper bound (seconds) on audio the AudioQueue has TAKEN from us (its
+    /// buffer callback fired) but not yet PLAYED. This is a different quantity
+    /// from both `bufferedSamples` and `maxPausedBufferSeconds`:
+    ///  - `bufferedSamples` is enqueued-but-not-taken — the normal demux
+    ///    read-ahead (~1.2 s) — and must stay free to grow;
+    ///  - TAKEN-but-unplayed is ~0 in steady playback (callbacks fire at the
+    ///    play rate) and is what must stay small.
+    /// zyno#361: after a reader stall the demux refills at many × real time and
+    /// the queue takes that recovery burst immediately (the callback means
+    /// "finished taking data from a buffer"), so the callback-driven AudioClock
+    /// advanced 2–3× while the device kept playing at 1× — clock and picture
+    /// jumped ~7 s ahead of the sound.
+    ///
+    /// The primary fix for that state is rebuildQueueIfStarved(): the queue is
+    /// replaced before the recovery burst is fed, so a healthy queue never
+    /// over-takes (pre-stall it takes exactly at the play rate, lead ≈ 0).
+    /// This cap is the safety net for a queue that over-takes WITHOUT a long
+    /// callback gap. It must stay well above the demux's normal read-ahead
+    /// (~1.2 s in `bufferedSamples`): a tight cap blocks the enqueue, collapses
+    /// that read-ahead, and turns playback into a just-in-time feed whose
+    /// callback bursts make the clock (and the picture) stutter — measured
+    /// with a 0.1 s cap after a freeze: bufSec stayed 0.00, the lead crept to
+    /// 0.37 s and the display dropped to 3–5 fps.
+    var maxPlayingLeadSeconds: Double = 2.0
+
+    /// Seconds without an AudioQueue callback (while playing, not paused) after
+    /// which the queue counts as starved and rebuildQueueIfStarved() replaces
+    /// it. Production 2 s; tests raise it when they exercise other behaviour on
+    /// slow CI runners (a stalled virtual audio device plus a slow test process
+    /// can stretch a "normal" feed past the threshold).
+    var starvationRebuildSeconds: Double = 2.0
+
+    /// Wall time of the last AudioQueue callback. Guarded by lock. A gap of
+    /// seconds means the queue starved; see rebuildQueueIfStarved().
+    private var lastCallbackWall: TimeInterval = 0
+    /// Starvation-triggered queue rebuilds since start (test/diag seam).
+    private var queueRebuilds = 0
+
+    // True-progress accounting for maxPlayingLeadSeconds. Guarded by lock.
+    /// Cumulative output samples handed back by AudioQueue callbacks — exactly
+    /// what AudioClock.advance() is fed. Includes the silent primers.
+    private var takenOutputSamples: Int64 = 0
+    /// Wall-anchored take-rate baseline: (wall, taken) at the last moment the
+    /// queue had NOT taken more than the device could have played. The excess
+    /// `taken − anchorTaken − elapsed × sampleRate` is the audio the queue has
+    /// taken but cannot have played yet — the lead that maxPlayingLeadSeconds
+    /// bounds. AudioQueueGetCurrentTime is NOT usable for this: it is the
+    /// device timeline and keeps advancing through an underrun, which would
+    /// hide exactly the post-stall burst this cap exists for (measured: qts
+    /// advanced 1× while callbacks took 2.8×).
+    private var leadAnchorWall: TimeInterval = 0
+    private var leadAnchorTaken: Int64 = 0
+
     // [diag] cumulative queue-health counters (晃动 localization 2026-10-12):
     // enqueues/starts/pauses/resumes since last drain — distinguishes "queue
     // never fed" (enqueues≈callbacks, both tiny) from "queue repeatedly
@@ -109,6 +162,14 @@ public final class AudioUnitOutput: AudioOutputBackend {
     private var diagStarts = 0
     private var diagPauses = 0
     private var diagResumes = 0
+    // [diag] callback-side accumulators, guarded by lock.
+    private var diagCallbackCount = 0
+    private var diagCallbackSamples: Int64 = 0
+    private var diagCallbackWall: TimeInterval = 0
+    private var diagLastCallbackWall: TimeInterval = 0
+    private var diagQueueTimeLast: Double?
+    private var diagQueueTimeDelta: Double = 0
+    private var diagEnqueuedSamples: Int64 = 0
 
     public let supportsPassthrough: Bool = false
 
@@ -122,15 +183,45 @@ public final class AudioUnitOutput: AudioOutputBackend {
         var pausedNow = false
         var bufferedSamplesNow = 0
         var bufferedFramesNow = 0
+        // [diag] zyno#361 callback-side observability. A sample-count clock can
+        // only advance when the AudioQueue reports consumed buffers; if the
+        // callback sum outruns wall time, either the device really consumed
+        // faster (a device-clock anomaly) or buffers completed without being
+        // played (a drain). `queueTimeSeconds` is AudioQueue's own played-
+        // sample timebase — it separates the two.
+        var callbackCount = 0
+        var callbackSeconds = 0.0
+        var callbackWallSeconds = 0.0
+        var queueTimeSeconds = 0.0
+        var enqueuedSeconds = 0.0
+        var sampleRateNow: Int32 = 48000
+        var playRateNow: Double = 1.0
+        /// Instantaneous TAKEN-but-unplayed lead (see maxPlayingLeadSeconds).
+        /// Stays ~0 in healthy playback; grows to seconds when the queue takes
+        /// a recovery burst it cannot play in step (zyno#361).
+        var leadSeconds = 0.0
     }
 
     func drainQueueDiag() -> QueueDiag {
         lock.lock(); defer { lock.unlock() }
+        let sr = max(1, clock.sampleRate)
         let d = QueueDiag(enqueues: diagEnqueues, starts: diagStarts, pauses: diagPauses,
                           resumes: diagResumes, pausedNow: paused,
                           bufferedSamplesNow: bufferedSamples,
-                          bufferedFramesNow: bufferedFrameCount)
+                          bufferedFramesNow: bufferedFrameCount,
+                          callbackCount: diagCallbackCount,
+                          callbackSeconds: Double(diagCallbackSamples) / Double(sr),
+                          callbackWallSeconds: diagCallbackWall,
+                          queueTimeSeconds: diagQueueTimeDelta / Double(sr),
+                          enqueuedSeconds: Double(diagEnqueuedSamples) / Double(sr),
+                          sampleRateNow: sr,
+                          playRateNow: _playbackRate,
+                          leadSeconds: max(0, Double(takenOutputSamples - leadAnchorTaken) / Double(sr)
+                              - (ProcessInfo.processInfo.systemUptime - leadAnchorWall)))
         diagEnqueues = 0; diagStarts = 0; diagPauses = 0; diagResumes = 0
+        diagCallbackCount = 0; diagCallbackSamples = 0; diagCallbackWall = 0
+        diagQueueTimeDelta = 0; diagQueueTimeLast = nil; diagEnqueuedSamples = 0
+        diagLastCallbackWall = 0
         return d
     }
 
@@ -245,6 +336,10 @@ public final class AudioUnitOutput: AudioOutputBackend {
         bufferedFrameCount = 0
         pendingPrimerCallbacks = primerCount
         bufferedSamples = 0
+        takenOutputSamples = 0
+        leadAnchorWall = 0
+        leadAnchorTaken = 0
+        lastCallbackWall = 0
         contentFifo.removeAll(); playedContentEndPTS = .nan
         lock.unlock()
 
@@ -268,6 +363,10 @@ public final class AudioUnitOutput: AudioOutputBackend {
         enqueuedFrames = 0
         pendingPrimerCallbacks = 0
         bufferedSamples = 0
+        takenOutputSamples = 0
+        leadAnchorWall = 0
+        leadAnchorTaken = 0
+        lastCallbackWall = 0
         contentFifo.removeAll(); playedContentEndPTS = .nan
         lock.unlock()
         // Seek/stop/track-switch all land here: drop the held-back frames so
@@ -320,6 +419,9 @@ public final class AudioUnitOutput: AudioOutputBackend {
         let queue = audioQueue
         if paused { paused = false }
         diagResumes += 1
+        // A deliberate pause is not a starvation: re-anchor the callback clock
+        // so the first enqueue after a resume cannot trigger a rebuild.
+        if lastCallbackWall > 0 { lastCallbackWall = ProcessInfo.processInfo.systemUptime }
         lock.unlock()
         guard queue != nil else {
             // 音频队列尚不存在时被要求恢复:start() 未跑或队列已 dispose。
@@ -337,12 +439,123 @@ public final class AudioUnitOutput: AudioOutputBackend {
         }
     }
 
+    /// Rebuild the AudioQueue if it has been starved for seconds.
+    ///
+    /// zyno#361 follow-up: a playback AudioQueue that underruns for a long time
+    /// does not necessarily recover when data returns. Measured after a 25 s
+    /// reader stall: callbacks resumed at ~1× (so the sample clock looked
+    /// healthy and the picture no longer fast-forwarded), but the device output
+    /// stayed at digital silence (-120 dB) for minutes while the app-side buffer
+    /// never refilled — the queue consumed buffers without playing them.
+    /// Rebuilding it (the same stop()/start() path a seek takes) restores sound.
+    ///
+    /// Runs on the decode path before the first post-stall enqueue, so a broken
+    /// queue is never fed. resume() re-anchors the callback clock: a deliberate
+    /// pause is not a starvation. Threshold 2 s: normal hiccups are far shorter,
+    /// and the reader's own stall handling can keep a 4K stream starved for
+    /// several seconds.
+    private func rebuildQueueIfStarved() {
+        let now = ProcessInfo.processInfo.systemUptime
+        lock.lock()
+        let gap = lastCallbackWall > 0 ? now - lastCallbackWall : 0
+        let starved = running && !paused && lastCallbackWall > 0
+            && gap > starvationRebuildSeconds
+        let sr = clock.sampleRate
+        let ch = _channels
+        if starved {
+            queueRebuilds += 1
+            lastCallbackWall = now
+        }
+        lock.unlock()
+        guard starved else { return }
+        logger.warning("AudioQueue starved \(String(format: "%.1f", gap), privacy: .public)s — rebuilding")
+        start(sampleRate: sr, channels: ch)
+    }
+
+    /// Number of starvation-triggered AudioQueue rebuilds (test seam).
+    func queueRebuildCountForTesting() -> Int {
+        lock.lock(); defer { lock.unlock() }
+        return queueRebuilds
+    }
+
+    /// Block until the AudioQueue's TAKEN-but-unplayed lead is within
+    /// `maxPlayingLeadSeconds` (zyno#361). Only the decode path calls this —
+    /// control paths (setDelayTarget/setPlaybackRate) release delay-line frames
+    /// through enqueueDirect directly and must never block their caller.
+    ///
+    /// The wait runs on the audio decode queue, which is exactly where
+    /// back-pressure belongs: the demux keeps reading video/subtitle packets,
+    /// only decoded audio waits. Playback consumes output samples at the
+    /// output sample rate regardless of the tempo rate, so the device can have
+    /// played at most `elapsed × sampleRate` since the anchor — anything taken
+    /// beyond that (plus the cap) is a take burst the device cannot have
+    /// played, and it is what made the callback clock jump (zyno#361).
+    /// A 2 s deadline keeps a device-side stall from wedging the decode queue
+    /// forever; past it we enqueue anyway (dropping audio would be worse).
+    private func waitForPlaybackLead() {
+        let cap = maxPlayingLeadSeconds
+        guard cap > 0 else { return }
+        let deadline = ProcessInfo.processInfo.systemUptime + 2.0
+        while true {
+            let now = ProcessInfo.processInfo.systemUptime
+            lock.lock()
+            let sr = Double(max(1, clock.sampleRate))
+            // Pacing only makes sense while the queue is actually playing: a
+            // paused queue is bounded by maxPausedBufferSeconds instead, and
+            // before the first callback there is no anchor to measure from.
+            let canPace = running && !paused && leadAnchorWall > 0
+            let excess = Double(takenOutputSamples - leadAnchorTaken)
+                - max(0, now - leadAnchorWall) * sr
+            let shouldWait = canPace && excess > cap * sr
+            lock.unlock()
+            guard shouldWait, now < deadline else { return }
+            // 5 ms: a few 40-sample TrueHD buffers (0.83 ms each) per step —
+            // fine-grained enough not to overshoot the lead cap meaningfully.
+            Thread.sleep(forTimeInterval: 0.005)
+        }
+    }
+
+    /// Test seam: pretend the last AudioQueue callback was `seconds` ago, so
+    /// rebuildQueueIfStarved() can be exercised without a real audio-thread
+    /// stall (CI's virtual device does not reliably deliver callbacks).
+    func simulateStarvationForTesting(seconds: Double) {
+        lock.lock()
+        if running {
+            lastCallbackWall = ProcessInfo.processInfo.systemUptime - max(0, seconds)
+        }
+        lock.unlock()
+    }
+
+    /// Test seam: inject a TAKEN-but-unplayed lead so waitForPlaybackLead() can
+    /// be exercised deterministically — the real queue's post-starvation take
+    /// burst depends on audio-thread timing and is not reproducible in CI.
+    func injectPlaybackLeadForTesting(takenSeconds: Double) {
+        lock.lock()
+        let sr = Double(max(1, clock.sampleRate))
+        takenOutputSamples = Int64(max(0, takenSeconds) * sr)
+        leadAnchorTaken = 0
+        leadAnchorWall = ProcessInfo.processInfo.systemUptime
+        lock.unlock()
+    }
+
+    /// Test seam: the current TAKEN-but-unplayed lead in seconds, i.e. how
+    /// much audio the queue has taken beyond what the device could have played.
+    func playbackLeadSeconds() -> Double {
+        lock.lock(); defer { lock.unlock() }
+        let sr = Double(max(1, clock.sampleRate))
+        let excess = Double(takenOutputSamples - leadAnchorTaken)
+            - max(0, ProcessInfo.processInfo.systemUptime - leadAnchorWall) * sr
+        return max(0, excess / sr)
+    }
+
     /// Line-aware entry (zyno#104). With no delay target (the default) this is
     /// a direct pass-through — zero behavior change. With d>0 the frame parks
     /// in AudioDelayLine and only frames the pump releases reach the queue.
     /// The line runs OUTSIDE the output lock (it never calls back in; see its
     /// doc) — releasing it into enqueueDirect per frame re-takes the lock.
     func enqueue(_ frame: PCMFrame, contentPts: Double = .nan) {
+        rebuildQueueIfStarved()
+        waitForPlaybackLead()
         lock.lock()
         let targetContent = _delayTargetContent
         let rate = _playbackRate
@@ -451,6 +664,7 @@ public final class AudioUnitOutput: AudioOutputBackend {
         diagEnqueues += 1
         bufferedFrameCount += 1
         bufferedSamples += frame.sampleCount
+        diagEnqueuedSamples += Int64(frame.sampleCount)
         let shouldRestart = !paused
         if shouldRestart { diagStarts += 1 }
         lock.unlock()
@@ -472,7 +686,21 @@ public final class AudioUnitOutput: AudioOutputBackend {
     }
 
     /// Called from the AudioQueue callback — do not call directly.
-    func _callbackConsumed(byteCount: Int) {
+    func _callbackConsumed(byteCount: Int, queue: AudioQueueRef?) {
+        // [diag] The queue's own sample timebase, read OUTSIDE our lock: holding
+        // the lock across an AudioQueue call can deadlock against the enqueue
+        // path (which holds the lock across AudioQueueEnqueueBuffer). Note it
+        // advances through underruns, so it is diagnostics only — the playing
+        // back-pressure measures against wall time instead (see leadAnchorWall).
+        var queueSampleTime: Double?
+        if NativeBackend.diagLoggingEnabled, let queue {
+            var ts = AudioTimeStamp()
+            if AudioQueueGetCurrentTime(queue, nil, &ts, nil) == noErr,
+               ts.mFlags.contains(.sampleTimeValid) {
+                queueSampleTime = ts.mSampleTime
+            }
+        }
+        let now = ProcessInfo.processInfo.systemUptime
         lock.lock()
         if bufferedFrameCount > 0 { bufferedFrameCount &-= 1 }
         let ch = _channels
@@ -486,6 +714,31 @@ public final class AudioUnitOutput: AudioOutputBackend {
                 if done.pts.isFinite { playedContentEndPTS = done.pts + done.dur }
             }
         }
+        if diagLastCallbackWall > 0 { diagCallbackWall += now - diagLastCallbackWall }
+        diagLastCallbackWall = now
+        diagCallbackCount += 1
+        diagCallbackSamples += Int64(byteCount / (max(1, Int(ch)) * 4))
+        if let qts = queueSampleTime {
+            if let last = diagQueueTimeLast {
+                let d = qts - last
+                if d >= 0, d < Double(clock.sampleRate) * 10 { diagQueueTimeDelta += d }
+            }
+            diagQueueTimeLast = qts
+        }
+        // True-progress accounting for the playing back-pressure (zyno#361).
+        takenOutputSamples += Int64(byteCount / (max(1, Int(ch)) * 4))
+        let sr = Double(max(1, clock.sampleRate))
+        let excess = Double(takenOutputSamples - leadAnchorTaken)
+            - (now - leadAnchorWall) * sr
+        if leadAnchorWall == 0 || excess < -0.05 * sr {
+            // The queue took less than the device could have played since the
+            // anchor (startup, underrun, or a reader stall). Re-anchor rather
+            // than bank that deficit as credit the next burst could spend — a
+            // stall must never license a fast-forward.
+            leadAnchorWall = now
+            leadAnchorTaken = takenOutputSamples
+        }
+        lastCallbackWall = now
         lock.unlock()
         // Route primer callbacks to advancePrimer() so _primerPendingSamples in
         // AudioClock stays accurate for calibrate() after a position reset.
@@ -536,6 +789,6 @@ private func audioQueueCallback(_ userData: UnsafeMutableRawPointer?,
                                  _ buffer: AudioQueueBufferRef) {
     guard let p = userData else { AudioQueueFreeBuffer(queue, buffer); return }
     let output = Unmanaged<AudioUnitOutput>.fromOpaque(p).takeUnretainedValue()
-    output._callbackConsumed(byteCount: Int(buffer.pointee.mAudioDataByteSize))
+    output._callbackConsumed(byteCount: Int(buffer.pointee.mAudioDataByteSize), queue: queue)
     AudioQueueFreeBuffer(queue, buffer)
 }

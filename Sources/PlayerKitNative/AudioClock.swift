@@ -1,9 +1,18 @@
 import Foundation
+import os
 
 /// Sample-count–based audio position clock. Thread-safe.
 /// The single source of truth for current audio playback position.
 final class AudioClock: @unchecked Sendable {
     private let lock = NSLock()
+    private let logger = Logger(subsystem: "io.zyno.PlayerKit", category: "clock")
+
+    // [diag] zyno#361: a 14 s audio-clock advance in 5 s of wall time cannot
+    // come from real-time consumption of a 1× queue — it must be a reset/
+    // calibration jump or a burst of oversized callbacks. Log those, gated by
+    // PLAYERKIT_DIAG, so a freeze-recovery log can distinguish a dropped-span
+    // jump from a clock re-anchor.
+    private static var diagEnabled: Bool { NativeBackend.diagLoggingEnabled }
     private var _consumedSamples: Int64 = 0
     private(set) var sampleRate: Int32 = 44100
 
@@ -116,12 +125,24 @@ final class AudioClock: @unchecked Sendable {
         guard bytesPerSample > 0, sampleRate > 0 else { return }
         let maxPerCall = Int64(Double(sampleRate) * maxAdvanceSeconds)
         let outputSamples = min(Int64(byteCount / bytesPerSample), maxPerCall)
+        let clampedRate = max(0.25, min(4.0, rate))
         lock.withLock {
             // [diag] callback granularity distribution (晃动 localization):
             // a healthy queue fires ~23ms AAC buffers steadily; batched /
             // stalled callbacks show up as a wide max/min or a large maxJump.
             advanceDiag.record(Double(outputSamples))
-            _consumedSamples += Int64(Double(outputSamples) * max(0.25, min(4.0, rate)))
+            _consumedSamples += Int64(Double(outputSamples) * clampedRate)
+        }
+        // [diag] zyno#361: a single callback consuming >100ms of content means
+        // either a batched/draining queue (catches up in bursts) or rate>1
+        // scaling — both can move the clock multiple seconds within one 5s
+        // diag window without any content actually being skipped.
+        if Self.diagEnabled {
+            let sr = Double(sampleRate)
+            let contentSeconds = Double(outputSamples) * clampedRate / sr
+            if contentSeconds > 0.1 {
+                logger.info("[diag] clock.advance burst out=\(String(format: "%.3f", Double(outputSamples) / sr), privacy: .public)s content=\(String(format: "%.3f", contentSeconds), privacy: .public)s rate=\(String(format: "%.2f", clampedRate), privacy: .public)")
+            }
         }
     }
 
@@ -171,11 +192,13 @@ final class AudioClock: @unchecked Sendable {
     /// queue is fully disposed and rebuilt from scratch with fresh primers.
     func reset(to time: Double, sampleRate: Int32) {
         let sr = sampleRate > 0 ? sampleRate : 44100
+        let old = audioTime
         lock.withLock {
             self.sampleRate = sr
             _consumedSamples = Int64(time * Double(sr))
             _primerPendingSamples = 0
         }
+        logJump("reset", old: old)
     }
 
     /// Calibration reset: atomically move the playback position to `time`
@@ -194,9 +217,21 @@ final class AudioClock: @unchecked Sendable {
     /// all pending primers complete, audioTime converges exactly to `time`.
     func calibrate(to time: Double, sampleRate: Int32) {
         let sr = sampleRate > 0 ? sampleRate : 44100
+        let old = audioTime
         lock.withLock {
             self.sampleRate = sr
             _consumedSamples = Int64(time * Double(sr)) - _primerPendingSamples
         }
+        logJump("calibrate", old: old)
+    }
+
+    /// [diag] zyno#361: log any reset/calibrate that moves the clock by more
+    /// than 100 ms. A freeze-recovery clock jump would land here; the observed
+    /// one did not, it came from the AudioQueue callbacks instead.
+    private func logJump(_ kind: String, old: Double) {
+        guard Self.diagEnabled else { return }
+        let new = audioTime
+        guard abs(new - old) > 0.1 else { return }
+        logger.info("[diag] clock.\(kind, privacy: .public) old=\(String(format: "%.3f", old), privacy: .public)s new=\(String(format: "%.3f", new), privacy: .public)s delta=\(String(format: "%+.3f", new - old), privacy: .public)s")
     }
 }

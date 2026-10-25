@@ -2643,6 +2643,12 @@ public final class NativeBackend: PlayerBackend {
             // All periodic [diag] lines are gated by diagLoggingEnabled (off
             // in production).
             if Self.diagLoggingEnabled {
+                // [diag] zyno#361: callback sum vs wall vs AudioQueue's own
+                // timebase. cbSec≈wall at 1×; cbSec>wall with qts≈wall means
+                // buffers completed without playing (drain); cbSec≈qts>wall
+                // means the device really consumed faster than real time.
+                let out = self.drainOutputQueueDiag()
+                logger.info("[diag] out[cb=\(out.callbackCount, privacy: .public) cbSec=\(String(format: "%.2f", out.callbackSeconds), privacy: .public) wall=\(String(format: "%.2f", out.callbackWallSeconds), privacy: .public) qts=\(String(format: "%.2f", out.queueTimeSeconds), privacy: .public) enq=\(out.enqueues, privacy: .public) enqSec=\(String(format: "%.2f", out.enqueuedSeconds), privacy: .public) starts=\(out.starts, privacy: .public) pauses=\(out.pauses, privacy: .public) resumes=\(out.resumes, privacy: .public) paused=\(out.pausedNow, privacy: .public) bufSec=\(String(format: "%.2f", Double(out.bufferedSamplesNow) / Double(max(1, out.sampleRateNow))), privacy: .public) lead=\(String(format: "%.3f", out.leadSeconds), privacy: .public) rate=\(String(format: "%.2f", out.playRateNow), privacy: .public)]")
                 logger.info("[diag] av[n=\(av.count, privacy: .public) mean=\(String(format:"%+.1f", av.mean*1000), privacy: .public)ms sd=\(String(format:"%.1f", av.stddev*1000), privacy: .public)ms min=\(String(format:"%+.1f", av.min*1000), privacy: .public)ms max=\(String(format:"%+.1f", av.max*1000), privacy: .public)ms jump=\(String(format:"%.1f", av.maxJump*1000), privacy: .public)ms flips=\(av.signFlips, privacy: .public)] aq[n=\(aq.count, privacy: .public) mean=\(String(format:"%.0f", aq.mean), privacy: .public) min=\(String(format:"%.0f", aq.min), privacy: .public) max=\(String(format:"%.0f", aq.max), privacy: .public) jump=\(String(format:"%.0f", aq.maxJump), privacy: .public)]")
                 // [diag] where ticks went: drain=skip-behind pops, stall=freeze-ahead
                 // ticks, deny=SyncController refusals, appends=decode supply.
