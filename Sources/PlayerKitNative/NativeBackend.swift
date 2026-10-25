@@ -643,25 +643,39 @@ public final class NativeBackend: PlayerBackend {
     nonisolated(unsafe) var altAudioCache = AltAudioPacketCache<UnsafeMutablePointer<AVPacket>>(
         bytesOf: { Int($0.pointee.size) },
         onEvict: { var p: UnsafeMutablePointer<AVPacket>? = $0; av_packet_free(&p) })
-    /// 正在被缓存的备选音频流下标(音轨数超门槛/多片段时为空 = 功能关闭)。
+    /// 正在被缓存的备选音频流下标(候选集,至多 maxAlternates 条;多片段时为空 = 功能关闭)。
     nonisolated(unsafe) var altAudioStreams: Set<Int32> = []
-    /// zyno#196: 当前音轨包克隆进缓存的总开关(与 AltAudioCachePolicy.shouldEnable
-    /// 同步)。单音轨/超上限轨数文件没有切轨缓存的意义,不为它们付克隆开销。
+    /// zyno#196: 当前音轨包克隆进缓存的总开关(音轨 ≥2 时为 true)。单音轨文件没有
+    /// 切轨缓存的意义,不为它们付克隆开销。
     nonisolated(unsafe) var altCacheEnabled = false
+    /// zyno#359: 用户手动切轨前所在的音轨,候选优先级排第一(#196「切走后立刻切回」
+    /// 命中依赖旧轨仍被缓存)。仅在 audioSwitchQueue 块内写、refreshAltAudioStreams 读;
+    /// stop() 清空,新条目不带上一部的切轨痕迹。
+    nonisolated(unsafe) var lastSwitchedFromAudioTrack: Int? = nil
 
-    /// 按当前选中音轨重算备选缓存流集合并通知解复用层;调用方须持 demuxLock
+    /// 按当前选中音轨重算备选缓存候选集合并通知解复用层;调用方须持 demuxLock
     /// (或在无解复用循环运行时调用,如 open)。
     private func refreshAltAudioStreams(_ demuxer: any PacketDemuxing) {
         let all = demuxer.audioStreamIndices
-        if AltAudioCachePolicy.shouldEnable(audioTrackCount: all.count) {
-            altAudioStreams = Set(all.filter { $0 != demuxer.audioStreamIndex })
-            altCacheEnabled = true
+        let enabled = all.count >= 2
+        if enabled {
+            // 只取 state.audioTracks 与 demuxer 流列表的交集:多片段盘(MultiClipDemuxer)
+            // 的 currentDemuxer 为 nil 时 audioStreamIndices 为空集,或与列表暂不一致,不崩。
+            let tracks = state.audioTracks.filter { all.contains(Int32($0.id)) }
+            altAudioStreams = Set(AltAudioCachePolicy.selectCandidates(
+                tracks: tracks,
+                current: Int(demuxer.audioStreamIndex),
+                preferredLanguage: preferredAudioLanguage,
+                lastSwitchedFrom: lastSwitchedFromAudioTrack))
+            // 候选集收缩时清掉被移出流的包;保留当前轨克隆(zyno#196 内容,不能清)。
+            altAudioCache.retain(streams: altAudioStreams.union([demuxer.audioStreamIndex]))
         } else {
             altAudioStreams = []
-            altCacheEnabled = false
+            altAudioCache.removeAll()
         }
+        altCacheEnabled = enabled
         demuxer.setCachedAudioStreams(altAudioStreams)
-        logger.notice("[diag] altaudio audioTracks=\(all.count, privacy: .public) enabled=\(!self.altAudioStreams.isEmpty, privacy: .public)")
+        logger.notice("[diag] altaudio audioTracks=\(all.count, privacy: .public) enabled=\(!self.altAudioStreams.isEmpty, privacy: .public) cached=\(self.altAudioStreams.sorted(), privacy: .public)")
     }
 
     /// Default init: ASBDLRenderer + AudioUnitOutput (PCM).
@@ -1328,10 +1342,6 @@ public final class NativeBackend: PlayerBackend {
             }
         }
 
-        // zyno#171: 备选音轨包缓存(音轨 2…4 条才启用)。
-        altAudioCache.removeAll()
-        refreshAltAudioStreams(demuxer)
-
         // Initialize graphic subtitle decoder for PGS/VOBSUB streams, and the
         // libass typeset renderer for ASS/SSA (zyno#158).
         subtitleDecoder = nil
@@ -1359,6 +1369,12 @@ public final class NativeBackend: PlayerBackend {
            demuxer.selectAudioStream(by: picked.id) {
             logger.info("audio: language pref '\(pref)' → stream \(picked.id) (\(picked.lang ?? "?"))")
         }
+
+        // zyno#171: 备选音轨包缓存。放在偏好语言选轨之后——选轨会改变当前轨,候选集
+        // (zyno#359)必须按最终当前轨计算,否则首个候选集就建立在旧轨上。此时 demux
+        // 循环尚未启动,期间没有包被读入。
+        altAudioCache.removeAll()
+        refreshAltAudioStreams(demuxer)
 
         if let as_ = demuxer.audioStream,
            let dec = FFmpegAudioDecoder(stream: as_, sampleRate: 44100, channels: 2) {
@@ -3297,6 +3313,7 @@ public final class NativeBackend: PlayerBackend {
         _injectedAudioOutput?.flush()
         demuxLock.lock()
         altAudioCache.removeAll(); altAudioStreams = []; altCacheEnabled = false   // zyno#171
+        lastSwitchedFromAudioTrack = nil   // zyno#359: 新条目不带上一部的切轨痕迹
         demuxer?.close(); demuxer = nil
         videoDecoder = nil; audioDecoder = nil
         // No seek can be pending on a stream that no longer exists; never leave the
@@ -3418,6 +3435,8 @@ public final class NativeBackend: PlayerBackend {
                     self?.notifyStateChange()
                 }
             }
+            // zyno#359: 此刻 demuxer 仍选旧轨,记下用户刚离开的轨,供候选优先级使用。
+            self.lastSwitchedFromAudioTrack = Int(demuxerRef.audioStreamIndex)
             if self.performAudioTrackSwitchFast(trackId: trackId, demuxer: demuxerRef) { return }
             self.performAudioTrackSwitch(id: id, trackId: trackId, demuxer: demuxerRef)
         }
