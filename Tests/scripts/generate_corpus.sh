@@ -74,6 +74,22 @@ python3 "$SCRIPT_DIR/patch_dvcc.py" "$CORPUS_DIR/c5_dv_p81.mp4"
 ffmpeg -v error -y -i "$CORPUS_DIR/c5_dv_p81.mp4" -map 0:v:0 -c:v copy \
   -bsf:v hevc_mp4toannexb -f mpegts "$CORPUS_DIR/c9_dv_ts.ts"
 
+# ---------- C10: DV P5 IPTPQc2(gen_p5_yuv.py 合成基础层 + dovi_tool RPU) ----------
+# P5 像素语义为 IPTPQc2(无常规 YCbCr):gen_p5_yuv.py 把 BT.2020 线性 RGB 测试图
+# 经 PQ OETF 编进 IPT 空间再落 i420。容器标记沿用 bt2020nc + PQ(P5 文件的通行
+# 封装方式;IPT 语义由 dvcC profile=5 声明触发系统路径)。x265 只加色彩标记,
+# RPU 由 dovi_tool generate/inject 注入(spike 验证过的路径;不用
+# --dolby-vision-profile,homebrew x265 对该选项支持不定)。
+python3 "$SCRIPT_DIR/gen_p5_yuv.py" "$TMP/p5.yuv"
+x265 --input "$TMP/p5.yuv" --input-res 256x144 --input-depth 10 --profile main10 \
+  --fps $FPS --colorprim bt2020 --transfer smpte2084 --colormatrix bt2020nc \
+  --repeat-headers --no-info -o "$TMP/p5.265" 2>/dev/null
+dovi_tool generate -j "$SCRIPT_DIR/l1_metadata_p5.json" -o "$TMP/RPU5.bin"
+dovi_tool inject-rpu -i "$TMP/p5.265" -r "$TMP/RPU5.bin" -o "$TMP/c10.265"
+ffmpeg -v error -y -i "$TMP/c10.265" -c copy "$CORPUS_DIR/c10_dv_p5_ipt.mp4"
+# P5 的 dvcC:profile=5 / compat=0(rpu=1,el=0,bl=1,md=limited 与 C5 同源)。
+python3 "$SCRIPT_DIR/patch_dvcc.py" --profile 5 --compat 0 "$CORPUS_DIR/c10_dv_p5_ipt.mp4"
+
 # ---------- 权威值测量 + 与期望核对 ----------
 # 期望段 = 矩阵表(spec §3.1)落地,strategy case 名与 RendererStrategy.swift 实际声明一致。
 cat > "$TMP/expected.json" <<'EOF'
@@ -111,17 +127,24 @@ cat > "$TMP/expected.json" <<'EOF'
       "ffprobe": { "codec": "hevc", "trc": "smpte2084", "primaries": "bt2020", "matrix": "bt2020nc",
         "dv_profile": 8, "dv_rpu_present": true, "dv_el_present": false,
         "dv_bl_signal_compatibility_id": 1, "hdr10plus": false },
-      "expected": { "strategyEDR": "doviProfile8(false)", "strategySDR": "degradedHDR10",
+      "expected": { "strategyEDR": "doviProfile8(true)", "strategySDR": "degradedHDR10",
         "isDoVi": true, "doviProfile": 8, "hasHDR10Plus": false, "blSignalCompatibilityId": 1 },
       "discDovi": null },
     { "file": "c9_dv_ts.ts", "cell": "DV_TS", "synthetic": true, "realCorpus": null,
       "ffprobe": { "codec": "hevc", "trc": "smpte2084", "primaries": "bt2020", "matrix": "bt2020nc",
         "dv_profile": 0, "dv_rpu_present": false, "dv_el_present": false,
         "dv_bl_signal_compatibility_id": 0, "hdr10plus": false },
-      "expected": { "strategyEDR": "doviProfile8(false)", "strategySDR": "degradedHDR10",
+      "expected": { "strategyEDR": "doviProfile8(true)", "strategySDR": "degradedHDR10",
         "isDoVi": true, "doviProfile": 8, "hasHDR10Plus": false, "blSignalCompatibilityId": 1 },
       "discDovi": { "profile": 8, "rpu": true, "el": false, "bl": true, "compatId": 1 },
       "note": "ffmpeg 8.x mpegts muxer 不写 DOVI registration descriptor(mpegts demuxer 可解析),故 ffprobe 段无 DOVI 字段是工具限制的实测记录;TS 内 RPU NAL 完整保留,DOVI 断言由 Task 4 的 reader 注入路径承担" },
+    { "file": "c10_dv_p5_ipt.mp4", "cell": "DV_P5_IPT", "synthetic": true, "realCorpus": null,
+      "ffprobe": { "codec": "hevc", "trc": "smpte2084", "primaries": "bt2020", "matrix": "bt2020nc",
+        "dv_profile": 5, "dv_rpu_present": true, "dv_el_present": false,
+        "dv_bl_signal_compatibility_id": 0, "hdr10plus": false },
+      "expected": { "strategyEDR": "doviProfile5", "strategySDR": "degradedHDR10",
+        "isDoVi": true, "doviProfile": 5, "hasHDR10Plus": false, "blSignalCompatibilityId": 0 },
+      "discDovi": null },
     { "file": "", "cell": "DV_P5", "synthetic": false,
       "realCorpus": { "subdir": "c6_dv_p5", "patterns": ["*.mkv", "*.mp4", "*.ts", "*.m2ts"] },
       "ffprobe": null,
@@ -175,7 +198,7 @@ extract() { # extract <file> → 权威 ffprobe 段(流级字段 + 帧级 HDR10+
   }'
 }
 fail=0
-for f in c1_sdr_bt709.mp4 c2_hdr10.mp4 c3_hdr10plus.mp4 c4_hlg.mp4 c5_dv_p81.mp4 c9_dv_ts.ts; do
+for f in c1_sdr_bt709.mp4 c2_hdr10.mp4 c3_hdr10plus.mp4 c4_hlg.mp4 c5_dv_p81.mp4 c9_dv_ts.ts c10_dv_p5_ipt.mp4; do
   cell=$(jq -r --arg f "$f" '.cells[] | select(.file==$f) | .cell' "$TMP/expected.json")
   m=$(extract "$CORPUS_DIR/$f")
   jq --arg c "$cell" --argjson m "$m" '.[$c] = $m' "$MEASURED" > "$MEASURED.new" && mv "$MEASURED.new" "$MEASURED"

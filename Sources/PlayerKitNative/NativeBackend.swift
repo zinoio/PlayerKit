@@ -107,6 +107,40 @@ public final class NativeBackend: PlayerBackend {
     /// Set by the app layer based on Pro subscription status.
     public var doviEnabled: Bool = true
 
+    // MARK: Native DV system path(design §5/§6)
+
+    /// How Dolby Vision reaches the screen: `.system`(默认,压缩码流交系统解码
+    /// + 系统显示管理)或 `.software`(自研软解 + tone map)。变更需重开播放链,
+    /// 由上层决定重开时机(design §6.1)。
+    public var dolbyVisionOutput: DolbyVisionOutputPreference = .system
+
+    /// 当前会话实际使用的视频管线。open/fallback 在主线程写,任意线程读。
+    public nonisolated(unsafe) private(set) var activeVideoPipeline: VideoPipeline = .decodedFrames
+
+    /// 系统路径会话内回退到软件路径时回调**一次**(design §6.2)。
+    public nonisolated(unsafe) var onSystemDVFallback: (() -> Void)?
+
+    // —— 系统路径会话状态(main 写,demux/显示线程读;nonisolated(unsafe) 惯例)——
+    private nonisolated(unsafe) var systemDVActive = false
+    /// 会话内已回退:回退只触发一次,不再重试系统路径(design §6.2)。stop() 清零。
+    private nonisolated(unsafe) var systemDVDisabledForSession = false
+    private nonisolated(unsafe) var systemDVRenderer: SystemDVRenderer?
+    private nonisolated(unsafe) var systemDVBuilder: SystemDVSampleBuilder?
+    /// demux 读到的首个系统路径样本 pts;timebase start 锚点(design §5.3)。
+    private nonisolated(unsafe) var systemDVFirstSamplePts: Double = .nan
+    private nonisolated(unsafe) var systemDVStarted = false
+    private nonisolated(unsafe) var systemDVStartWall: Double = 0
+    /// 系统路径首帧超时(秒,design §6.2 默认 3s);测试可缩短。
+    nonisolated(unsafe) var systemDVFirstFrameTimeout: Double = 3.0
+    /// 测试钩子:替换 SystemDVRenderer 的构造(注入假 renderer / 失败钩子)。
+    nonisolated(unsafe) var systemDVRendererFactory: ((AVSampleBufferDisplayLayer) -> SystemDVRenderer?)?
+    /// fallback 串行化(demux 线程 onFailure / 显示线程超时都可能触发)。
+    private let systemDVFallbackLock = NSLock()
+    /// 本会话时长(秒),_finishOpen 时快照;系统路径 EOF 上报的封顶用。
+    private nonisolated(unsafe) var systemDVPipelineDurationSecs: Double = 0
+    /// 有无音轨(_finishOpen 快照;demuxer 是主线程隔离的,tick 不能读)。
+    private nonisolated(unsafe) var systemDVHasAudio = false
+
     /// Preferred maximum video width (0 = unlimited). When >0, the demuxer
     /// picks the highest-resolution video stream not exceeding this width.
     /// Set by PlayerController based on the user's quality preference.
@@ -1050,6 +1084,9 @@ public final class NativeBackend: PlayerBackend {
             // it already reflects the true end-of-stream PTS, not the container placeholder.
             state.duration = Duration.seconds(demuxDur)
         }
+        // 系统路径 tick 在显示线程读,不碰 state(@MainActor);快照一份秒数。
+        systemDVPipelineDurationSecs = Double(self.state.duration.components.seconds)
+        systemDVHasAudio = demuxer.audioStreamIndex >= 0
         logger.info("duration: knownDuration=\(knownDuration.map{"\(Double($0.components.seconds))s"} ?? "nil") demuxer=\(String(format:"%.1f",demuxDur))s → using \(String(format:"%.1f",Double(self.state.duration.components.seconds)))s self=\(String(format:"%p", UInt(bitPattern: Unmanaged.passUnretained(self).toOpaque())))")
 
         // Extract HDR color metadata from the video stream's codec parameters
@@ -1088,11 +1125,21 @@ public final class NativeBackend: PlayerBackend {
             let attrs = demuxer.videoStreamAttributes()
                 ?? VideoStreamAttributes(width: 0, height: 0, codecID: 0,
                                          colorMatrix: .bt709, transfer: .sdr, range: .limited)
+            // Native DV 系统路径能力(design §5.4):仅 macOS 且 EDR 屏可用;
+            // 非 ASBDLRenderer 渲染器视为不可用(系统路径复用其 displayLayer,
+            // EDRRenderer/Metal 渲染器不可用);会话内已回退则不再尝试。
+            var systemDV = SystemDVCapability.unavailable
+            if dolbyVisionOutput == .system, !systemDVDisabledForSession,
+               _renderer is ASBDLRenderer {
+                systemDV = SystemDVCapability.probe(display: displayCapability)
+            }
             let strat = decideRendererStrategy(
                 stream: attrs,
                 prefersTenBit: _renderer.prefersTenBit,
                 display: displayCapability,
-                doviEnabled: doviEnabled
+                doviEnabled: doviEnabled,
+                systemDolbyVision: systemDV,
+                dolbyVisionOutput: dolbyVisionOutput
             )
             renderConfigLock.withLock { self.rendererStrategy = strat }
 
@@ -1100,7 +1147,10 @@ public final class NativeBackend: PlayerBackend {
             // Main thread, pre-decode-loop: assigning the result — including
             // nil — makes the provider the single decision point for the
             // ASBDL mapper on this stream.
-            if let provider = toneMapperProvider,
+            // 系统路径不产出像素(design §6.4):tone map 由系统显示管理取代,
+            // 该路径下不调用 provider(PlayerKitPro 零改动的保证)。
+            if strat.videoPipeline == .decodedFrames,
+               let provider = toneMapperProvider,
                let asbdl = _renderer as? ASBDLRenderer {
                 asbdl.toneMapper = provider(strat, attrs)
             }
@@ -1135,10 +1185,65 @@ public final class NativeBackend: PlayerBackend {
         // decoder can't disagree about which path a stream takes.
         if let vs = demuxer.videoStream {
             let sar = demuxer.sampleAspectRatio
-            let preference = rendererStrategy?.decoderPreference ?? .vtHW
             let isDoVi = demuxer.isDolbyVision
-            let tVDec = Date()
-            switch preference {
+
+            // Native DV 系统路径分叉(design §5.1):不创建 videoDecoder,
+            // 构造「packet → CMSampleBuffer → 层」的压缩直通链;失败则当场
+            // 以软件策略重算并落入原解码器分支。
+            if rendererStrategy?.videoPipeline == .compressedPassthrough {
+                // doviConfiguration 在 FFmpegDemuxer 上(MultiClip/其他实现 v1
+                // 不走系统路径,open 阶段即回软件——保守正确)。
+                if let fd = demuxer as? FFmpegDemuxer,
+                   let dovi = fd.doviConfiguration,
+                   let builder = SystemDVSampleBuilder(stream: vs, dovi: dovi),
+                   let asbdl = _renderer as? ASBDLRenderer {
+                    let renderer = systemDVRendererFactory?(asbdl.displayLayer)
+                        ?? SystemDVRenderer(displayLayer: asbdl.displayLayer)
+                    renderer.onFailure = { [weak self] err in
+                        self?.fallbackToSoftwareDV(
+                            reason: "renderer failure: \(err.map { String(describing: $0) } ?? "layer failed")")
+                    }
+                    systemDVRenderer = renderer
+                    systemDVBuilder = builder
+                    systemDVActive = true
+                    systemDVStarted = false
+                    systemDVFirstSamplePts = .nan
+                    systemDVStartWall = 0
+                    activeVideoPipeline = .compressedPassthrough
+                    let cpW = Int(vs.pointee.codecpar.pointee.width)
+                    let cpH = Int(vs.pointee.codecpar.pointee.height)
+                    codedVideoWidth = cpW; codedVideoHeight = cpH
+                    videoWidth  = sar > 1.0 ? Int(Double(cpW) * sar) : cpW
+                    videoHeight = sar < 1.0 ? Int(Double(cpH) / sar) : cpH
+                    logger.info("[dovi-sys] system path active: profile=\(demuxer.doviProfile) strategy=\(String(describing: self.rendererStrategy), privacy: .public)")
+                } else {
+                    logger.info("[dovi-sys] 样本构造器初始化失败,open 阶段即回软件路径")
+                    systemDVActive = false
+                    activeVideoPipeline = .decodedFrames
+                    let softAttrs = demuxer.videoStreamAttributes()
+                        ?? VideoStreamAttributes(width: 0, height: 0, codecID: 0,
+                                                 colorMatrix: .bt709, transfer: .sdr, range: .limited)
+                    let softwareStrat = decideRendererStrategy(
+                        stream: softAttrs,
+                        prefersTenBit: _renderer.prefersTenBit,
+                        display: displayCapability,
+                        doviEnabled: doviEnabled,
+                        systemDolbyVision: .unavailable,
+                        dolbyVisionOutput: dolbyVisionOutput
+                    )
+                    renderConfigLock.withLock { self.rendererStrategy = softwareStrat }
+                }
+            } else {
+                systemDVActive = false
+                systemDVRenderer = nil
+                systemDVBuilder = nil
+                activeVideoPipeline = .decodedFrames
+            }
+
+            if !systemDVActive {
+                let preference = rendererStrategy?.decoderPreference ?? .vtHW
+                let tVDec = Date()
+                switch preference {
             case .ffmpegSW:
                 if let dec = FFmpegVideoDecoder(stream: vs, forceSoftware: true, colorParams: colorParams) {
                     videoDecoder = dec
@@ -1188,7 +1293,8 @@ public final class NativeBackend: PlayerBackend {
                     logger.info("video: VT failed, FFmpeg fallback \(dec.width)x\(dec.height)\(sarStr) hw=\(dec.isHardware)")
                 }
             }
-            logger.info("video decoder init took \(String(format: "%.0f", Date().timeIntervalSince(tVDec) * 1000))ms")
+                logger.info("video decoder init took \(String(format: "%.0f", Date().timeIntervalSince(tVDec) * 1000))ms")
+            } // if !systemDVActive
         }
 
         // Populate state.videoInfo
@@ -1427,6 +1533,14 @@ public final class NativeBackend: PlayerBackend {
         state.isPlaying = true
         notifyStateChange()
         let t1 = Date()
+        // Native DV 系统路径:jitter buffer 永远不会被填(没有解码帧),
+        // `.buffering → .playing` 的音频放行门不会打开 —— 直接放行音频输出,
+        // 音频主时钟照常起步;画面由层 timebase 校准跟上(design §5.3)。
+        if systemDVActive {
+            audioUnitOutput?.resume()
+            _injectedAudioOutput?.resume()
+            state.isBuffering = false
+        }
         logger.info("_finishOpen done in \(String(format: "%.0f", t1.timeIntervalSince(t0) * 1000))ms")
     }
 
@@ -1729,6 +1843,35 @@ public final class NativeBackend: PlayerBackend {
                         self.videoDecoder = sw
                     }
 
+                    // Native DV 系统路径(design §5.1):跳过解码与 jitter buffer,
+                    // 压缩包经 SystemDVSampleBuilder 直入显示层;音频仍是主时钟。
+                    // fine-seek 预滚帧(落点之前)标 DoNotDisplay(design §5.2,
+                    // 对接 FineSeekPolicy;音频侧的 discard 照旧)。
+                    if systemDVActive, let builder = systemDVBuilder, let renderer = systemDVRenderer {
+                        let doNotDisplay = discardLock.withLock { self.discardVideoUntilPts }
+                            .map { pts < $0 } ?? false
+                        if let sb = builder.makeSample(packet: packet, pts: pts,
+                                                       doNotDisplay: doNotDisplay) {
+                            // 首样本:就地启动 timebase(不依赖显示 tick——层消费
+                            // 快于 tick 时 pending/buffered 归零,竞态会让 start
+                            // 永远不触发)。start 内部 queue.sync,demux 线程安全。
+                            if systemDVFirstSamplePts.isNaN {
+                                systemDVFirstSamplePts = pts
+                                systemDVStarted = true
+                                systemDVStartWall = CACurrentMediaTime()
+                                let r = displayLoopLock.withLock { self.displayRate }
+                                renderer.start(at: pts, rate: Float(r))
+                                logger.info("[dovi-sys] timebase start at \(String(format: "%.3f", pts), privacy: .public)s")
+                            }
+                            renderer.enqueue(sb)
+                        }
+                        dLock.unlock()
+                        // 背压:层前瞻上限(Task 5 接口契约)。下方共享的音频参照
+                        // throttle 对该路径同样生效(jitter 恒空 → readAhead=0)。
+                        if renderer.bufferedSeconds >= renderer.maxLookaheadSeconds {
+                            Thread.sleep(forTimeInterval: 0.020)
+                        }
+                    } else {
                     // Always decode — VTVideoDecoder needs every packet for its RPS.
                     let decoded = self.videoDecoder?.decode(packet: packet)
                     dLock.unlock()
@@ -1784,6 +1927,7 @@ public final class NativeBackend: PlayerBackend {
                             if d > self.state.duration { self.state.duration = d }
                         }
                     }
+                    } // else 软解分支(与系统路径分叉配对)
                     // Throttle: keep video demux within 2s of the audio clock.
                     // HW decode runs ~4× real-time; without throttling the demux
                     // would advance 30+ seconds ahead of audio and the jitter
@@ -2361,6 +2505,16 @@ public final class NativeBackend: PlayerBackend {
         ticksSinceLastLog += 1
         displayLoopLock.unlock()
 
+        // Native DV 系统路径:压缩直通 tick 取代整套软解机制——不经
+        // syncController / jitterBuffer / discard 弹帧(design §5.3);
+        // 音频仍是主时钟,层 timebase 周期向它校准。位置/EOF/首帧超时
+        // 判定由 systemDVTick 接管(上游依赖 displayNextFrame 弹帧的
+        // 位置上报在此路径由音频时钟提供,口径一致)。
+        if systemDVActive {
+            systemDVTick()
+            return
+        }
+
         // Calibrate audioClock to the actual first decoded frame PTS after seek.
         // seek() resets audioClock to the target position, but FFmpeg seeks to the
         // nearest prior I-frame, so the first decodable frame's PTS < seek target.
@@ -2442,21 +2596,7 @@ public final class NativeBackend: PlayerBackend {
         // decode speed: MKV/DTS sources played at ~2-3x (2026-09 bug report).
         // On iOS/tvOS passthrough is disabled (PCM decode), so audioClock is
         // driven by AudioUnitOutput even when PassthroughOutput is injected.
-        let audioTime: Double
-        if _injectedAudioOutput != nil && isPassthroughActive,
-           let pt = _injectedAudioOutput?.playbackTime, pt.isFinite, pt >= 0 {
-            // zyno#127: the renderer's timebase is anchored to packet PTS (=
-            // what is audible), so the WHOLE signed delay lives in the master
-            // clock: sync holds the picture d ahead of the sound for d>0
-            // (audible lag) and |d| behind for d<0 (sound leads) — symmetric,
-            // and identical to the PCM path's negative half. No PRO-side
-            // change: PassthroughOutput's playbackTime stays a pure timebase
-            // read, so the offset survives output/track rebuilds for free
-            // (it lives in audioClock, which outlives them).
-            audioTime = pt + audioClock.fullDelay
-        } else {
-            audioTime = audioClock.audioTime
-        }
+        let audioTime = currentMasterAudioTime()
         let serial = seekLock.withLock { seekSerial }
         let playbackRate = displayLoopLock.withLock { displayRate }
 
@@ -2752,6 +2892,165 @@ public final class NativeBackend: PlayerBackend {
         logSync(now: now, pts: popped.pts, audioTime: audioTime)
     }
 
+    // MARK: - Native DV 系统路径 tick 与回退(design §5.3 / §6.2)
+
+    /// 测试专用:系统路径渲染器 timebase 当前时间(nil = 未启动/未激活)。
+    nonisolated func systemDVRendererTimeForTesting() -> Double? {
+        systemDVRenderer?.currentTime
+    }
+
+    /// 测试专用:系统路径下层 timebase 与音频主时钟的当前差(秒)。
+    nonisolated func systemDVClockGapForTesting() -> Double {
+        guard let renderer = systemDVRenderer, let t = renderer.currentTime else { return .nan }
+        return t - currentMasterAudioTime()
+    }
+
+    /// 主时钟(音频)对外时间。passthrough 时 = 注入后端播放时间 + 全符号延迟
+    /// (zyno#127);PCM = audioClock.audioTime。软件/系统两条路径共用同一口径:
+    /// 这里**不做**任何输出延迟加减(#357 保持单一约定,修复后两路一起受益)。
+    private nonisolated func currentMasterAudioTime() -> Double {
+        if _injectedAudioOutput != nil && isPassthroughActive,
+           let pt = _injectedAudioOutput?.playbackTime, pt.isFinite, pt >= 0 {
+            return pt + audioClock.fullDelay
+        }
+        return audioClock.audioTime
+    }
+
+    /// 系统路径的显示 tick:
+    /// 1. 首个样本入层后以首帧 pts 启动 timebase(design §5.3);
+    /// 2. 每 tick 向音频主时钟校准(层内自带 0.08s 漂移阈值);
+    /// 3. 位置上报:500ms 节流口径与软解路径一致;无音轨时渲染器 timebase
+    ///    是唯一时钟(音频缺席的 DV 文件真实存在),EOF 且缓冲耗尽后封顶到时长;
+    /// 4. EOF = demux 读尽 && renderer 无缓冲 && 音频播完(无音轨看呈现);
+    /// 5. 首帧超时(默认 3s)未呈现 → 回退,绝不永远黑屏(design §6.2)。
+    private nonisolated func systemDVTick() {
+        guard let renderer = systemDVRenderer else { return }
+        let audioTime = currentMasterAudioTime()
+
+        // 1. 启动 timebase
+        if !systemDVStarted, !self.systemDVFirstSamplePts.isNaN,
+           renderer.pendingSampleCount > 0 || renderer.bufferedSeconds > 0 {
+            systemDVStarted = true
+            systemDVStartWall = CACurrentMediaTime()
+            let rate = displayLoopLock.withLock { displayRate }
+            renderer.start(at: self.systemDVFirstSamplePts, rate: Float(rate))
+            logger.info("[dovi-sys] timebase start at \(String(format: "%.3f", self.systemDVFirstSamplePts), privacy: .public)s")
+        }
+
+        // 2. 首帧校准(resume/seek 后 audioClock 被 reset):软解路径是
+        //    "audioClock 校准到首个解码帧 pts";系统路径无解码帧,反向用层
+        //    呈现点重锚音频时钟。语义与 ClockCalibrationPolicy 一致(maxGap
+        //    兜底,zyno#358 不前跳)。
+        let (needsCal, forceCal) = displayLoopLock.withLock { (needsClockCalibration, forceClockCalibration) }
+        if needsCal, systemDVStarted, let presented = renderer.currentTime {
+            let audioAnchored = discardLock.withLock { audioAnchoredAtTarget }
+            if ClockCalibrationPolicy.shouldCalibrate(firstFramePts: presented,
+                                                      audioTime: audioTime,
+                                                      force: forceCal,
+                                                      audioAnchoredAtTarget: audioAnchored,
+                                                      maxGap: maxCalibrationGap) {
+                audioClock.calibrate(to: presented,
+                                     sampleRate: audioDecoder?.outputSampleRate ?? 44100)
+                logger.info("[dovi-sys] audio clock calibrated to \(String(format: "%.3f", presented), privacy: .public)s")
+            }
+            displayLoopLock.withLock {
+                needsClockCalibration = false
+                forceClockCalibration = false
+            }
+        }
+
+        // 3. 周期校准:层 timebase 向音频主时钟对齐(读 AudioClock 对外时间,
+        //    不加不减,#357)
+        if systemDVStarted {
+            renderer.calibrate(toAudioTime: audioTime)
+        }
+
+        // 3+4. 位置上报 + EOF 封顶
+        let hasAudio = systemDVHasAudio
+        let demuxEOF = jitterBuffer.atEOF
+        let drained = renderer.pendingSampleCount == 0 && renderer.bufferedSeconds <= 0.001
+        var pos = hasAudio ? max(0, audioTime) : max(0, renderer.currentTime ?? 0)
+        // 无音轨且已呈现到尾:封顶到时长(否则 rate-1 timebase 会越过终点)。
+        if !hasAudio && demuxEOF && drained {
+            pos = min(pos, systemDVPipelineDurationSecs)
+        }
+        let posDur = Duration.milliseconds(Int64(pos * 1000))
+        let due = displayLoopLock.withLock { (posDur - lastNotifiedPos) >= .milliseconds(500) }
+        if due {
+            displayLoopLock.withLock { lastNotifiedPos = posDur }
+            applyDisplayUpdate(DisplayUIUpdate(position: posDur,
+                                               durationAtLeast: Duration.milliseconds(
+                                                   Int64(systemDVPipelineDurationSecs * 1000)),
+                                               generation: playGeneration, notify: true))
+        }
+
+        // 5. 首帧超时回退(测试可缩短超时)
+        if systemDVStarted, !renderer.hasPresentedFirstFrame,
+           CACurrentMediaTime() - systemDVStartWall > systemDVFirstFrameTimeout {
+            fallbackToSoftwareDV(reason: "first frame timeout")
+        }
+    }
+
+    /// 系统路径回退入口(design §6.2):**只触发一次**。完整释放系统会话
+    /// (SystemDVRenderer.stop 四件套,-12910 纪律)→ 以软件策略重算 →
+    /// 重建软件解码链 → seek 回当前位置(不回 0)。onFailure(渲染线程)与
+    /// 首帧超时(显示线程)都会进来,systemDVFallbackLock 串行化。
+    private nonisolated func fallbackToSoftwareDV(reason: String) {
+        let didFall = systemDVFallbackLock.withLock { () -> Bool in
+            guard !systemDVDisabledForSession, systemDVActive else { return false }
+            systemDVDisabledForSession = true
+            return true
+        }
+        guard didFall else { return }
+        logger.error("[dovi-sys] fallback to software: \(reason, privacy: .public)")
+        systemDVRenderer?.stop()
+        systemDVRenderer = nil
+        systemDVBuilder = nil
+        systemDVActive = false
+        systemDVStarted = false
+        activeVideoPipeline = .decodedFrames
+        let pos = max(0, currentMasterAudioTime())
+        onSystemDVFallback?()
+        Task { @MainActor [weak self] in
+            self?.rebuildSoftwareDVChain(currentPosition: pos)
+        }
+    }
+
+    /// 回退后的软件链重建(主线程):重算策略(软件路径,系统能力视为不可用)
+    /// → 注入 tone mapper(此时恢复)→ 重建 FFmpeg 软解码器 → seek 回当前位置。
+    private func rebuildSoftwareDVChain(currentPosition: Double) {
+        guard let demuxer, systemDVDisabledForSession else { return }
+        let attrs = demuxer.videoStreamAttributes()
+            ?? VideoStreamAttributes(width: 0, height: 0, codecID: 0,
+                                     colorMatrix: .bt709, transfer: .sdr, range: .limited)
+        let strat = decideRendererStrategy(
+            stream: attrs,
+            prefersTenBit: _renderer.prefersTenBit,
+            display: displayCapability,
+            doviEnabled: doviEnabled,
+            systemDolbyVision: .unavailable,
+            dolbyVisionOutput: dolbyVisionOutput
+        )
+        renderConfigLock.withLock { self.rendererStrategy = strat }
+        if let provider = toneMapperProvider, let asbdl = _renderer as? ASBDLRenderer {
+            asbdl.toneMapper = provider(strat, attrs)
+        }
+        if let vs = demuxer.videoStream,
+           let dec = FFmpegVideoDecoder(stream: vs, forceSoftware: true, colorParams: colorParams) {
+            videoDecoder = dec
+            codedVideoWidth = dec.width; codedVideoHeight = dec.height
+            let sar = demuxer.sampleAspectRatio
+            videoWidth  = sar > 1.0 ? Int(Double(dec.width) * sar) : dec.width
+            videoHeight = sar < 1.0 ? Int(Double(dec.height) / sar) : dec.height
+            logger.info("[dovi-sys] software chain rebuilt: \(dec.width)x\(dec.height) strategy=\(String(describing: strat), privacy: .public)")
+        } else {
+            logger.error("[dovi-sys] software decoder rebuild FAILED")
+        }
+        // seek 回当前位置(物理 seek 同步走,本地文件场景可接受):重锚音频
+        // 时钟 + 清 jitter,播放从当前位置继续,不回 0。
+        _seek(to: .seconds(max(0, currentPosition - 0.05)), synchronousDemuxerSeek: true)
+    }
+
     private nonisolated func logSync(now: Double, pts: Double, audioTime: Double) {
         let gen = playGeneration
         let (elapsed, fpsSamples): (Double, Int) = displayLoopLock.withLock {
@@ -2940,6 +3239,8 @@ public final class NativeBackend: PlayerBackend {
         displayLinkProxy = nil
         #endif
         audioUnitOutput?.pause()
+        // 系统路径:层 timebase 同步冻结(音频时钟停了,画面必须一起停)。
+        systemDVRenderer?.setRate(0)
         // Stop the demux loop so jitterBuffer doesn't fill up while audio is
         // paused. Without this, the demux loop keeps reading packets and
         // appending frames (video throttle skips sleep when audioClock is
@@ -3043,6 +3344,14 @@ public final class NativeBackend: PlayerBackend {
         }
         startDemuxLoop()
         startDisplayLink()
+        // 系统路径:恢复层 timebase 并让 calibrate 拉回音频主时钟;
+        // jitter 放行门在该路径不存在(rebuild 路径 flush 后音频会停),直接放行。
+        if systemDVActive {
+            systemDVRenderer?.setRate(Float(state.rate))
+            audioUnitOutput?.resume()
+            _injectedAudioOutput?.resume()
+            state.isBuffering = false
+        }
         // Calibrate audioClock to the first post-resume frame (like post-seek).
         // PiP 连续场景时钟从未停,无需校准。
         if !resumingContinuous {
@@ -3101,6 +3410,11 @@ public final class NativeBackend: PlayerBackend {
         // Clear the displayed frame so the pre-seek frame doesn't linger on
         // screen until the first post-seek frame is decoded and rendered.
         _renderer.flush()
+        // 系统路径:同步释放层内会话内容(design §6.5 的 seek 形态——不重建
+        // 渲染器,flush + 重设 timebase 即可;-12910 冲突只在新建会话时发生)。
+        if systemDVActive {
+            systemDVRenderer?.flush(at: secs)
+        }
 
         let sr = audioDecoder?.outputSampleRate ?? 44100
         let ch = audioDecoder?.outputChannels ?? 2
@@ -3118,6 +3432,11 @@ public final class NativeBackend: PlayerBackend {
         audioUnitOutput?.start(sampleRate: sr, channels: ch)
         // Pause until jitterBuffer has enough video — same as initial play().
         audioUnitOutput?.pause()
+        // 系统路径:该放行门不存在(无解码帧),直接恢复音频主时钟。
+        if systemDVActive {
+            audioUnitOutput?.resume()
+            _injectedAudioOutput?.resume()
+        }
         // Reset download tracking for the new seek position
         maxDownloadedPts = secs
         // Signal displayNextFrame to calibrate audioClock to actual I-frame PTS.
@@ -3276,6 +3595,12 @@ public final class NativeBackend: PlayerBackend {
         backend?.physicalSeekGeneration = gen
         // Open the gate: from the next demux iteration on, frames are from the target.
         backend?.seekLandedSerial = expectedSerial
+        // 系统路径:seek 后同样绕过 jitter 放行门(物理 seek 的 stop→start→pause
+        // 会把音频压住,而该路径没有帧可把 jitter 顶回 .playing)。
+        if backend?.systemDVActive == true {
+            backend?.audioUnitOutput?.resume()
+            backend?._injectedAudioOutput?.resume()
+        }
         logger.info("seek to \(String(format:"%.1f",secs))s landed physically, physicalSeekGeneration=\(gen)")
     }
 
@@ -3291,6 +3616,14 @@ public final class NativeBackend: PlayerBackend {
         fallbackRenderTimer = nil
         #endif
         demuxCancelled = true
+        // 系统路径完整释放(-12910 纪律,design §6.5);新会话允许系统路径。
+        systemDVRenderer?.stop()
+        systemDVRenderer = nil
+        systemDVBuilder = nil
+        systemDVActive = false
+        systemDVStarted = false
+        systemDVDisabledForSession = false
+        activeVideoPipeline = .decodedFrames
         audioUnitOutput?.stop()
         // Passthrough: drop audio scheduled for the previous session so the
         // next play() re-anchors its clock to the new stream (playbackTime).
@@ -3363,6 +3696,8 @@ public final class NativeBackend: PlayerBackend {
         //   - the display loop's guard window and sync normalization
         audioTempo.setRate(clamped)
         audioUnitOutput?.setPlaybackRate(clamped)
+        // 系统路径:层 timebase 同步变 rate。
+        systemDVRenderer?.setRate(Float(clamped))
         notifyStateChange()
     }
     /// zyno#171: 切轨的重负载段(flush/seek/管线重建)调度到专用串行队列,
