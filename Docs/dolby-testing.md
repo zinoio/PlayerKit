@@ -9,7 +9,7 @@
 |---|---|---|---|
 | P5/P7/P8 检测分型路由 | ✅ | `RendererStrategy.swift` | DOVI_CONF 判 profile,绑定 decoder/renderer/tone-map |
 | P5 IPT 转换 | ✅ | ToneMapProcessor (PlayerKitPro) | IPT→BT.2020,修复绿紫偏;GPU e2e 像素级验证 |
-| L1 逐帧动态 tone map | ✅ | `DolbyVisionFrameMetadata.Level1` | 仅 mac EDR 路径可达;iOS/tvOS 走系统 |
+| L1 逐帧动态 tone map | ✅ | `DolbyVisionFrameMetadata.Level1` | 代码无平台分支:iOS/tvOS 与 macOS 走同一条软件路径(仅 EDR 屏可达);iOS/tvOS 真机未验证 |
 | L2/L8 trim + L3 offset 精修 | ✅ | `parseDoviTrim`/`parseDoviLevel3` + 两 shader | libdovi 2048 中点约定;中性 trim 像素级 no-op |
 | L6 (maxCLL/maxFALL) | ✅ | `EDRRenderer.swift` | 静态亮度目标 |
 | HDR10+ bezier (ST 2094-40) | ✅ | `parseHDR10Plus` + EETF shader | 真 Bernstein 多锚点,逐帧 |
@@ -56,14 +56,16 @@ issue #13 起与 mpv/libplacebo 同源同语义(同款 ffmpeg metadata 数据源
 
 **背景**:P5 用 IPTPQc2(IPT) 色彩空间,若被当普通 BT.2020 PQ 读,
 画面整体**绿紫偏**(肤色发绿、高光发紫)——这是"播放器不支持 P5"的
-标志性症状,QuickTime 和多数播放器都有。
+标志性症状。没有 DV 标签、或不认 DV 的播放器都会出现。
 
 1. mac 上用本播放器播 P5 片
 2. 看肤色、白色墙面、灰色场景
 
 预期:颜色正常,无绿紫。
-对照:同一文件用系统 QuickTime 或 Infuse 的非 DV 路径播,若绿紫即反证
-片源确实是 P5 且我们修对了。
+对照:同一文件用 QuickTime / AVPlayer 播——**文件须是 MP4/MOV 且带正确 DV
+标签**(`dvh1` + `dvcC`),此时系统应走 DV、颜色正常;**去掉 DV 标签**后
+应偏紫/偏绿,可反证片源确实是 P5。QuickTime 不支持 MKV/M2TS,这类文件
+不能用它对照。
 
 ### 第 3 层:动态 tone map(需要 EDR 屏,XDR MacBook / 外接 HDR 显示器)
 
@@ -96,14 +98,16 @@ xcodebuild test -scheme PlayerKitPro -destination 'platform=macOS' \
 
 ### tvOS / Apple TV 场景
 
-ATV 4K + DV 电视:tvOS 走**系统直出**(Apple 是 Dolby 授权方,RPU 由系统
-处理,HDMI 输出 DV)——这条路径三家播放器打平,我们只需验证第 1 层徽章
-正确 + 播放正常,画质是系统责任。
+现状:`decideRendererStrategy` 没有任何平台分支,DV 在 tvOS 上与 macOS 一样
+走 FFmpeg 软解 + 自研 tone map,**不是**系统直出,电视也不会进入 DV 模式。
+Infuse 等的 DV 能力来自系统解码管线;我们是否在 tvOS 上改走系统路径,取决于
+真机 spike(见 zinoio/zinora#390)。当前验证第 1 层徽章 + 播放正常即可,
+画质结论不要套用“系统责任”。
 
 ## 已知边界(验证时别误判)
 
-- L1/L2/L3 仅 **mac EDR 路径**可达;iOS/tvOS 播 DV 是系统直出,不是我们的
-  tone map 在起作用
+- L1/L2/L3 仅在 **EDR 屏**上生效(macOS / iOS / tvOS 同一软件路径,代码无
+  平台分支;iOS/tvOS 真机未验证)。DV 不会触发电视/系统进入 DV 模式
 - 非 EDR mac 屏(如普通 LCD MacBook)走 `ciEDRFallback` 伪 PQ 路径,P5
   降级为 HDR10 静态——绿紫偏已修但无动态元数据
 - Pro gating 挡**渲染本体**:免费用户播 DV 片先给 2 分钟全功能试用
