@@ -9,7 +9,7 @@
 |---|---|---|---|
 | P5/P7/P8 检测分型路由 | ✅ | `RendererStrategy.swift` | DOVI_CONF 判 profile,绑定 decoder/renderer/tone-map |
 | P5 IPT 转换 | ✅ | ToneMapProcessor (PlayerKitPro) | IPT→BT.2020,修复绿紫偏;GPU e2e 像素级验证 |
-| L1 逐帧动态 tone map | ✅ | `DolbyVisionFrameMetadata.Level1` | 代码无平台分支:iOS/tvOS 与 macOS 走同一条软件路径(仅 EDR 屏可达);iOS/tvOS 真机未验证 |
+| L1 逐帧动态 tone map | ✅ | `DolbyVisionFrameMetadata.Level1` | 软件路径能力,仅 EDR 屏可达;macOS 的 DV 片默认走系统路径(见第 6 层),iOS/tvOS 走软件路径且真机未验证 |
 | L2/L8 trim + L3 offset 精修 | ✅ | `parseDoviTrim`/`parseDoviLevel3` + 两 shader | libdovi 2048 中点约定;中性 trim 像素级 no-op |
 | L6 (maxCLL/maxFALL) | ✅ | `EDRRenderer.swift` | 静态亮度目标 |
 | HDR10+ bezier (ST 2094-40) | ✅ | `parseHDR10Plus` + EETF shader | 真 Bernstein 多锚点,逐帧 |
@@ -96,18 +96,52 @@ xcodebuild test -scheme PlayerKitPro -destination 'platform=macOS' \
   -only-testing:PlayerKitProTests/HDR10PlusShaderTests
 ```
 
+### 第 6 层:系统 DV 层(macOS,XDR/EDR 屏,5 分钟)
+
+**验什么**:原生杜比视界系统路径(P5/P8.1 默认走系统解码 + 系统显示管理)。
+
+1. mac(EDR 屏)上播合成 P5 语料 `Tests/PlayerKitTests/Fixtures/corpus/c10_dv_p5_ipt.mp4`
+   (IPTPQc2 编码,基础层未经 DV 校正时呈**偏紫/偏绿**)
+2. 看上半的 8 色条与中带灰阶:
+   - **纯灰、颜色正常 = 系统 DV 生效**(系统按 RPU 完成 IPT 校正)
+   - 偏绿/偏紫 = 系统路径未生效(回退到了软件路径,或 DV 声明丢失)
+3. 对照实验:
+   - 播放器抽屉「画面」DV 开关关掉 → 走软件路径(同样应颜色正常,
+     这是自研 IPT→BT.2020 修复在起作用,画质可与系统路径肉眼对比)
+   - 同文件用 QuickTime 播 → 系统基准
+4. 日志核对:开播时应有 `[dovi-sys] system path active: profile=5`;
+   回退时必有 `[dovi-sys] fallback to software:` 一行(只触发一次)
+
+**bl_signal_compatibility_id 语义(2026-10-28 核实,Chromium 常量 +
+c5 ffprobe 金标准;ffmpeg dovi_meta.h 不含值说明)**:
+
+| 值 | 含义 | Chromium 是否视为向后兼容 |
+|---|---|---|
+| 0 | 无/不合规 | 否 |
+| 1 | HDR10 兼容基础层(P8.1) | 是 |
+| 2 | SDR 兼容基础层(P8.2) | 是 |
+| 4 | HLG 兼容基础层(P8.4) | 是 |
+| 6 | UHD Blu-ray(P7) | 否 |
+
+旧注释「1 = DV-Mel, 2 = DV-CT」有误已更正;`doviProfile8(tonemapCompat:)`
+现为 `compat == 1`(HDR10 基础层)时为真。v1 系统路径只放行 P8.1
+(`SystemDVPolicy.eligibleP8CompatIds = [1]`),8.4 待样本(design V7)。
+
 ### tvOS / Apple TV 场景
 
-现状:`decideRendererStrategy` 没有任何平台分支,DV 在 tvOS 上与 macOS 一样
-走 FFmpeg 软解 + 自研 tone map,**不是**系统直出,电视也不会进入 DV 模式。
-Infuse 等的 DV 能力来自系统解码管线;我们是否在 tvOS 上改走系统路径,取决于
-真机 spike(见 zinoio/zinora#390)。当前验证第 1 层徽章 + 播放正常即可,
-画质结论不要套用“系统责任”。
+现状:`decideRendererStrategy` 对 tvOS/iOS 没有任何平台分支,DV 在 tvOS 上
+走 FFmpeg 软解 + 自研 tone map,**不是**系统直出,电视也不会进入 DV 模式
+(macOS 的 DV 片自系统路径 v1 起默认走系统解码 + 系统显示管理,见第 6 层)。
+Infuse 等的 DV 能力来自系统解码管线;tvOS/iOS 是否开启系统路径,取决于各自
+真机 spike(设计 §8 阶段 3:合成 P5 灰条判据 + 带/不带 DV 声明对照 +
+P8.1 逐个单独播放确认,见 zinoio/zinora#390)。当前验证第 1 层徽章 + 播放
+正常即可,画质结论不要套用“系统责任”。
 
 ## 已知边界(验证时别误判)
 
-- L1/L2/L3 仅在 **EDR 屏**上生效(macOS / iOS / tvOS 同一软件路径,代码无
-  平台分支;iOS/tvOS 真机未验证)。DV 不会触发电视/系统进入 DV 模式
+- L1/L2/L3 仅在 **EDR 屏**的软件路径上生效(tvOS/iOS 与 macOS 软件路径同一
+  实现,代码无平台分支;iOS/tvOS 真机未验证)。macOS 的 DV 片默认走系统路径,
+  tone map 由系统显示管理完成,自研 L1/L2/L3 只作用于软件路径
 - 非 EDR mac 屏(如普通 LCD MacBook)走 `ciEDRFallback` 伪 PQ 路径,P5
   降级为 HDR10 静态——绿紫偏已修但无动态元数据
 - Pro gating 挡**渲染本体**:免费用户播 DV 片先给 2 分钟全功能试用

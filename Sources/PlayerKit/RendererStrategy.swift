@@ -26,8 +26,13 @@ public struct VideoStreamAttributes: Sendable {
     /// DV profile (4/5/7/8). 0 when `isDolbyVision` is false.
     public var doviProfile: UInt8
 
-    /// BL signal compatibility id from the DV config record.
-    /// 1 = DV-Mel, 2 = DV-CT (HDR10 fallback), etc. 0 when non-DV.
+    /// BL signal compatibility id from the DV config record. 0 when non-DV.
+    /// Semantics verified 2026-10-28 against first-hand sources (Chromium
+    /// `media/formats/mp4/dolby_vision.h` constants; c5 ffprobe gold standard;
+    /// ffmpeg's `dovi_meta.h` documents no value meanings):
+    /// 1 = HDR10-compatible base (PQ + BT.2020), 2 = SDR, 4 = HLG,
+    /// 6 = UHD Blu-ray capture; 0 = none/non-compliant. Chromium treats only
+    /// 1/2/4 as backward compatible.
     public var blSignalCompatibilityId: UInt8
 
     /// True when the stream carries HDR10+ ST 2094-40 dynamic metadata.
@@ -79,7 +84,11 @@ public struct VideoStreamAttributes: Sendable {
 /// Which decoder to instantiate for a stream.
 public enum DecoderPreference: Sendable, Equatable {
     /// FFmpeg software decoder (`FFmpegVideoDecoder` with `forceSoftware: true`).
-    /// Required for DoVi Profile 5/8 (VT strips RPU) and HDR10+ (VT strips ST 2094-40).
+    /// Required for DoVi Profile 5/8 and HDR10+ **when we decode ourselves** —
+    /// VideoToolbox strips the DoVi RPU / ST 2094-40 SEI from its decoded
+    /// output. (The native DV system path keeps the bitstream intact and hands
+    /// it to the system decoder, so the constraint doesn't apply there —
+    /// `NativeBackend` branches on `RendererStrategy.videoPipeline` first.)
     case ffmpegSW
     /// FFmpeg VideoToolbox hardware acceleration. Used for non-DV HEVC/H.264 when
     /// the renderer wants 10-bit VT output.
@@ -128,13 +137,18 @@ public enum RendererStrategy: Sendable, Equatable {
     /// HDR10 PQ with static mastering display metadata. EDR displays use Metal
     /// HDR + BT.2390 static; non-EDR fall back to CI EDR fallback.
     case hdr10Static(peakNits: UInt16)
-    /// HDR10+ ST 2094-40 dynamic metadata. Requires FFmpeg SW (VT strips it).
+    /// HDR10+ ST 2094-40 dynamic metadata. Requires FFmpeg SW for in-app
+    /// decode (VT strips the SEI from decoded output).
     case hdr10Plus
     /// Dolby Vision Profile 5 (Netflix/Disney exclusive). FFmpeg SW + Metal HDR
     /// + DoVi L1 dynamic tone-map.
     case doviProfile5
-    /// Dolby Vision Profile 8 (HDR10-compatible). `tonemapCompat` is true when
-    /// bl_signal_compatibility_id == 2 (CT, HDR10-compatible fallback).
+    /// Dolby Vision Profile 8. `tonemapCompat` is true when the base layer is
+    /// backward-compatible HDR10 (`blSignalCompatibilityId == 1`, i.e. P8.1):
+    /// when DV is unavailable such a stream plays correctly as HDR10 with the
+    /// static BT.2390 tone-map. (`== 2` means the base layer is SDR, `== 4`
+    /// HLG — see `blSignalCompatibilityId`.) No renderer currently consumes
+    /// this flag; it is carried for diagnostics and future P8.2/8.4 routing.
     case doviProfile8(tonemapCompat: Bool)
     /// HLG broadcast content on an EDR display — apply OOTF + tone-map.
     case hlgOOTF
@@ -142,22 +156,47 @@ public enum RendererStrategy: Sendable, Equatable {
     /// dual-layer decode is out of scope. Falls back to `hdr10Static` path
     /// when VT handles it.
     case degradedHDR10
+    /// Native DV system path (design §5.1): no in-app decode — compressed HEVC
+    /// samples go straight to `AVSampleBufferDisplayLayer` (system decoder +
+    /// system display management). Only eligible for P5 / P8.1 on macOS EDR
+    /// displays with the `.system` preference; `NativeBackend` routes on
+    /// `videoPipeline == .compressedPassthrough` and must skip decoder +
+    /// jitter buffer entirely for this case.
+    case doviSystem
+
+    /// Which pipeline carries video to the renderer (design §5.1).
+    public var videoPipeline: VideoPipeline {
+        switch self {
+        case .doviSystem:                        return .compressedPassthrough
+        case .sdr8Bit, .sdr10Bit, .hdr10Static, .hdr10Plus, .doviProfile5,
+             .doviProfile8, .hlgOOTF, .degradedHDR10:
+            return .decodedFrames
+        }
+    }
 
     /// True when this strategy needs 10-bit pixel buffers from the decoder.
     public var pixelFormat10Bit: Bool {
         switch self {
         case .sdr8Bit:       return false
-        case .sdr10Bit:      return true
+        case .sdr10Bit, .doviSystem: return true
         case .hdr10Static, .hdr10Plus, .doviProfile5, .doviProfile8, .hlgOOTF, .degradedHDR10:
             return true
         }
     }
 
     /// Which decoder to instantiate.
+    ///
+    /// - Note: for `.doviSystem` the decoder preference is never consulted —
+    ///   `NativeBackend` must branch on `videoPipeline` **first** and skip
+    ///   decoder creation entirely (compressed passthrough). The `.ffmpegSW`
+    ///   value here is the DV fallback decoder, i.e. what a downgrade to the
+    ///   software path (`.doviProfile5`/`.doviProfile8`) would use.
     public var decoderPreference: DecoderPreference {
         switch self {
-        case .doviProfile5, .doviProfile8, .hdr10Plus:
-            // VT strips DoVi RPU and HDR10+ ST 2094-40 metadata; must go SW.
+        case .doviProfile5, .doviProfile8, .hdr10Plus, .doviSystem:
+            // VT strips DoVi RPU and HDR10+ ST 2094-40 metadata when *we*
+            // decode; must go SW. (The system DV path keeps the RPU in the
+            // bitstream — the system handles it.)
             return .ffmpegSW
         case .hdr10Static, .hlgOOTF, .degradedHDR10:
             // HEVC HDR10 / HLG — FFmpeg VT hwaccel gives 10-bit IOSurface-backed output.
@@ -175,7 +214,7 @@ public enum RendererStrategy: Sendable, Equatable {
         switch self {
         case .sdr8Bit, .sdr10Bit:
             return .ciSDR
-        case .hdr10Static, .hdr10Plus, .doviProfile5, .doviProfile8, .hlgOOTF, .degradedHDR10:
+        case .hdr10Static, .hdr10Plus, .doviProfile5, .doviProfile8, .hlgOOTF, .degradedHDR10, .doviSystem:
             return display.supportsEDR ? .metalHDR : .ciEDRFallback
         }
     }
@@ -183,7 +222,7 @@ public enum RendererStrategy: Sendable, Equatable {
     /// Which tone-mapping algorithm to instantiate in EDRRenderer.
     public var toneMapAlgorithm: ToneMappingAlgorithmKind {
         switch self {
-        case .sdr8Bit, .sdr10Bit:                return .passthroughSDR
+        case .sdr8Bit, .sdr10Bit, .doviSystem:   return .passthroughSDR
         case .hdr10Static, .degradedHDR10:      return .bt2390Static
         case .hdr10Plus:                        return .hdr10PlusDynamic
         case .doviProfile5, .doviProfile8:       return .bt2390DoViL1
@@ -195,7 +234,9 @@ public enum RendererStrategy: Sendable, Equatable {
 /// Pure function: pick a `RendererStrategy` from stream attributes + display
 /// capability + renderer preference (EDRRenderer.prefersTenBit == true).
 ///
-/// Decision order (spec §5):
+/// Decision order (spec §5, design §5.1):
+/// 0. DoVi + system DV eligible (P5 / P8.1, `.system` preference, capability
+///    available, EDR) → `doviSystem` — native compressed passthrough
 /// 1. DoVi Profile 5 → `doviProfile5` (EDR) or `degradedHDR10` (non-EDR)
 /// 2. DoVi Profile 8 → `doviProfile8` (EDR) or `degradedHDR10` (non-EDR)
 /// 3. DoVi Profile 7 → `degradedHDR10` (always — VT handles as HDR10)
@@ -210,11 +251,18 @@ public enum RendererStrategy: Sendable, Equatable {
 ///
 /// When `doviEnabled` is false (free tier), Dolby Vision streams are treated as
 /// HDR10 base layer — content still plays, but without DoVi L1 dynamic tone-map.
+///
+/// The two trailing parameters default to "system DV unavailable / `.system`
+/// preference": callers that don't know about the native path get today's
+/// software-path behavior bit-for-bit (anti-goal: the software path must not
+/// change).
 public func decideRendererStrategy(
     stream: VideoStreamAttributes,
     prefersTenBit: Bool,
     display: DisplayCapability,
-    doviEnabled: Bool = true
+    doviEnabled: Bool = true,
+    systemDolbyVision: SystemDVCapability = .unavailable,
+    dolbyVisionOutput: DolbyVisionOutputPreference = .system
 ) -> RendererStrategy {
     // Non-EDR display + non-10-bit renderer → always SDR path.
     // (Even HDR content on MetalRenderer / SDR-only renderer renders as SDR
@@ -230,15 +278,26 @@ public func decideRendererStrategy(
         guard doviEnabled else {
             return edrCapable ? .hdr10Static(peakNits: 1000) : .sdr8Bit(matrix: .bt2020)
         }
+        // 0. Native DV system path (design §5.1). Placed after the free-tier
+        // guard (system path is gated by the same doviEnabled) and before the
+        // per-profile software switch. All conditions must hold, else fall
+        // through to the software path unchanged.
+        if dolbyVisionOutput == .system,
+           systemDolbyVision.isAvailable,
+           edrCapable,
+           SystemDVPolicy.isEligible(profile: stream.doviProfile,
+                                     compatId: stream.blSignalCompatibilityId) {
+            return .doviSystem
+        }
         switch stream.doviProfile {
         case 5:
             return edrCapable ? .doviProfile5 : .degradedHDR10
         case 8:
-            // bl_signal_compatibility_id == 2 → HDR10-compatible ("CT" mode).
-            // These streams are designed to be played as HDR10 when DV is
-            // unavailable — tonemapCompat flag tells EDRRenderer whether to
-            // apply the DV L1 dynamic tone-map or fall back to BT.2390 static.
-            let compat = stream.blSignalCompatibilityId == 2
+            // bl_signal_compatibility_id == 1 → base layer is backward-compatible
+            // HDR10 (P8.1): plays correctly as HDR10 when DV is unavailable —
+            // tonemapCompat records that for diagnostics (see case doc; no
+            // renderer consumes it today). == 2 is an SDR base layer, == 4 HLG.
+            let compat = stream.blSignalCompatibilityId == 1
             return edrCapable ? .doviProfile8(tonemapCompat: compat) : .degradedHDR10
         case 7:
             // Profile 7 (BL+EL dual-layer) — software dual-layer decode is out

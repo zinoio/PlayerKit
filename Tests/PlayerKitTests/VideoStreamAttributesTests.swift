@@ -38,6 +38,24 @@ final class VideoStreamAttributesTests: XCTestCase {
         XCTAssertFalse(attrs.isHEVC10BitSDRHint)
     }
 
+    /// 2026-10-28 compat id 语义核实结论(ffmpeg dovi_meta.h 无值说明,一手对照:
+    /// Chromium `media/formats/mp4/dolby_vision.h` 常量 + c5 ffprobe 金标准):
+    /// 1 = HDR10 向后兼容,2 = SDR,4 = HLG,6 = UHD BD;
+    /// 旧注释「1 = DV-Mel, 2 = DV-CT (HDR10 fallback)」是错的。
+    /// P8.1(compat=1)BL 即 HDR10 → doviProfile8 的 tonemapCompat(=「DV 不可用
+    /// 时按 HDR10 静态 tone map 播放」)必须为真。
+    func testP81CompatIdIsHDR10Compatible() throws {
+        let url = corpusURL("c5_dv_p81.mp4")
+        let demuxer = FFmpegDemuxer()
+        try demuxer.open(url: url, headers: [:])
+        let attrs = try XCTUnwrap(demuxer.videoStreamAttributes())
+        XCTAssertEqual(attrs.doviProfile, 8)
+        XCTAssertEqual(attrs.blSignalCompatibilityId, 1)
+        let edr = decideRendererStrategy(stream: attrs, prefersTenBit: true,
+                                         display: .macEDR, doviEnabled: true)
+        XCTAssertEqual(edr, .doviProfile8(tonemapCompat: true))
+    }
+
     func testReturnsNilWithoutVideoStream() {
         let demuxer = FFmpegDemuxer()
         XCTAssertNil(demuxer.videoStreamAttributes())

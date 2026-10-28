@@ -66,6 +66,7 @@ final class HdrCorpusConformanceTests: XCTestCase {
         case .doviProfile8(let compat):  return "doviProfile8(\(compat))"
         case .hlgOOTF:                   return "hlgOOTF"
         case .degradedHDR10:             return "degradedHDR10"
+        case .doviSystem:                return "doviSystem"
         }
     }
 

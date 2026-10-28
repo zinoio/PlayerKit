@@ -203,7 +203,9 @@ final class FFmpegDemuxer: @unchecked Sendable {
     var doviProfile: UInt8 { doviConfiguration?.dv_profile ?? 0 }
 
     /// BL signal compatibility id from the DV config record. 0 for non-DV
-    /// streams; 2 = HDR10-compatible CT mode (can fall back to HDR10 rendering).
+    /// streams. Verified semantics (2026-10-28, Chromium constants + c5
+    /// ffprobe gold standard): 1 = HDR10-compatible base, 2 = SDR, 4 = HLG,
+    /// 6 = UHD Blu-ray; only 1/2/4 are backward compatible.
     var doviBLSignalCompatibilityId: UInt8 {
         doviConfiguration?.dv_bl_signal_compatibility_id ?? 0
     }

@@ -1,0 +1,14 @@
+{
+  "cm_version": "V29",
+  "profile": "5",
+  "length": 24,
+  "level6": {
+    "max_display_mastering_luminance": 1000,
+    "min_display_mastering_luminance": 1,
+    "max_content_light_level": 1000,
+    "max_frame_average_light_level": 400
+  },
+  "default_metadata_blocks": [
+    { "Level1": { "min_pq": 0, "max_pq": 2900, "avg_pq": 1200 } }
+  ]
+}

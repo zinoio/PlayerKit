@@ -9,8 +9,10 @@ dovi_tool inject-rpu 得到的 RPU 流直接 mux 进 mp4 会丢失 DOVI 配置�
 一个规格正确的 dvcC box:profile 8、rpu=1、el=0、bl=1、bl_signal_compatibility_id=1。
 moov 必须是最后一个 top-level box(ffmpeg 默认布局),否则 chunk 偏移会失效,拒绝打补丁。
 """
+import argparse
 import sys
 
+DEFAULTS = dict(profile=8, level=0, rpu=1, el=0, bl=1, compat=1, md=1)
 DVCC_PAYLOAD = bytes(
     [0x01, 0x00]  # dv_version_major=1, minor=0
     # 7b profile=8 | 6b level=0 | 1b rpu=1 | 1b el=0 | 1b bl=1  -> 0x1005
@@ -20,6 +22,24 @@ DVCC_PAYLOAD = bytes(
     + [0x00] * 19  # reserved
 )
 assert len(DVCC_PAYLOAD) == 24
+
+
+def dvcc_payload_for(profile=8, level=0, rpu=1, el=0, bl=1, compat=1, md=1):
+    """按 ff_isom_put_dvcc_dvvc 位布局生成 24 字节载荷。
+
+    word = (profile<<9)|(level<<3)|(rpu<<2)|(el<<1)|bl;byte4 = (compat<<4)|(md<<2)。
+    P5 合成语料用 profile=5 / compat=0 / md=1(dovi_tool 注入的 RPU 为
+    limited 压缩,与 C5 实测一致)。
+    """
+    word = (profile << 9) | (level << 3) | (rpu << 2) | (el << 1) | bl
+    return bytes(
+        [0x01, 0x00]
+        + [(word >> 8) & 0xFF, word & 0xFF]
+        + [((compat & 0xF) << 4) | ((md & 0x3) << 2)]
+        + [0x00] * 19
+    )
+
+
 DVCC_BOX = (32).to_bytes(4, "big") + b"dvcC" + DVCC_PAYLOAD
 
 
@@ -46,7 +66,7 @@ def find(data, start, end, fourcc):
     return None
 
 
-def main(path):
+def main(path, payload=DVCC_PAYLOAD):
     with open(path, "rb") as f:
         data = bytearray(f.read())
     n = len(data)
@@ -107,19 +127,30 @@ def main(path):
         print("已存在 DOVI 配置 box,跳过")
         return
 
-    data[entry_e:entry_e] = DVCC_BOX
+    box = (32).to_bytes(4, "big") + b"dvcC" + payload
+    data[entry_e:entry_e] = box
     for off in chain:
         old = int.from_bytes(data[off : off + 4], "big")
         if old >= (1 << 31):
             sys.exit(f"拒绝打补丁: chain 上出现 largesize box @ {off:#x}")
-        data[off : off + 4] = (old + 32).to_bytes(4, "big")
+        data[off : off + 4] = (old + len(box)).to_bytes(4, "big")
 
     with open(path, "wb") as f:
         f.write(data)
-    print(f"已插入 dvcC(profile 8, rpu=1, el=0, bl=1, compat_id=1)@ {path}")
+    prof = payload[2] >> 1
+    compat = payload[4] >> 4
+    print(f"已插入 dvcC(profile {prof}, rpu=1, el=0, bl=1, compat_id={compat})@ {path}")
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        sys.exit(f"用法: {sys.argv[0]} <video.mp4>")
-    main(sys.argv[1])
+    ap = argparse.ArgumentParser(description="向 hvc1/hev1 sample entry 插入 DOVI 配置 box")
+    ap.add_argument("video")
+    ap.add_argument("--profile", type=int, default=DEFAULTS["profile"],
+                    help="DV profile(默认 8;P5 语料用 5)")
+    ap.add_argument("--compat", type=int, default=DEFAULTS["compat"],
+                    help="bl_signal_compatibility_id(默认 1;P5 用 0)")
+    args = ap.parse_args()
+    payload = DVCC_PAYLOAD
+    if (args.profile, args.compat) != (DEFAULTS["profile"], DEFAULTS["compat"]):
+        payload = dvcc_payload_for(profile=args.profile, compat=args.compat)
+    main(args.video, payload)

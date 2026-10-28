@@ -121,7 +121,7 @@
         "hdr10plus": false
       },
       "expected": {
-        "strategyEDR": "doviProfile8(false)",
+        "strategyEDR": "doviProfile8(true)",
         "strategySDR": "degradedHDR10",
         "isDoVi": true,
         "doviProfile": 8,
@@ -147,7 +147,7 @@
         "hdr10plus": false
       },
       "expected": {
-        "strategyEDR": "doviProfile8(false)",
+        "strategyEDR": "doviProfile8(true)",
         "strategySDR": "degradedHDR10",
         "isDoVi": true,
         "doviProfile": 8,
@@ -162,6 +162,32 @@
         "compatId": 1
       },
       "note": "ffmpeg 8.x mpegts muxer 不写 DOVI registration descriptor(mpegts demuxer 可解析),故 ffprobe 段无 DOVI 字段是工具限制的实测记录;TS 内 RPU NAL 完整保留,DOVI 断言由 Task 4 的 reader 注入路径承担"
+    },
+    {
+      "file": "c10_dv_p5_ipt.mp4",
+      "cell": "DV_P5_IPT",
+      "synthetic": true,
+      "realCorpus": null,
+      "ffprobe": {
+        "codec": "hevc",
+        "trc": "smpte2084",
+        "primaries": "bt2020",
+        "matrix": "bt2020nc",
+        "dv_profile": 5,
+        "dv_rpu_present": true,
+        "dv_el_present": false,
+        "dv_bl_signal_compatibility_id": 0,
+        "hdr10plus": false
+      },
+      "expected": {
+        "strategyEDR": "doviProfile5",
+        "strategySDR": "degradedHDR10",
+        "isDoVi": true,
+        "doviProfile": 5,
+        "hasHDR10Plus": false,
+        "blSignalCompatibilityId": 0
+      },
+      "discDovi": null
     },
     {
       "file": "",
