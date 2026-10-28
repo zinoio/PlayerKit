@@ -34,8 +34,8 @@ HDR 渲染决策不是"一个格式对应一种方式",而是三个独立维度�
 | HDR10+ | 非 EDR | FFmpeg VT hwaccel (`ffmpegHW`) | `ciEDRFallback` | 降级为 HDR10 静态 |
 | **DoVi Profile 5** | EDR | **FFmpeg 软解** (`ffmpegSW`) | `metalHDR` | BT.2390 + DoVi L1 动态 (+ L2/L3 精修) |
 | DoVi Profile 5 | 非 EDR | FFmpeg 软解 (`ffmpegSW`) | `ciEDRFallback` | 降级为 HDR10 静态 |
-| **DoVi Profile 7** (BL+EL) | EDR | VT 直解 (`vtHW`) | `metalHDR` | BT.2390 static (降级) |
-| DoVi Profile 7 | 非 EDR | VT 直解 (`vtHW`) | `ciEDRFallback` | 降级为 HDR10 静态 |
+| **DoVi Profile 7** (BL+EL) | EDR | FFmpeg VT hwaccel (`ffmpegHW`) | `metalHDR` | BT.2390 static (降级) |
+| DoVi Profile 7 | 非 EDR | FFmpeg VT hwaccel (`ffmpegHW`) | `ciEDRFallback` | 降级为 HDR10 静态 |
 | **DoVi Profile 8** | EDR | **FFmpeg 软解** (`ffmpegSW`) | `metalHDR` | BT.2390 + DoVi L1 动态 (+ L2/L3 精修,同 P5) |
 | DoVi Profile 8 | 非 EDR | FFmpeg 软解 (`ffmpegSW`) | `ciEDRFallback` | 降级为 HDR10 静态 |
 | **HLG** (广播) | EDR | FFmpeg VT hwaccel (`ffmpegHW`) | `metalHDR` | HLG OOTF + BT.2390 |
