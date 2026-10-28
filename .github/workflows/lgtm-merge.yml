@@ -1,6 +1,11 @@
 name: lgtm-merge
 on:
-  pull_request:
+  # pull_request_target instead of pull_request: labeled events on PRs whose
+  # head lives in a fork (our normal dev flow) never register a run with the
+  # plain pull_request event — same-repo branches work either way. Safe here:
+  # the workflow file comes from the base branch and this job only calls the
+  # merge API, it never checks out or executes PR code.
+  pull_request_target:
     types: [labeled]
 permissions:
   contents: write
@@ -14,11 +19,19 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        # Public repos have allow_auto_merge on; --auto waits for required
-        # checks / reviews before merging. Private repos on a free org cannot
-        # enable allow_auto_merge (API silently rejects it) and have no branch
-        # protection to wait for either, so --auto errors out — fall back to a
-        # direct merge there. The lgtm label itself is the human approval.
+        # GITHUB_TOKEN can never merge a PR whose diff touches
+        # .github/workflows/ (mergePullRequest is refused without a workflows
+        # permission that the token cannot be granted), so skip those and let
+        # a human merge them. Public repos have allow_auto_merge on; --auto
+        # waits for required checks / reviews before merging. Private repos on
+        # a free org cannot enable allow_auto_merge (API silently rejects it)
+        # and have no branch protection to wait for either, so --auto errors
+        # out — fall back to a direct merge there. The lgtm label itself is
+        # the human approval.
         run: |
+          if gh api "repos/$GH_REPO/pulls/${{ github.event.pull_request.number }}/files" --paginate --jq '.[].filename' | grep -q '^\.github/workflows/'; then
+            echo "PR touches .github/workflows/ — GITHUB_TOKEN can't merge it; merge manually."
+            exit 0
+          fi
           gh pr merge ${{ github.event.pull_request.number }} --merge --auto --delete-branch || \
             gh pr merge ${{ github.event.pull_request.number }} --merge --delete-branch
