@@ -44,6 +44,9 @@ public struct PlayerState: @unchecked Sendable {
     public var videoInfo:      VideoInfo?  = nil
     /// Cache download speed in bytes/second.
     public var cacheSpeed:     Int64       = 0
+    /// Cumulative count of decoded video frames dropped before render
+    /// (late frames drained + sync-rejected), refreshed periodically by the backend.
+    public var droppedVideoFrames: Int64 = 0
 
     public init() {}
 }
@@ -62,15 +65,29 @@ public struct TrackInfo: Identifiable, Sendable, Equatable {
     public let isDefault: Bool
     /// Whether this audio track carries Dolby Atmos object metadata.
     public let isAtmos: Bool
+    /// Audio channel count (e.g. 6 ≈ 5.1), nil when unknown.
+    public var channels: Int?
+    /// Audio sample rate in Hz, nil when unknown.
+    public var sampleRate: Int?
+    /// Bits per sample, nil when unknown.
+    public var bitDepth: Int?
+    /// Track bitrate in bits/second, nil when unknown.
+    public var bitrate: Int64?
 
     public init(id: Int, title: String? = nil, lang: String? = nil,
-                codec: String? = nil, isDefault: Bool = false, isAtmos: Bool = false) {
+                codec: String? = nil, isDefault: Bool = false, isAtmos: Bool = false,
+                channels: Int? = nil, sampleRate: Int? = nil,
+                bitDepth: Int? = nil, bitrate: Int64? = nil) {
         self.id = id
         self.title = title
         self.lang = lang
         self.codec = codec
         self.isDefault = isDefault
         self.isAtmos = isAtmos
+        self.channels = channels
+        self.sampleRate = sampleRate
+        self.bitDepth = bitDepth
+        self.bitrate = bitrate
     }
 }
 
@@ -90,10 +107,20 @@ public struct VideoInfo: Sendable, Equatable {
     public let transfer: String?
     /// Whether the stream is Dolby Vision (profile 5/8/9 detected via DOVI_CONF side data).
     public let isDolbyVision: Bool
+    /// Frame rate in fps (from avg_frame_rate), nil when unknown.
+    public var fps: Double?
+    /// Codec profile name (e.g. "Main 10"), nil when unknown.
+    public var profile: String?
+    /// Codec level as declared in the container, nil when unknown.
+    public var level: Int?
+    /// Stream bitrate in bits/second (container-declared, else rolling estimate), nil when unknown.
+    public var bitrate: Int64?
 
     public init(width: Int, height: Int, codec: String? = nil,
                 isHDR: Bool = false, colorMatrix: String? = nil,
-                transfer: String? = nil, isDolbyVision: Bool = false) {
+                transfer: String? = nil, isDolbyVision: Bool = false,
+                fps: Double? = nil, profile: String? = nil,
+                level: Int? = nil, bitrate: Int64? = nil) {
         self.width = width
         self.height = height
         self.codec = codec
@@ -101,6 +128,10 @@ public struct VideoInfo: Sendable, Equatable {
         self.colorMatrix = colorMatrix
         self.transfer = transfer
         self.isDolbyVision = isDolbyVision
+        self.fps = fps
+        self.profile = profile
+        self.level = level
+        self.bitrate = bitrate
     }
 }
 
