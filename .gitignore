@@ -2,3 +2,6 @@
 .swiftpm/
 build/
 .idea/
+
+# 本地 git worktree 目录
+.wt/

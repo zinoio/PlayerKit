@@ -455,6 +455,15 @@ public final class NativeBackend: PlayerBackend {
     /// Decoded frames appended into the jitter buffer (supply-side count; the
     /// loss is display-side iff appends ≈ source fps×elapsed ≫ displayed).
     private nonisolated(unsafe) var diagAppendsSinceLog = 0
+    /// Rolling video bitrate estimate fed by the demux loop (EMA over packet
+    /// sizes × fps); logSync publishes it when the container declares no
+    /// stream bitrate. Same lock-free discipline as the diag counters above.
+    private nonisolated(unsafe) var videoBitrateEstimator = VideoBitrateEstimator()
+    /// Cumulative decoded frames that never reached the renderer (skip-behind
+    /// drains + syncController denials); published to state.droppedVideoFrames
+    /// by logSync. Deliberately excludes freeze-ahead/guardSkip/noFrame ticks
+    /// (nothing decoded was lost there).
+    private nonisolated(unsafe) var renderDropTotal: Int64 = 0
     // [diag] zyno#380: demux read-ahead throttle accounting. When the jitter
     // buffer's PTS span (`dur`) grows without bound after a big fine-seek
     // discard, these counters say whether the throttle even fired and what it
@@ -1304,6 +1313,14 @@ public final class NativeBackend: PlayerBackend {
                 ? String(cString: avcodec_get_name(cp.codec_id))
                 : nil
             let isHDR = colorParams.transfer == .pq || colorParams.transfer == .hlg
+            let fr = vs.pointee.avg_frame_rate
+            let fps: Double? = (fr.num > 0 && fr.den > 0) ? Double(fr.num) / Double(fr.den) : nil
+            let profile: String?
+            if cp.profile > 0, let name = avcodec_profile_name(cp.codec_id, cp.profile) {
+                profile = String(cString: name)
+            } else {
+                profile = nil
+            }
             state.videoInfo = VideoInfo(
                 width: videoWidth,
                 height: videoHeight,
@@ -1311,7 +1328,11 @@ public final class NativeBackend: PlayerBackend {
                 isHDR: isHDR,
                 colorMatrix: isHDR ? "\(colorParams.matrix)" : nil,
                 transfer: isHDR ? "\(colorParams.transfer)" : nil,
-                isDolbyVision: demuxer.isDolbyVision
+                isDolbyVision: demuxer.isDolbyVision,
+                fps: fps,
+                profile: profile,
+                level: cp.level > 0 ? Int(cp.level) : nil,
+                bitrate: cp.bit_rate > 0 ? cp.bit_rate : nil
             )
             if demuxer.isDolbyVision {
                 logger.info("Dolby Vision detected")
@@ -1353,7 +1374,11 @@ public final class NativeBackend: PlayerBackend {
                     lang: lang,
                     codec: codecName,
                     isDefault: isDefault,
-                    isAtmos: isAtmos
+                    isAtmos: isAtmos,
+                    channels: cp.ch_layout.nb_channels > 0 ? Int(cp.ch_layout.nb_channels) : nil,
+                    sampleRate: cp.sample_rate > 0 ? Int(cp.sample_rate) : nil,
+                    bitDepth: Self.audioBitDepth(cp),
+                    bitrate: cp.bit_rate > 0 ? cp.bit_rate : nil
                 ))
             }
             state.audioTracks = tracks
@@ -1660,6 +1685,8 @@ public final class NativeBackend: PlayerBackend {
             var lastAudioAdvanceWall = CACurrentMediaTime()
 
             let frameDuration: Double
+            // Source fps for the bitrate EMA below (0 = unknown; record() ignores it).
+            var contentFPS: Double = 0
             if let vs = demuxer.videoStream {
                 let fr = vs.pointee.avg_frame_rate
                 frameDuration = fr.num > 0 ? Double(fr.den) / Double(fr.num) : 1.0/25.0
@@ -1670,6 +1697,7 @@ public final class NativeBackend: PlayerBackend {
                 // "开播→弹一帧→冻结4秒"，跟从没做过这个修复一模一样。
                 if fr.num > 0 && fr.den > 0 {
                     let fps = Double(fr.num) / Double(fr.den)
+                    contentFPS = fps
                     jitter.configureFrameRate(fps)
                     // zyno#106: 真实 fps 同时喂给显示链路做刷新率匹配
                     // (24/25/30p → 保守倍频;混帧率内容 fps 变化时热切换)。
@@ -1804,6 +1832,7 @@ public final class NativeBackend: PlayerBackend {
                 var handedOffPacket = false
 
                 if streamIndex == demuxer.videoStreamIndex {
+                    self.videoBitrateEstimator.record(packetBytes: pktSize, frameRate: contentFPS)
                     let rawPTS = Self.ptsFromPacket(packet, demuxer: demuxer)
                     // MultiClipDemuxer rebases every packet's PTS onto the
                     // continuous global timeline before handing it out, so the
@@ -2634,6 +2663,7 @@ public final class NativeBackend: PlayerBackend {
                 jitterBuffer.pop()
                 displayLoopLock.withLock {
                     tickDrainLag += 1
+                    renderDropTotal += 1
                     drainDepthStats.record(audioTime - lagging.pts)
                 }
             }
@@ -2753,7 +2783,7 @@ public final class NativeBackend: PlayerBackend {
         }
 
         guard shouldShow else {
-            if clockReady { displayLoopLock.withLock { tickCheckDeny += 1 } }
+            if clockReady { displayLoopLock.withLock { tickCheckDeny += 1; renderDropTotal += 1 } }
             // 旁路 pacing 等待时视频帧已在正确位置,用帧 PTS 而非 audioTime
             // (音频卡死时恒为 0,会把进度条打回 0)。
             let pos = Duration.milliseconds(Int64(max(0, clockReady ? audioTime : frame.pts) * 1000))
@@ -3053,10 +3083,10 @@ public final class NativeBackend: PlayerBackend {
 
     private nonisolated func logSync(now: Double, pts: Double, audioTime: Double) {
         let gen = playGeneration
-        let (elapsed, fpsSamples): (Double, Int) = displayLoopLock.withLock {
+        let (elapsed, fpsSamples, drops): (Double, Int, Int64) = displayLoopLock.withLock {
             let e = now - lastLogTime
-            guard e > 5.0 else { return (0.0, 0) }
-            return (e, framesSinceLastLog)
+            guard e > 5.0 else { return (0.0, 0, 0) }
+            return (e, framesSinceLastLog, renderDropTotal)
         }
         guard elapsed > 5.0 else { return }
         let fps = Double(fpsSamples) / elapsed
@@ -3137,6 +3167,15 @@ public final class NativeBackend: PlayerBackend {
                     self.lastBytesLogged = self.totalBytesRead
                     self.lastThroughputTime = now
                 }
+            }
+
+            // Publish cumulative render drops + bitrate fallback: the
+            // container-declared stream bitrate wins; the demux EMA fills in
+            // when it's absent.
+            self.state.droppedVideoFrames = drops
+            let estBps = self.videoBitrateEstimator.bitsPerSecond
+            if estBps > 0, let vi = self.state.videoInfo, (vi.bitrate ?? 0) <= 0 {
+                self.state.videoInfo?.bitrate = estBps
             }
 
             displayLoopLock.withLock {
@@ -3653,6 +3692,8 @@ public final class NativeBackend: PlayerBackend {
             // restart").
             lastNotifiedPos = .zero
             displayedVideoFrames = 0
+            renderDropTotal = 0
+            videoBitrateEstimator = VideoBitrateEstimator()
             throughputLock.withLock {
                 lastBytesLogged = 0
                 lastThroughputTime = 0
@@ -4105,6 +4146,15 @@ public final class NativeBackend: PlayerBackend {
         }
     }
 
+    /// Bits per sample for an audio stream: exact raw sample bits when the
+    /// container declares them, else the decoded sample format's byte width
+    /// × 8 (lossy codecs report their internal float/int width).
+    private static func audioBitDepth(_ cp: AVCodecParameters) -> Int? {
+        if cp.bits_per_raw_sample > 0 { return Int(cp.bits_per_raw_sample) }
+        let bits = Int(av_get_bytes_per_sample(AVSampleFormat(rawValue: cp.format))) * 8
+        return bits > 0 ? bits : nil
+    }
+
     private func refreshAudioTracks() {
         guard let fmtCtx = demuxer?.formatContext else { return }
         var tracks: [TrackInfo] = []
@@ -4140,7 +4190,11 @@ public final class NativeBackend: PlayerBackend {
                 lang: lang,
                 codec: codecName,
                 isDefault: isDefault,
-                isAtmos: isAtmos
+                isAtmos: isAtmos,
+                channels: cp.ch_layout.nb_channels > 0 ? Int(cp.ch_layout.nb_channels) : nil,
+                sampleRate: cp.sample_rate > 0 ? Int(cp.sample_rate) : nil,
+                bitDepth: Self.audioBitDepth(cp),
+                bitrate: cp.bit_rate > 0 ? cp.bit_rate : nil
             ))
         }
         state.audioTracks = tracks
