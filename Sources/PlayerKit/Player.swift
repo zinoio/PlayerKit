@@ -117,6 +117,20 @@ public final class Player {
         }
     }
 
+    /// Preferred subtitle font family (nil = system/libass default). Forwarded
+    /// to backends that render ASS/SSA through libass; takes effect when the
+    /// next ASS renderer is created (track switch / next episode — libass
+    /// requires font lookup to be set before use). Text subtitles rendered by
+    /// `SubtitleOverlayView` use its own `fontFamily` parameter and switch
+    /// immediately.
+    public var subtitleFontFamily: String? {
+        didSet {
+            guard oldValue != subtitleFontFamily else { return }
+            (backend as? any SubtitleFontConfigurable)?
+                .setSubtitleFontFamily(subtitleFontFamily)
+        }
+    }
+
     // MARK: - Renderer (requires PlayerBackend)
 
     /// The renderer's Core Animation layer for embedding in a view hierarchy.
