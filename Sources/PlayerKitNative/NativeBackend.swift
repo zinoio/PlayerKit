@@ -496,11 +496,17 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
     /// sizes × fps); logSync publishes it when the container declares no
     /// stream bitrate. Same lock-free discipline as the diag counters above.
     private nonisolated(unsafe) var videoBitrateEstimator = VideoBitrateEstimator()
-    /// Cumulative decoded frames that never reached the renderer (skip-behind
-    /// drains + syncController denials); published to state.droppedVideoFrames
-    /// by logSync. Deliberately excludes freeze-ahead/guardSkip/noFrame ticks
-    /// (nothing decoded was lost there).
+    /// Cumulative decoded frames that never reached the renderer because they
+    /// fell behind audio and were drained from the jitter buffer. SyncController
+    /// "not due yet" denials are NOT drops — the frame stays at the head and is
+    /// retried on the next display tick; they stay in `tickCheckDeny` for
+    /// diagnostics only (counting them here made the user-facing counter climb
+    /// continuously on every refresh tick). Published to
+    /// `state.droppedVideoFrames` by logSync.
     private nonisolated(unsafe) var renderDropTotal: Int64 = 0
+    /// `renderDropTotal` at the previous ~5s publish; used to compute
+    /// `recentDroppedVideoFrames` / `droppedVideoFramesPerSecond`.
+    private nonisolated(unsafe) var lastPublishedDropTotal: Int64 = 0
     // [diag] zyno#380: demux read-ahead throttle accounting. When the jitter
     // buffer's PTS span (`dur`) grows without bound after a big fine-seek
     // discard, these counters say whether the throttle even fired and what it
@@ -1339,6 +1345,9 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
                     logger.info("video: VT failed, FFmpeg fallback \(dec.width)x\(dec.height)\(sarStr) hw=\(dec.isHardware)")
                 }
             }
+                if let dec = videoDecoder {
+                    state.videoDecoderPath = Self.decoderPath(for: dec)
+                }
                 logger.info("video decoder init took \(String(format: "%.0f", Date().timeIntervalSince(tVDec) * 1000))ms")
             } // if !systemDVActive
         }
@@ -1371,6 +1380,9 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
                 level: cp.level > 0 ? Int(cp.level) : nil,
                 bitrate: cp.bit_rate > 0 ? cp.bit_rate : nil
             )
+            // P1 diagnostics: a declared stream bitrate is authoritative; the
+            // EMA fallback below flips this to true only when it fills the gap.
+            state.videoBitrateIsEstimated = false
             if demuxer.isDolbyVision {
                 logger.info("Dolby Vision detected")
             }
@@ -1908,6 +1920,7 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
                        let sw = FFmpegVideoDecoder(stream: vs, forceSoftware: true, colorParams: colorParams) {
                         logger.notice("VT→SW fallback: \(sw.width)x\(sw.height) — HW decoder failed, using FFmpeg SW")
                         self.videoDecoder = sw
+                        self.state.videoDecoderPath = .ffmpegSoftware
                     }
 
                     // Native DV 系统路径(design §5.1):跳过解码与 jitter buffer,
@@ -2372,6 +2385,15 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
     /// stream carries no extradata (bare packet streams) — callers then fall
     /// back to the legacy text-cue path.  startOffsetSecs mirrors
     /// FFmpegSubtitleDecoder's start_time normalization.
+    /// P1 diagnostics: map the live decoder instance to the public enum.
+    private static func decoderPath(for decoder: any VideoDecoding) -> VideoDecoderPath {
+        if decoder is VTVideoDecoder { return .videoToolbox }
+        if let ff = decoder as? FFmpegVideoDecoder {
+            return ff.isHardware ? .videoToolbox : .ffmpegSoftware
+        }
+        return .ffmpegSoftware
+    }
+
     private nonisolated static func makeASSRenderer(
         stream: UnsafeMutablePointer<AVStream>, videoSize: CGSize,
         fontFamily: String?) -> ASSRenderer? {
@@ -2823,7 +2845,9 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
         }
 
         guard shouldShow else {
-            if clockReady { displayLoopLock.withLock { tickCheckDeny += 1; renderDropTotal += 1 } }
+            // "Not due yet" — the frame stays at the head and is retried next
+            // tick. Diagnostic counter only; NOT a dropped frame.
+            if clockReady { displayLoopLock.withLock { tickCheckDeny += 1 } }
             // 旁路 pacing 等待时视频帧已在正确位置,用帧 PTS 而非 audioTime
             // (音频卡死时恒为 0,会把进度条打回 0)。
             let pos = Duration.milliseconds(Int64(max(0, clockReady ? audioTime : frame.pts) * 1000))
@@ -3119,6 +3143,7 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
         if let vs = demuxer.videoStream,
            let dec = FFmpegVideoDecoder(stream: vs, forceSoftware: true, colorParams: colorParams) {
             videoDecoder = dec
+            state.videoDecoderPath = .ffmpegSoftware
             codedVideoWidth = dec.width; codedVideoHeight = dec.height
             let sar = demuxer.sampleAspectRatio
             videoWidth  = sar > 1.0 ? Int(Double(dec.width) * sar) : dec.width
@@ -3224,9 +3249,15 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
             // container-declared stream bitrate wins; the demux EMA fills in
             // when it's absent.
             self.state.droppedVideoFrames = drops
+            let recentDrops = max(0, drops - self.lastPublishedDropTotal)
+            self.lastPublishedDropTotal = drops
+            self.state.recentDroppedVideoFrames = recentDrops
+            self.state.droppedVideoFramesPerSecond = elapsed > 0
+                ? Double(recentDrops) / elapsed : 0
             let estBps = self.videoBitrateEstimator.bitsPerSecond
             if estBps > 0, let vi = self.state.videoInfo, (vi.bitrate ?? 0) <= 0 {
                 self.state.videoInfo?.bitrate = estBps
+                self.state.videoBitrateIsEstimated = true
             }
 
             displayLoopLock.withLock {
@@ -3722,6 +3753,8 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
         altAudioCache.removeAll(); altAudioStreams = []; altCacheEnabled = false   // zyno#171
         demuxer?.close(); demuxer = nil
         videoDecoder = nil; audioDecoder = nil
+        state.videoDecoderPath = nil
+        state.videoBitrateIsEstimated = false
         // No seek can be pending on a stream that no longer exists; never leave the
         // frame gate (SeekFrameGate) closed or a fine-seek discard window armed
         // for the next session.
@@ -3744,6 +3777,7 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
             lastNotifiedPos = .zero
             displayedVideoFrames = 0
             renderDropTotal = 0
+            lastPublishedDropTotal = 0
             videoBitrateEstimator = VideoBitrateEstimator()
             throughputLock.withLock {
                 lastBytesLogged = 0
