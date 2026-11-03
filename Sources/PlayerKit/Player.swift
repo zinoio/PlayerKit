@@ -102,6 +102,35 @@ public final class Player {
     /// Select a subtitle track, or pass nil to disable subtitles.
     public func selectSubtitle(id: String?)    { backend.selectSubtitle(id: id) }
 
+    /// User-selectable video display geometry (feat/player-reskin, reflux
+    /// #444 P1 — the tuning panel's aspect-ratio presets). Session-level UI
+    /// preference owned by the app; changing it posts
+    /// `.playerKitVideoAspectDidChange` and the mounted PlayerNativeView
+    /// re-layouts on the next pass (instant mid-play, no pipeline rebuild).
+    /// Applies to AVSampleBufferDisplayLayer renderers; Metal renderers
+    /// manage their own content rect.
+    public var videoAspectMode: VideoAspectMode = .source {
+        didSet {
+            guard oldValue != videoAspectMode else { return }
+            NotificationCenter.default.post(name: .playerKitVideoAspectDidChange,
+                                            object: nil)
+        }
+    }
+
+    /// Preferred subtitle font family (nil = system/libass default). Forwarded
+    /// to backends that render ASS/SSA through libass; takes effect when the
+    /// next ASS renderer is created (track switch / next episode — libass
+    /// requires font lookup to be set before use). Text subtitles rendered by
+    /// `SubtitleOverlayView` use its own `fontFamily` parameter and switch
+    /// immediately.
+    public var subtitleFontFamily: String? {
+        didSet {
+            guard oldValue != subtitleFontFamily else { return }
+            (backend as? any SubtitleFontConfigurable)?
+                .setSubtitleFontFamily(subtitleFontFamily)
+        }
+    }
+
     // MARK: - Renderer (requires PlayerBackend)
 
     /// The renderer's Core Animation layer for embedding in a view hierarchy.

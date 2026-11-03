@@ -35,7 +35,8 @@ final class ASSRenderer: @unchecked Sendable {
     /// so NativeBackend's CGImage-identity check suppresses redundant UI hops.
     private var lastFrame: Frame?
 
-    init?(extradata: Data, videoSize: CGSize, startOffsetSecs: Double) {
+    init?(extradata: Data, videoSize: CGSize, startOffsetSecs: Double,
+          preferredFontFamily: String? = nil) {
         guard videoSize.width > 0, videoSize.height > 0, !extradata.isEmpty else { return nil }
         guard let lib = ass_library_init() else { return nil }
         library = lib
@@ -56,7 +57,15 @@ final class ASSRenderer: @unchecked Sendable {
         ass_set_frame_size(rend, Int32(videoSize.width), Int32(videoSize.height))
         // CoreText provider on Darwin (autodetected); fallback fonts allowed so
         // CJK/Latin glyphs missing from the styled font still render.
-        ass_set_fonts(rend, nil, nil, Int32(ASS_FONTPROVIDER_AUTODETECT.rawValue), nil, 1)
+        // `default_family` is the user's preferred subtitle font (app setting);
+        // libass copies the string, so the temporary C buffer is safe.
+        if let family = preferredFontFamily, !family.isEmpty {
+            family.withCString { cFamily in
+                ass_set_fonts(rend, nil, cFamily, Int32(ASS_FONTPROVIDER_AUTODETECT.rawValue), nil, 1)
+            }
+        } else {
+            ass_set_fonts(rend, nil, nil, Int32(ASS_FONTPROVIDER_AUTODETECT.rawValue), nil, 1)
+        }
 
         self.videoSize = videoSize
         self.startOffsetSecs = startOffsetSecs

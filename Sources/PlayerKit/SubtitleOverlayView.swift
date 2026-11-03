@@ -15,12 +15,18 @@ public struct SubtitleOverlayView: View {
     public var horizontalOffset: CGFloat = 0
     /// User-adjustable scale factor for subtitle size (1.0 = original, 1.5 = 50% larger, 0.8 = 20% smaller).
     public var scale: CGFloat = 1.0
+    /// Preferred font family for text subtitles (nil = system font). Bitmap
+    /// (PGS/VOBSUB) and ASS typeset subtitles ignore this — ASS font choice
+    /// goes through `Player.subtitleFontFamily`.
+    public var fontFamily: String? = nil
 
-    public init(player: Player, verticalOffset: CGFloat = 0, horizontalOffset: CGFloat = 0, scale: CGFloat = 1.0) {
+    public init(player: Player, verticalOffset: CGFloat = 0, horizontalOffset: CGFloat = 0,
+                scale: CGFloat = 1.0, fontFamily: String? = nil) {
         self.player = player
         self.verticalOffset = verticalOffset
         self.horizontalOffset = horizontalOffset
         self.scale = scale
+        self.fontFamily = fontFamily
     }
 
     public var body: some View {
@@ -75,9 +81,16 @@ public struct SubtitleOverlayView: View {
         }
     }
 
+    private var textSubtitleFont: Font {
+        if let family = fontFamily, !family.isEmpty {
+            return .custom(family, size: 20 * scale).weight(.semibold)
+        }
+        return .system(size: 20 * scale, weight: .semibold)
+    }
+
     private func textSubtitle(_ text: String, videoRect: CGRect) -> some View {
         Text(text)
-            .font(.system(size: 20 * scale, weight: .semibold))
+            .font(textSubtitleFont)
             .foregroundStyle(.white)
             .multilineTextAlignment(.center)
             .lineSpacing(4 * scale)

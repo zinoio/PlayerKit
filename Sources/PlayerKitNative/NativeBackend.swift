@@ -82,7 +82,7 @@ enum SeekFrameGate {
 }
 
 @MainActor
-public final class NativeBackend: PlayerBackend {
+public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
     public internal(set) var state = PlayerState()
     public private(set) var videoWidth: Int = 0
     public private(set) var videoHeight: Int = 0
@@ -224,6 +224,43 @@ public final class NativeBackend: PlayerBackend {
         audioDelay = clamped
         audioClock.setDelay(clamped)
         audioUnitOutput?.setDelayTarget(contentSecs: max(0, clamped))
+    }
+
+    /// User subtitle delay in CONTENT seconds, signed, ±30 clamp (matches the
+    /// app-side external-subtitle offset range; feat/player-reskin, reflux
+    /// #444 P1). Session-level like `audioDelay`: deliberately NOT part of
+    /// PlayerState — survives play() calls so the panel value stays meaningful
+    /// across episodes; the app resets it when it wants a clean slate.
+    /// Applies to embedded subtitle paths only (text cues, PGS/VOBSUB images,
+    /// ASS typeset) — external subtitle files are offset in the app layer.
+    /// Written on the main actor; the display loop reads `_subtitleDelay`
+    /// through `subtitleDelayLock`, so there is no data race.
+    public private(set) var subtitleDelay: Double = 0
+    private let subtitleDelayLock = NSLock()
+    private nonisolated(unsafe) var _subtitleDelay: Double = 0
+
+    /// Apply a user subtitle delay. d>0 shows embedded subtitles later (cue
+    /// window shifts forward); d<0 earlier. Instant mid-play — the display
+    /// loop picks it up on the next frame, no decoder/track rebuild.
+    public func setSubtitleDelay(_ secs: Double) {
+        let clamped = min(30.0, max(-30.0, secs.isFinite ? secs : 0))
+        subtitleDelay = clamped
+        subtitleDelayLock.withLock { _subtitleDelay = clamped }
+    }
+
+    /// Preferred subtitle font family for ASS/SSA rendering (nil = libass
+    /// autodetect). Session-level like `subtitleDelay`. libass requires font
+    /// lookup to be configured before the renderer is used, so an already
+    /// running ASS renderer keeps its font until the next one is created
+    /// (track switch / next episode); text subtitles are rendered by the app
+    /// overlay and switch immediately.
+    public private(set) var subtitleFontFamily: String?
+
+    /// Apply the app's subtitle font preference. Takes effect for ASS/SSA
+    /// renderers created after this call (see `subtitleFontFamily`).
+    public func setSubtitleFontFamily(_ family: String?) {
+        let normalized = (family?.isEmpty ?? true) ? nil : family
+        subtitleFontFamily = normalized
     }
 
     private var demuxer: (any PacketDemuxing)?
@@ -1473,7 +1510,8 @@ public final class NativeBackend: PlayerBackend {
             if codecId == AV_CODEC_ID_HDMV_PGS_SUBTITLE || codecId == AV_CODEC_ID_DVD_SUBTITLE {
                 subtitleDecoder = FFmpegSubtitleDecoder(stream: defaultSubStream, videoSize: vSize)
             } else if codecId == AV_CODEC_ID_ASS || codecId == AV_CODEC_ID_SSA {
-                let r = Self.makeASSRenderer(stream: defaultSubStream, videoSize: vSize)
+                let r = Self.makeASSRenderer(stream: defaultSubStream, videoSize: vSize,
+                                             fontFamily: subtitleFontFamily)
                 assRenderer = r
                 logger.notice("[sub] ASS renderer \(r != nil ? "created" : "unavailable (no extradata)")")
             }
@@ -2335,7 +2373,8 @@ public final class NativeBackend: PlayerBackend {
     /// back to the legacy text-cue path.  startOffsetSecs mirrors
     /// FFmpegSubtitleDecoder's start_time normalization.
     private nonisolated static func makeASSRenderer(
-        stream: UnsafeMutablePointer<AVStream>, videoSize: CGSize) -> ASSRenderer? {
+        stream: UnsafeMutablePointer<AVStream>, videoSize: CGSize,
+        fontFamily: String?) -> ASSRenderer? {
         guard let par = stream.pointee.codecpar else { return nil }
         guard let ex = par.pointee.extradata, par.pointee.extradata_size > 0 else { return nil }
         let exData = Data(bytes: ex, count: Int(par.pointee.extradata_size))
@@ -2347,7 +2386,8 @@ public final class NativeBackend: PlayerBackend {
         } else {
             offset = 0
         }
-        return ASSRenderer(extradata: exData, videoSize: videoSize, startOffsetSecs: offset)
+        return ASSRenderer(extradata: exData, videoSize: videoSize,
+                           startOffsetSecs: offset, preferredFontFamily: fontFamily)
     }
 
     private nonisolated static func parseASSCue(
@@ -2871,17 +2911,25 @@ public final class NativeBackend: PlayerBackend {
         // Audio clock can lag behind video (seek, primer, underrun) causing
         // subtitles to appear late when matched against audioTime.
         let displayPts = popped.pts
+        // User subtitle delay (feat/player-reskin, reflux #444 P1): shift the
+        // lookup clock once — text matching, ASS rendering, and PGS matching
+        // below all consume `subPts`, so one definition covers every embedded
+        // subtitle path (external subtitles are offset app-side).
+        let subPts = SubtitleTiming.shifted(
+            displayPts, delay: subtitleDelayLock.withLock { _subtitleDelay })
         let activeSub: String? = subtitleLock.withLock {
-            subtitleCues.first { $0.startPts <= displayPts && displayPts < $0.endPts }?.text
+            subtitleCues.first { SubtitleTiming.contains(startPts: $0.startPts,
+                                                         endPts: $0.endPts,
+                                                         pts: subPts) }?.text
         }
         let assR = self.assRenderer
         let (newImage, newRect): (CGImage?, CGRect)
         if let assR {
-            // ASS typeset rendering against the displayed frame's video PTS.
-            // libass's detect_change keeps the Frame instance stable across
-            // calls without content change, so the identity check below still
-            // suppresses redundant UI hops.
-            if let f = assR.renderFrame(ptsSecs: displayPts) {
+            // ASS typeset rendering against the displayed frame's video PTS
+            // (+ user subtitle delay). libass's detect_change keeps the Frame
+            // instance stable across calls without content change, so the
+            // identity check below still suppresses redundant UI hops.
+            if let f = assR.renderFrame(ptsSecs: subPts) {
                 newImage = f.image
                 newRect = f.rect
             } else {
@@ -2895,7 +2943,10 @@ public final class NativeBackend: PlayerBackend {
                 if subtitleImageCues.count > 4 {
                     subtitleImageCues.removeAll { $0.endPts < displayPts - 1.0 }
                 }
-                if let c = subtitleImageCues.first(where: { $0.startPts <= displayPts && displayPts < $0.endPts }) {
+                if let c = subtitleImageCues.first(where: {
+                    SubtitleTiming.contains(startPts: $0.startPts,
+                                            endPts: $0.endPts, pts: subPts)
+                }) {
                     return (c.image, c.rect)
                 }
                 return (nil, .zero)
@@ -4120,7 +4171,8 @@ public final class NativeBackend: PlayerBackend {
                 } else if codecId == AV_CODEC_ID_ASS || codecId == AV_CODEC_ID_SSA {
                     let r = Self.makeASSRenderer(
                         stream: s,
-                        videoSize: CGSize(width: codedVideoWidth, height: codedVideoHeight)
+                        videoSize: CGSize(width: codedVideoWidth, height: codedVideoHeight),
+                        fontFamily: subtitleFontFamily
                     )
                     assRenderer = r
                     logger.notice("[sub] ASS renderer \(r != nil ? "created" : "unavailable (no extradata)")")
