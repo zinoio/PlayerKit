@@ -102,6 +102,21 @@ public final class Player {
     /// Select a subtitle track, or pass nil to disable subtitles.
     public func selectSubtitle(id: String?)    { backend.selectSubtitle(id: id) }
 
+    /// User-selectable video display geometry (feat/player-reskin, reflux
+    /// #444 P1 — the tuning panel's aspect-ratio presets). Session-level UI
+    /// preference owned by the app; changing it posts
+    /// `.playerKitVideoAspectDidChange` and the mounted PlayerNativeView
+    /// re-layouts on the next pass (instant mid-play, no pipeline rebuild).
+    /// Applies to AVSampleBufferDisplayLayer renderers; Metal renderers
+    /// manage their own content rect.
+    public var videoAspectMode: VideoAspectMode = .source {
+        didSet {
+            guard oldValue != videoAspectMode else { return }
+            NotificationCenter.default.post(name: .playerKitVideoAspectDidChange,
+                                            object: nil)
+        }
+    }
+
     // MARK: - Renderer (requires PlayerBackend)
 
     /// The renderer's Core Animation layer for embedding in a view hierarchy.

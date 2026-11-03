@@ -226,6 +226,28 @@ public final class NativeBackend: PlayerBackend {
         audioUnitOutput?.setDelayTarget(contentSecs: max(0, clamped))
     }
 
+    /// User subtitle delay in CONTENT seconds, signed, ±30 clamp (matches the
+    /// app-side external-subtitle offset range; feat/player-reskin, reflux
+    /// #444 P1). Session-level like `audioDelay`: deliberately NOT part of
+    /// PlayerState — survives play() calls so the panel value stays meaningful
+    /// across episodes; the app resets it when it wants a clean slate.
+    /// Applies to embedded subtitle paths only (text cues, PGS/VOBSUB images,
+    /// ASS typeset) — external subtitle files are offset in the app layer.
+    /// Written on the main actor; the display loop reads `_subtitleDelay`
+    /// through `subtitleDelayLock`, so there is no data race.
+    public private(set) var subtitleDelay: Double = 0
+    private let subtitleDelayLock = NSLock()
+    private nonisolated(unsafe) var _subtitleDelay: Double = 0
+
+    /// Apply a user subtitle delay. d>0 shows embedded subtitles later (cue
+    /// window shifts forward); d<0 earlier. Instant mid-play — the display
+    /// loop picks it up on the next frame, no decoder/track rebuild.
+    public func setSubtitleDelay(_ secs: Double) {
+        let clamped = min(30.0, max(-30.0, secs.isFinite ? secs : 0))
+        subtitleDelay = clamped
+        subtitleDelayLock.withLock { _subtitleDelay = clamped }
+    }
+
     private var demuxer: (any PacketDemuxing)?
     /// VT may fail on extreme-parameter streams (e.g. 4K@120fps).
     /// When that happens the demux loop hot-swaps in a software FFmpegVideoDecoder.
@@ -2871,17 +2893,25 @@ public final class NativeBackend: PlayerBackend {
         // Audio clock can lag behind video (seek, primer, underrun) causing
         // subtitles to appear late when matched against audioTime.
         let displayPts = popped.pts
+        // User subtitle delay (feat/player-reskin, reflux #444 P1): shift the
+        // lookup clock once — text matching, ASS rendering, and PGS matching
+        // below all consume `subPts`, so one definition covers every embedded
+        // subtitle path (external subtitles are offset app-side).
+        let subPts = SubtitleTiming.shifted(
+            displayPts, delay: subtitleDelayLock.withLock { _subtitleDelay })
         let activeSub: String? = subtitleLock.withLock {
-            subtitleCues.first { $0.startPts <= displayPts && displayPts < $0.endPts }?.text
+            subtitleCues.first { SubtitleTiming.contains(startPts: $0.startPts,
+                                                         endPts: $0.endPts,
+                                                         pts: subPts) }?.text
         }
         let assR = self.assRenderer
         let (newImage, newRect): (CGImage?, CGRect)
         if let assR {
-            // ASS typeset rendering against the displayed frame's video PTS.
-            // libass's detect_change keeps the Frame instance stable across
-            // calls without content change, so the identity check below still
-            // suppresses redundant UI hops.
-            if let f = assR.renderFrame(ptsSecs: displayPts) {
+            // ASS typeset rendering against the displayed frame's video PTS
+            // (+ user subtitle delay). libass's detect_change keeps the Frame
+            // instance stable across calls without content change, so the
+            // identity check below still suppresses redundant UI hops.
+            if let f = assR.renderFrame(ptsSecs: subPts) {
                 newImage = f.image
                 newRect = f.rect
             } else {
@@ -2895,7 +2925,10 @@ public final class NativeBackend: PlayerBackend {
                 if subtitleImageCues.count > 4 {
                     subtitleImageCues.removeAll { $0.endPts < displayPts - 1.0 }
                 }
-                if let c = subtitleImageCues.first(where: { $0.startPts <= displayPts && displayPts < $0.endPts }) {
+                if let c = subtitleImageCues.first(where: {
+                    SubtitleTiming.contains(startPts: $0.startPts,
+                                            endPts: $0.endPts, pts: subPts)
+                }) {
                     return (c.image, c.rect)
                 }
                 return (nil, .zero)

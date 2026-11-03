@@ -7,6 +7,7 @@ import AppKit
 @MainActor
 public final class PlayerNativeViewMac: NSView {
     private let player: Player
+    private var aspectToken: NSObjectProtocol?
 
     init(player: Player) {
         self.player = player
@@ -16,6 +17,17 @@ public final class PlayerNativeViewMac: NSView {
         // window chrome instead of showing a bright background peeking through.
         layer?.backgroundColor = NSColor.black.cgColor
         layer?.addSublayer(player.renderLayer ?? CALayer())
+        // Aspect preset switched mid-play (feat/player-reskin, #444 P1):
+        // the layer frame depends on the mode, so re-layout on the next pass.
+        aspectToken = NotificationCenter.default.addObserver(
+            forName: .playerKitVideoAspectDidChange, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.needsLayout = true }
+        }
+    }
+
+    deinit {
+        if let aspectToken { NotificationCenter.default.removeObserver(aspectToken) }
     }
 
     @available(*, unavailable)
@@ -50,9 +62,11 @@ public final class PlayerNativeViewMac: NSView {
             // window aspect), the animation target proportion mismatches the video
             // and the picture visibly stretches for a moment before aspect-fit
             // restores it.
-            frame = videoLayerFrame(in: bounds, videoInfo: player.state.videoInfo)
+            let mode = player.videoAspectMode
+            frame = VideoAspectLayout.frame(in: bounds, videoInfo: player.state.videoInfo,
+                                            mode: mode)
             (target as? AVSampleBufferDisplayLayer)?.videoGravity =
-                (frame == bounds) ? .resizeAspect : .resize
+                VideoAspectLayout.gravity(frame: frame, bounds: bounds, mode: mode)
         } else {
             // Non-ASBDL renderers (e.g. Metal) manage their own content rect.
             // Without this, the CAMetalLayer can end up with a zero or stale frame
@@ -66,20 +80,6 @@ public final class PlayerNativeViewMac: NSView {
         CATransaction.commit()
     }
 
-    private func videoLayerFrame(in bounds: CGRect, videoInfo: VideoInfo?) -> CGRect {
-        guard let info = videoInfo, info.width > 0, info.height > 0 else { return bounds }
-        let aspect = CGFloat(info.width) / CGFloat(info.height)
-        let boundsAspect = bounds.width / bounds.height
-        if aspect > boundsAspect {
-            // Letterbox: black bars top and bottom
-            let h = bounds.width / aspect
-            return CGRect(x: 0, y: (bounds.height - h) / 2, width: bounds.width, height: h)
-        } else {
-            // Pillarbox: black bars left and right
-            let w = bounds.height * aspect
-            return CGRect(x: (bounds.width - w) / 2, y: 0, width: w, height: bounds.height)
-        }
-    }
 }
 
 public struct PlayerNativeView: NSViewRepresentable {
@@ -133,6 +133,10 @@ public final class PlayerNativeViewiOS: UIView {
         lifecycleTokens.append(center.addObserver(
             forName: UIApplication.willEnterForegroundNotification, object: nil, queue: .main
         ) { [weak self] _ in self?.setNeedsLayout() })
+        // Aspect preset switched mid-play (feat/player-reskin, #444 P1).
+        lifecycleTokens.append(center.addObserver(
+            forName: .playerKitVideoAspectDidChange, object: nil, queue: .main
+        ) { [weak self] _ in self?.setNeedsLayout() })
         #endif
     }
 
@@ -169,11 +173,14 @@ public final class PlayerNativeViewiOS: UIView {
         // determined by the content source layer's bounds, not the pixel buffer
         // dimensions — using a full-screen layer causes the PiP window to appear
         // the same size as the portrait device screen.
-        let frame = videoLayerFrame(in: bounds, videoInfo: player.state.videoInfo)
+        let mode = player.videoAspectMode
+        let frame = VideoAspectLayout.frame(in: bounds, videoInfo: player.state.videoInfo,
+                                            mode: mode)
         if let dl = target as? AVSampleBufferDisplayLayer {
             // .resize fills the layer exactly when sized to the video rect;
             // .resizeAspect is used as fallback (before video info is known).
-            dl.videoGravity = (frame == bounds) ? .resizeAspect : .resize
+            dl.videoGravity = VideoAspectLayout.gravity(frame: frame, bounds: bounds,
+                                                        mode: mode)
         }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -181,20 +188,6 @@ public final class PlayerNativeViewiOS: UIView {
         CATransaction.commit()
     }
 
-    private func videoLayerFrame(in bounds: CGRect, videoInfo: VideoInfo?) -> CGRect {
-        guard let info = videoInfo, info.width > 0, info.height > 0 else { return bounds }
-        let aspect = CGFloat(info.width) / CGFloat(info.height)
-        let boundsAspect = bounds.width / bounds.height
-        if aspect > boundsAspect {
-            // Letterbox: black bars top and bottom
-            let h = bounds.width / aspect
-            return CGRect(x: 0, y: (bounds.height - h) / 2, width: bounds.width, height: h)
-        } else {
-            // Pillarbox: black bars left and right
-            let w = bounds.height * aspect
-            return CGRect(x: (bounds.width - w) / 2, y: 0, width: w, height: bounds.height)
-        }
-    }
 }
 
 public struct PlayerNativeView: UIViewRepresentable {
