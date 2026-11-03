@@ -45,10 +45,29 @@ public struct PlayerState: @unchecked Sendable {
     /// Cache download speed in bytes/second.
     public var cacheSpeed:     Int64       = 0
     /// Cumulative count of decoded video frames dropped before render
-    /// (late frames drained + sync-rejected), refreshed periodically by the backend.
+    /// (frames that fell behind audio and were drained), refreshed periodically
+    /// by the backend. "Not due yet" sync denials are retries, not drops.
     public var droppedVideoFrames: Int64 = 0
+    /// Frames dropped since the last diagnostics publish (~5s window).
+    public var recentDroppedVideoFrames: Int64 = 0
+    /// Drop rate over that publish window, in frames/second.
+    public var droppedVideoFramesPerSecond: Double = 0
+    /// Active video decode path, nil until a decoder is created or when the
+    /// native Dolby Vision system path bypasses the decoder (P1 diagnostics).
+    public var videoDecoderPath: VideoDecoderPath? = nil
+    /// True when `videoInfo.bitrate` was filled by the demux EMA because the
+    /// container did not declare a stream bitrate (P1 diagnostics).
+    public var videoBitrateIsEstimated: Bool = false
 
     public init() {}
+}
+
+/// How video frames are currently being decoded (P1 diagnostics).
+public enum VideoDecoderPath: String, Sendable {
+    /// VideoToolbox hardware decoding (VTVideoDecoder or FFmpeg's VT path).
+    case videoToolbox
+    /// FFmpeg software decoding (including the VT→SW fallback).
+    case ffmpegSoftware
 }
 
 /// Metadata for a single audio or subtitle track.
