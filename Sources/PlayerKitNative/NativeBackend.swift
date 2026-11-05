@@ -3128,14 +3128,14 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
 
         // 4.5 首帧呈现时刻探针(phase-3 spike):区分"慢"与"永不呈现"。
         if systemDVStarted, renderer.hasPresentedFirstFrame,
-           systemDVFirstPresentLoggedWall != systemDVStartWall {
-            systemDVFirstPresentLoggedWall = systemDVStartWall
-            logger.notice("[dovi-sys] first frame PRESENTED after \(String(format: "%.2f", CACurrentMediaTime() - systemDVStartWall), privacy: .public)s")
+           self.systemDVFirstPresentLoggedWall != self.systemDVStartWall {
+            self.systemDVFirstPresentLoggedWall = self.systemDVStartWall
+            logger.notice("[dovi-sys] first frame PRESENTED after \(String(format: "%.2f", CACurrentMediaTime() - self.systemDVStartWall), privacy: .public)s")
         }
         // 5. 首帧超时回退(测试可缩短超时)
         if systemDVStarted, !renderer.hasPresentedFirstFrame,
            CACurrentMediaTime() - systemDVStartWall > systemDVFirstFrameTimeout {
-            logger.notice("[dovi-sys] first frame TIMEOUT after \(String(format: "%.1f", CACurrentMediaTime() - systemDVStartWall), privacy: .public)s — falling back")
+            logger.notice("[dovi-sys] first frame TIMEOUT after \(String(format: "%.1f", CACurrentMediaTime() - self.systemDVStartWall), privacy: .public)s — falling back")
             fallbackToSoftwareDV(reason: "first frame timeout")
         }
     }
