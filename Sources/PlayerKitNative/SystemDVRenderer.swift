@@ -77,7 +77,10 @@ class SystemDVRenderer {
             }
 #if os(iOS) || os(tvOS)
             if #available(iOS 26.0, tvOS 26.0, *) {
-                logger.notice("[dovi-sys] layer frame=\(displayLayer.frame, privacy: .public) bounds=\(displayLayer.bounds, privacy: .public) pDR=.high superlayer=\(displayLayer.superlayer != nil, privacy: .public)")
+                let f = displayLayer.frame
+                let b = displayLayer.bounds
+                let geo = "(\(f.origin.x),\(f.origin.y)) \(f.size.width)x\(f.size.height) bounds \(b.width)x\(b.height)"
+                logger.notice("[dovi-sys] layer \(geo, privacy: .public) pDR=.high superlayer=\(displayLayer.superlayer != nil, privacy: .public)")
             }
 #endif
             CMTimebaseSetTime(tb, time: CMTime(seconds: pts, preferredTimescale: 90_000))
