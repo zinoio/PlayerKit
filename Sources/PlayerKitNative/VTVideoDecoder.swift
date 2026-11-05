@@ -398,7 +398,7 @@ final class VTVideoDecoder {
         // trigger session recreation, not count toward fallback heuristic.
         if decodeStatus != noErr {
             if Self.isTransientError(decodeStatus) {
-                logger.warning("VT transient error \(decodeStatus) — recreating session")
+                logger.warning("VT transient error \(decodeStatus, privacy: .public) — recreating session")
                 transientErrorCount += 1
                 if transientErrorCount <= maxTransientRetries {
                     recreateSession()
@@ -607,7 +607,7 @@ final class VTVideoDecoder {
                 }
             }
         }
-        if status != noErr { logger.error("HEVCFormatDesc failed: \(status)") }
+        if status != noErr { logger.error("HEVCFormatDesc failed: \(status, privacy: .public)") }
         return status == noErr ? desc : nil
     }
 
@@ -744,7 +744,7 @@ final class VTVideoDecoder {
                 if i > 0 { logger.info("8-bit fallback OK") }
                 return session
             }
-            logger.error("session create failed (fmt=\(fmt)): \(status)")
+            logger.error("session create failed (fmt=\(fmt, privacy: .public)): \(status, privacy: .public)")
         }
         return nil
     }

@@ -1935,6 +1935,11 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
                        let vs = demuxer.videoStream,
                        let sw = FFmpegVideoDecoder(stream: vs, forceSoftware: true, colorParams: colorParams) {
                         logger.notice("VT→SW fallback: \(sw.width)x\(sw.height) — HW decoder failed, using FFmpeg SW")
+                        // [vt-probe] 台账(#466 VT 设计稿第一段):回退瞬间把流形态
+                        // 一次打全(HEVC/H264、10-bit 请求、codecpar side data 清单),
+                        // 与已 public 化的逐帧 OSStatus 配合,真机一轮即可定位根因。
+                        let vtCodecID = vs.pointee.codecpar.pointee.codec_id
+                        logger.notice("[vt-probe] codec=\(vtCodecID == AV_CODEC_ID_H264 ? "h264" : (vtCodecID == AV_CODEC_ID_HEVC ? "hevc" : "other"), privacy: .public) is10Bit=\(vt.is10Bit, privacy: .public) sideData=\(demuxer.sideDataTypesDescription, privacy: .public)")
                         self.videoDecoder = sw
                         self.state.videoDecoderPath = .ffmpegSoftware
                     }
