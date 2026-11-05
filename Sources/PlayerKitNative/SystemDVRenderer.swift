@@ -84,7 +84,7 @@ class SystemDVRenderer {
             // 需要 EDR opt-in 才按 HDR/DV 合成;macOS 无此要求(红线:不动)。
             // 停止时还原 .standard,软路径行为保持现状。
 #if os(iOS) || os(tvOS)
-            if #available(iOS 18.0, tvOS 18.0, *) {
+            if #available(iOS 26.0, tvOS 26.0, *) {
                 displayLayer.preferredDynamicRange = .high
             }
 #endif
@@ -161,7 +161,7 @@ class SystemDVRenderer {
             sampleRenderer.flush(removingDisplayedImage: true)
             displayLayer.controlTimebase = nil
 #if os(iOS) || os(tvOS)
-            if #available(iOS 18.0, tvOS 18.0, *) {
+            if #available(iOS 26.0, tvOS 26.0, *) {
                 displayLayer.preferredDynamicRange = .standard
             }
 #endif
