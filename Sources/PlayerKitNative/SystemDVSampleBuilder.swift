@@ -32,11 +32,16 @@ final class SystemDVSampleBuilder {
     ///   - dovi: demuxer's parsed DV configuration record.
     /// Returns nil when the system path can't be set up (no usable hvcC, or
     /// CoreMedia rejects the format description) → strategy falls back.
-    init?(stream: UnsafeMutablePointer<AVStream>, dovi: AVDOVIDecoderConfigurationRecord) {
+        /// round-7 A/B:忽略 DV 声明(纯 HDR10 HEVC 直通)。默认 **true**(本轮
+    /// spike 包即测无声明态;DV 声明态已证明全屏黑)。UserDefaults
+    /// `dvSystemOmitDVDeclaration` 可显式覆盖(false=带 DV 声明)。
+    init?(stream: UnsafeMutablePointer<AVStream>, dovi: AVDOVIDecoderConfigurationRecord,
+          omitDVDeclaration: Bool = UserDefaults.standard.object(forKey: "dvSystemOmitDVDeclaration") as? Bool ?? true) {
         let cp = stream.pointee.codecpar.pointee
         guard let hvcC = VTVideoDecoder.realExtradata(cp),
               let fd = SystemDVFormatDescription.make(
-                  hvcC: hvcC, width: cp.width, height: cp.height, dovi: dovi)
+                  hvcC: hvcC, width: cp.width, height: cp.height, dovi: dovi,
+                  omitDVDeclaration: omitDVDeclaration)
         else {
             logger.error("system DV sample builder init failed: no hvcC or FD rejected")
             return nil
