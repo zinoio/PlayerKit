@@ -1207,6 +1207,9 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
                 systemDolbyVision: systemDV,
                 dolbyVisionOutput: dolbyVisionOutput
             )
+            // phase-3 spike(zinoio/zinora#390):开舞台账——每个资格条件逐项落日志,
+            // 一眼定位"没走系统路径"是哪一环(此前只能从 [dovi-sys] 缺席反推)。
+            logger.notice("[dovi-open] pref=\(dolbyVisionOutput == .system ? "system" : "software", privacy: .public) doviEnabled=\(doviEnabled) sysDV=\(systemDV.isAvailable) EDR=\(displayCapability.supportsEDR) pro10bit=\(_renderer.prefersTenBit) disabled4Session=\(systemDVDisabledForSession) stream=P\(attrs.doviProfile)/c\(attrs.blSignalCompatibilityId) dv=\(attrs.isDolbyVision) → \(String(describing: strat), privacy: .public)")
             renderConfigLock.withLock { self.rendererStrategy = strat }
 
             // Stream-aware tone-mapper injection (see `toneMapperProvider`).
