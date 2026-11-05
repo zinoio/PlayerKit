@@ -149,8 +149,10 @@ if __name__ == "__main__":
                     help="DV profile(默认 8;P5 语料用 5)")
     ap.add_argument("--compat", type=int, default=DEFAULTS["compat"],
                     help="bl_signal_compatibility_id(默认 1;P5 用 0)")
+    ap.add_argument("--level", type=int, default=DEFAULTS["level"],
+                    help="dv_level(默认 0;iOS 系统解码器疑拒 level=0,真机用 1)")
     args = ap.parse_args()
     payload = DVCC_PAYLOAD
-    if (args.profile, args.compat) != (DEFAULTS["profile"], DEFAULTS["compat"]):
-        payload = dvcc_payload_for(profile=args.profile, compat=args.compat)
+    if (args.profile, args.level, args.compat) != (DEFAULTS["profile"], DEFAULTS["level"], DEFAULTS["compat"]):
+        payload = dvcc_payload_for(profile=args.profile, level=args.level, compat=args.compat)
     main(args.video, payload)
