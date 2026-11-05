@@ -173,13 +173,10 @@ final class SystemDVStrategyTests: XCTestCase {
 
     // MARK: - 能力探测与放行集合
 
+    /// phase 3(2026-11-05):probe 三平台统一跟随显示 EDR 快照,不再有平台分支。
     func testCapabilityProbeFollowsDisplayEDR() {
-        #if os(macOS)
         XCTAssertTrue(SystemDVCapability.probe(display: .macEDR).isAvailable)
         XCTAssertFalse(SystemDVCapability.probe(display: .macSDR).isAvailable)
-        #else
-        XCTAssertEqual(SystemDVCapability.probe(display: .macEDR), .unavailable)
-        #endif
         XCTAssertEqual(SystemDVCapability.unavailable.isAvailable, false)
     }
 
