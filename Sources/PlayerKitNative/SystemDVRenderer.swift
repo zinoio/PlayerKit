@@ -33,6 +33,7 @@ class SystemDVRenderer {
     private let queue = DispatchQueue(label: "io.zyno.PlayerKit.dovi.system.renderer")
 
     private var pendingSamples: [CMSampleBuffer] = []
+    private var enqueuedCount = 0
     private var pendingDuration: Double = 0
     private var timebase: CMTimebase?
     private var lastEnqueuedPts: Double?
@@ -234,6 +235,19 @@ class SystemDVRenderer {
         }
     }
 
+    /// spike 探针(#466 round-6 实验 3):层状态/错误/入队-待发计数快照。
+    /// 全部先落局部字符串再拼,规避 os_log 插值对属性捕获的 iOS 26 SDK 检查。
+    func probeSnapshot() -> String {
+        queue.sync {
+            let st = displayLayer.status.rawValue
+            let err = displayLayer.error.map { String(describing: $0) } ?? "-"
+            let rerr = sampleRenderer.error.map { String(describing: $0) } ?? "-"
+            let f = displayLayer.frame
+            let geo = "(\(Int(f.origin.x)),\(Int(f.origin.y))) \(Int(f.size.width))x\(Int(f.size.height))"
+            return "status=\(st) pending=\(pendingSamples.count) enqueued=\(enqueuedCount) frame=\(geo) layerErr=\(err) rendererErr=\(rerr)"
+        }
+    }
+
     /// Called by the layer whenever it can accept more data.
     private func supplyMediaData() {
         // queue-confined
@@ -251,6 +265,7 @@ class SystemDVRenderer {
                 if pendingDuration < 0 { pendingDuration = 0 }
             }
             sampleRenderer.enqueue(sample)
+            enqueuedCount += 1
             lastEnqueuedPts = CMTimeGetSeconds(
                 CMSampleBufferGetPresentationTimeStamp(sample))
         }
