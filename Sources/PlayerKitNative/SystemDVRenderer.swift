@@ -75,6 +75,11 @@ class SystemDVRenderer {
                 logger.error("CMTimebaseCreateWithSourceClock failed")
                 return
             }
+#if os(iOS) || os(tvOS)
+            if #available(iOS 26.0, tvOS 26.0, *) {
+                logger.notice("[dovi-sys] layer frame=\(NSStringFromCGRect(displayLayer.frame), privacy: .public) bounds=\(NSStringFromCGRect(displayLayer.bounds), privacy: .public) pDR=.high superlayer=\(displayLayer.superlayer != nil, privacy: .public)")
+            }
+#endif
             CMTimebaseSetTime(tb, time: CMTime(seconds: pts, preferredTimescale: 90_000))
             CMTimebaseSetRate(tb, rate: Double(rate))
             displayLayer.controlTimebase = tb

@@ -130,8 +130,18 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
     private nonisolated(unsafe) var systemDVFirstSamplePts: Double = .nan
     private nonisolated(unsafe) var systemDVStarted = false
     private nonisolated(unsafe) var systemDVStartWall: Double = 0
-    /// 系统路径首帧超时(秒,design §6.2 默认 3s);测试可缩短。
-    nonisolated(unsafe) var systemDVFirstFrameTimeout: Double = 3.0
+    /// spike 探针:本会话首帧呈现日志去重(systemDVStartWall 作会话指纹)。
+    private nonisolated(unsafe) var systemDVFirstPresentLoggedWall: Double = .nan
+    /// 系统路径首帧超时(秒,design §6.2 默认 macOS 3s);测试可缩短。
+    /// phase-3 spike(2026-11-05):iOS 冷启动首帧显著偏慢(真机观测 5-18s
+    /// 不等),3s 常在呈现发生前就回退——放宽到 10s 以区分"慢"与"永不呈现"。
+    nonisolated(unsafe) var systemDVFirstFrameTimeout: Double = {
+#if os(iOS) || os(tvOS)
+        return 10.0
+#else
+        return 3.0
+#endif
+    }()
     /// 测试钩子:替换 SystemDVRenderer 的构造(注入假 renderer / 失败钩子)。
     nonisolated(unsafe) var systemDVRendererFactory: ((AVSampleBufferDisplayLayer) -> SystemDVRenderer?)?
     /// fallback 串行化(demux 线程 onFailure / 显示线程超时都可能触发)。
@@ -3116,9 +3126,16 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
                                                generation: playGeneration, notify: true))
         }
 
+        // 4.5 首帧呈现时刻探针(phase-3 spike):区分"慢"与"永不呈现"。
+        if systemDVStarted, renderer.hasPresentedFirstFrame,
+           systemDVFirstPresentLoggedWall != systemDVStartWall {
+            systemDVFirstPresentLoggedWall = systemDVStartWall
+            logger.notice("[dovi-sys] first frame PRESENTED after \(String(format: "%.2f", CACurrentMediaTime() - systemDVStartWall), privacy: .public)s")
+        }
         // 5. 首帧超时回退(测试可缩短超时)
         if systemDVStarted, !renderer.hasPresentedFirstFrame,
            CACurrentMediaTime() - systemDVStartWall > systemDVFirstFrameTimeout {
+            logger.notice("[dovi-sys] first frame TIMEOUT after \(String(format: "%.1f", CACurrentMediaTime() - systemDVStartWall), privacy: .public)s — falling back")
             fallbackToSoftwareDV(reason: "first frame timeout")
         }
     }
