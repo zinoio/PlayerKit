@@ -132,6 +132,11 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
     private nonisolated(unsafe) var systemDVStartWall: Double = 0
     /// spike 探针:本会话首帧呈现日志去重(systemDVStartWall 作会话指纹)。
     private nonisolated(unsafe) var systemDVFirstPresentLoggedWall: Double = .nan
+    /// 首帧超时的计时锚:起步时 = systemDVStartWall;此后每当层处于已呈现态
+    /// 就前移。flush/seek 复位呈现标志后,超时从"最后一次呈现"重新起算——
+    /// 否则会话 10s 后的任何层复位都会被旧计时立即误判超时(2026-11-05 真机:
+    /// 0.05s 呈现成功 → 3.9s 音频钟跳变层复位 → 10.0s 旧计时误回退)。
+    private nonisolated(unsafe) var systemDVLastPresentOrStartWall: Double = 0
     /// 系统路径首帧超时(秒,design §6.2 默认 macOS 3s);测试可缩短。
     /// phase-3 spike(2026-11-05):iOS 冷启动首帧显著偏慢(真机观测 5-18s
     /// 不等),3s 常在呈现发生前就回退——放宽到 10s 以区分"慢"与"永不呈现"。
@@ -1976,6 +1981,7 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
                                 systemDVFirstSamplePts = pts
                                 systemDVStarted = true
                                 systemDVStartWall = CACurrentMediaTime()
+                                systemDVLastPresentOrStartWall = systemDVStartWall
                                 let r = displayLoopLock.withLock { self.displayRate }
                                 renderer.start(at: pts, rate: Float(r))
                                 logger.info("[dovi-sys] timebase start at \(String(format: "%.3f", pts), privacy: .public)s")
@@ -3074,6 +3080,7 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
            renderer.pendingSampleCount > 0 || renderer.bufferedSeconds > 0 {
             systemDVStarted = true
             systemDVStartWall = CACurrentMediaTime()
+            systemDVLastPresentOrStartWall = systemDVStartWall
             let rate = displayLoopLock.withLock { displayRate }
             renderer.start(at: self.systemDVFirstSamplePts, rate: Float(rate))
             logger.info("[dovi-sys] timebase start at \(String(format: "%.3f", self.systemDVFirstSamplePts), privacy: .public)s")
@@ -3132,11 +3139,16 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
             self.systemDVFirstPresentLoggedWall = self.systemDVStartWall
             logger.notice("[dovi-sys] first frame PRESENTED after \(String(format: "%.2f", CACurrentMediaTime() - self.systemDVStartWall), privacy: .public)s")
         }
-        // 5. 首帧超时回退(测试可缩短超时)
-        if systemDVStarted, !renderer.hasPresentedFirstFrame,
-           CACurrentMediaTime() - systemDVStartWall > systemDVFirstFrameTimeout {
-            logger.notice("[dovi-sys] first frame TIMEOUT after \(String(format: "%.1f", CACurrentMediaTime() - self.systemDVStartWall), privacy: .public)s — falling back")
-            fallbackToSoftwareDV(reason: "first frame timeout")
+        // 5. 首帧/再呈现超时回退(测试可缩短超时)。呈现态持续刷新计时锚:
+        // flush/seek 复位呈现标志后,超时从最后一次呈现重新起算(见字段注释)。
+        if systemDVStarted {
+            let nowWall = CACurrentMediaTime()
+            if renderer.hasPresentedFirstFrame {
+                systemDVLastPresentOrStartWall = nowWall
+            } else if nowWall - systemDVLastPresentOrStartWall > systemDVFirstFrameTimeout {
+                logger.notice("[dovi-sys] first frame TIMEOUT after \(String(format: "%.1f", nowWall - self.systemDVLastPresentOrStartWall), privacy: .public)s without presentation — falling back")
+                fallbackToSoftwareDV(reason: "first frame timeout")
+            }
         }
     }
 
