@@ -53,10 +53,16 @@ public enum SystemDVPolicy {
 /// system path. Constructed by `NativeBackend` at open time (and refreshed on
 /// display-configuration changes) and passed into `decideRendererStrategy`.
 ///
-/// v1 is macOS-only (design §8 phase 3): iOS/tvOS return `.unavailable` until
-/// each platform passes its own on-device spike. Non-EDR displays are
-/// conservative — unknown system behavior on SDR panels, so the software path
-/// keeps handling DV there (design V2).
+/// phase 3 (design §8, 2026-11-05 spike): iOS/tvOS join macOS — the probe now
+/// follows the display EDR snapshot on all three platforms. The on-device
+/// validation runs under the spike criteria in reflux `Docs/dolby-testing.md`
+/// (§ spike, zinoio/zinora#390). Failure stays safe by construction: if the
+/// iOS/tvOS system decoder refuses the `dvh1` declaration, the existing
+/// first-frame timeout / `fallbackToSoftwareDV` returns to the software path
+/// (once per session, position preserved). Non-EDR displays remain
+/// conservative — unknown system behavior on SDR panels (design V2). Device
+/// qualification beyond EDR (`AVPlayer.availableHDRModes` etc.) is planned as
+/// a follow-up tightening once the spike lands (reflux PR #466, design §3b).
 public struct SystemDVCapability: Sendable, Equatable {
 
     public var isAvailable: Bool
@@ -70,15 +76,13 @@ public struct SystemDVCapability: Sendable, Equatable {
     /// call site on the software path.
     public static let unavailable = SystemDVCapability(isAvailable: false)
 
-    /// Probe from a display capability snapshot. macOS only; EDR-capable
-    /// displays qualify. Note (design §5.4): the result must be re-derived when
-    /// the display configuration changes — the existing display-change
-    /// notification flow handles that, no extra observer here.
+    /// Probe from a display capability snapshot. EDR-capable displays qualify
+    /// on all platforms (macOS since v1; iOS/tvOS since the phase-3 spike).
+    /// Note (design §5.4): the result must be re-derived when the display
+    /// configuration changes — the display-change notification flow (macOS) or
+    /// the app-side foreground/screen observers (iOS/tvOS) handle that, no
+    /// extra observer here.
     public static func probe(display: DisplayCapability) -> SystemDVCapability {
-#if os(macOS)
         return SystemDVCapability(isAvailable: display.supportsEDR)
-#else
-        return .unavailable
-#endif
     }
 }

@@ -1207,6 +1207,11 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
                 systemDolbyVision: systemDV,
                 dolbyVisionOutput: dolbyVisionOutput
             )
+            // phase-3 spike(zinoio/zinora#390):开舞台账——每个资格条件逐项落日志,
+            // 一眼定位"没走系统路径"是哪一环(此前只能从 [dovi-sys] 缺席反推)。
+            let doviOpenPref = dolbyVisionOutput == .system ? "system" : "software"
+            let doviOpenLine = "[dovi-open] pref=\(doviOpenPref) doviEnabled=\(doviEnabled) sysDV=\(systemDV.isAvailable) EDR=\(displayCapability.supportsEDR) pro10bit=\(_renderer.prefersTenBit) disabled4Session=\(systemDVDisabledForSession) stream=P\(attrs.doviProfile)/c\(attrs.blSignalCompatibilityId) dv=\(attrs.isDolbyVision) -> \(String(describing: strat))"
+            logger.notice("\(doviOpenLine, privacy: .public)")
             renderConfigLock.withLock { self.rendererStrategy = strat }
 
             // Stream-aware tone-mapper injection (see `toneMapperProvider`).
@@ -1397,8 +1402,14 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
             // P1 diagnostics: a declared stream bitrate is authoritative; the
             // EMA fallback below flips this to true only when it fills the gap.
             state.videoBitrateIsEstimated = false
+            // phase-3 spike(zinoio/zinora#390):解析结果以 notice 级显式落日志——
+            // 此前的 info 级在设备日志采集中不稳定,真机"名字带 DV 的片被识别成
+            // HDR"无法定位是文件无声明还是链路缺口。side data 清单同时回答
+            // "容器到底产出了什么"(matroska 应给 DOVI_CONF;缺失 = 文件无声明)。
             if demuxer.isDolbyVision {
-                logger.info("Dolby Vision detected")
+                logger.notice("[dovi-probe] DOVI_CONF present: profile=\(demuxer.doviProfile) blCompatId=\(demuxer.doviBLSignalCompatibilityId) isHDR=\(isHDR, privacy: .public)")
+            } else {
+                logger.notice("[dovi-probe] no DOVI_CONF from demuxer (side data: \(demuxer.sideDataTypesDescription, privacy: .public)) isHDR=\(isHDR, privacy: .public)")
             }
         }
 
