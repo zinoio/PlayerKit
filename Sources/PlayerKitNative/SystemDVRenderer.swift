@@ -78,6 +78,16 @@ class SystemDVRenderer {
             CMTimebaseSetTime(tb, time: CMTime(seconds: pts, preferredTimescale: 90_000))
             CMTimebaseSetRate(tb, rate: Double(rate))
             displayLayer.controlTimebase = tb
+            // phase-3 spike 真机发现(2026-11-05,zinoio/zinora#390):iOS 上压缩
+            // 直通全链路启动正常(策略选中、样本入队、音频时钟校准),但 layer 不
+            // 呈现首帧(黑屏 → 3s 超时回软)。iOS 18+ 的 AVSampleBufferDisplayLayer
+            // 需要 EDR opt-in 才按 HDR/DV 合成;macOS 无此要求(红线:不动)。
+            // 停止时还原 .standard,软路径行为保持现状。
+#if os(iOS) || os(tvOS)
+            if #available(iOS 18.0, tvOS 18.0, *) {
+                displayLayer.preferredDynamicRange = .high
+            }
+#endif
             self.timebase = tb
             beginRequestIfNeededLocked()
         }
@@ -150,6 +160,11 @@ class SystemDVRenderer {
             sampleRenderer.stopRequestingMediaData()
             sampleRenderer.flush(removingDisplayedImage: true)
             displayLayer.controlTimebase = nil
+#if os(iOS) || os(tvOS)
+            if #available(iOS 18.0, tvOS 18.0, *) {
+                displayLayer.preferredDynamicRange = .standard
+            }
+#endif
             timebase = nil
             pendingSamples.removeAll()
             pendingDuration = 0
