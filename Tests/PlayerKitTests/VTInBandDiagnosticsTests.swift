@@ -92,7 +92,12 @@ final class VTInBandDiagnosticsTests: XCTestCase {
 
         var pkt: UnsafeMutablePointer<AVPacket>? = av_packet_alloc()
         defer { av_packet_free(&pkt) }
-        for i in 1...40 {
+        // 2026-11-07 stability fix: the zero-output fast path now recreates
+        // the VT session once and resets counters before declaring a
+        // permanent SW fallback (30 real errors → retry window → fallback).
+        // It must NOT fire inside the first window, and must stick by the
+        // end of the retry window.
+        for i in 1...70 {
             XCTAssertEqual(av_new_packet(pkt, 512), 0)
             if let data = pkt!.pointee.data {
                 for b in 0..<512 { data[b] = 0xA5 }  // no start codes, no NALU framing
@@ -101,9 +106,13 @@ final class VTInBandDiagnosticsTests: XCTestCase {
             pkt!.pointee.dts = Int64(i)
             _ = dec.decode(packet: pkt!)
             av_packet_unref(pkt)
-            if i >= 30 && dec.needsSoftwareFallback { return }  // fired in time
+            if i < 30 {
+                XCTAssertFalse(dec.needsSoftwareFallback,
+                               "must not fall back inside the first zero-output window (attempt \(i))")
+            }
+            if i > 30 && dec.needsSoftwareFallback { return }  // fired after retry window
         }
-        XCTFail("zero-output fast fallback must fire by attempt 30")
+        XCTFail("zero-output fast fallback must fire after one session-recreate retry window")
     }
 
     /// zyno#107: AV1 is probe-gated. On devices with AV1 hardware decode
