@@ -130,8 +130,25 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
     private nonisolated(unsafe) var systemDVFirstSamplePts: Double = .nan
     private nonisolated(unsafe) var systemDVStarted = false
     private nonisolated(unsafe) var systemDVStartWall: Double = 0
-    /// 系统路径首帧超时(秒,design §6.2 默认 3s);测试可缩短。
-    nonisolated(unsafe) var systemDVFirstFrameTimeout: Double = 3.0
+    /// spike 探针:本会话首帧呈现日志去重(systemDVStartWall 作会话指纹)。
+    private nonisolated(unsafe) var systemDVFirstPresentLoggedWall: Double = .nan
+    /// 首帧超时的计时锚:起步时 = systemDVStartWall;此后每当层处于已呈现态
+    /// 就前移。flush/seek 复位呈现标志后,超时从"最后一次呈现"重新起算——
+    /// 否则会话 10s 后的任何层复位都会被旧计时立即误判超时(2026-11-05 真机:
+    /// 0.05s 呈现成功 → 3.9s 音频钟跳变层复位 → 10.0s 旧计时误回退)。
+    private nonisolated(unsafe) var systemDVLastPresentOrStartWall: Double = 0
+    /// spike 探针节流:层状态快照上次打点时刻。
+    private nonisolated(unsafe) var systemDVLastProbeWall: Double = 0
+    /// 系统路径首帧超时(秒,design §6.2 默认 macOS 3s);测试可缩短。
+    /// phase-3 spike(2026-11-05):iOS 冷启动首帧显著偏慢(真机观测 5-18s
+    /// 不等),3s 常在呈现发生前就回退——放宽到 10s 以区分"慢"与"永不呈现"。
+    nonisolated(unsafe) var systemDVFirstFrameTimeout: Double = {
+#if os(iOS) || os(tvOS)
+        return 10.0
+#else
+        return 3.0
+#endif
+    }()
     /// 测试钩子:替换 SystemDVRenderer 的构造(注入假 renderer / 失败钩子)。
     nonisolated(unsafe) var systemDVRendererFactory: ((AVSampleBufferDisplayLayer) -> SystemDVRenderer?)?
     /// fallback 串行化(demux 线程 onFailure / 显示线程超时都可能触发)。
@@ -1971,6 +1988,7 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
                                 systemDVFirstSamplePts = pts
                                 systemDVStarted = true
                                 systemDVStartWall = CACurrentMediaTime()
+                                systemDVLastPresentOrStartWall = systemDVStartWall
                                 let r = displayLoopLock.withLock { self.displayRate }
                                 renderer.start(at: pts, rate: Float(r))
                                 logger.info("[dovi-sys] timebase start at \(String(format: "%.3f", pts), privacy: .public)s")
@@ -3069,6 +3087,7 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
            renderer.pendingSampleCount > 0 || renderer.bufferedSeconds > 0 {
             systemDVStarted = true
             systemDVStartWall = CACurrentMediaTime()
+            systemDVLastPresentOrStartWall = systemDVStartWall
             let rate = displayLoopLock.withLock { displayRate }
             renderer.start(at: self.systemDVFirstSamplePts, rate: Float(rate))
             logger.info("[dovi-sys] timebase start at \(String(format: "%.3f", self.systemDVFirstSamplePts), privacy: .public)s")
@@ -3121,10 +3140,29 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
                                                generation: playGeneration, notify: true))
         }
 
-        // 5. 首帧超时回退(测试可缩短超时)
-        if systemDVStarted, !renderer.hasPresentedFirstFrame,
-           CACurrentMediaTime() - systemDVStartWall > systemDVFirstFrameTimeout {
-            fallbackToSoftwareDV(reason: "first frame timeout")
+        // 4.4 层状态探针(每 5s,#466 round-6 实验 3):status/错误/入队-待发
+        // 计数——"层收样本报就绪但全屏合成黑"的定性数据。
+        if systemDVStarted, CACurrentMediaTime() - self.systemDVLastProbeWall > 5.0 {
+            self.systemDVLastProbeWall = CACurrentMediaTime()
+            let snap = renderer.probeSnapshot()
+            logger.notice("[dovi-sys] probe \(snap, privacy: .public)")
+        }
+        // 4.5 首帧呈现时刻探针(phase-3 spike):区分"慢"与"永不呈现"。
+        if systemDVStarted, renderer.hasPresentedFirstFrame,
+           self.systemDVFirstPresentLoggedWall != self.systemDVStartWall {
+            self.systemDVFirstPresentLoggedWall = self.systemDVStartWall
+            logger.notice("[dovi-sys] first frame PRESENTED after \(String(format: "%.2f", CACurrentMediaTime() - self.systemDVStartWall), privacy: .public)s")
+        }
+        // 5. 首帧/再呈现超时回退(测试可缩短超时)。呈现态持续刷新计时锚:
+        // flush/seek 复位呈现标志后,超时从最后一次呈现重新起算(见字段注释)。
+        if systemDVStarted {
+            let nowWall = CACurrentMediaTime()
+            if renderer.hasPresentedFirstFrame {
+                systemDVLastPresentOrStartWall = nowWall
+            } else if nowWall - systemDVLastPresentOrStartWall > systemDVFirstFrameTimeout {
+                logger.notice("[dovi-sys] first frame TIMEOUT after \(String(format: "%.1f", nowWall - self.systemDVLastPresentOrStartWall), privacy: .public)s without presentation — falling back")
+                fallbackToSoftwareDV(reason: "first frame timeout")
+            }
         }
     }
 

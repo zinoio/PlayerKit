@@ -50,13 +50,19 @@ enum SystemDVFormatDescription {
     /// the DV config atom via `SampleDescriptionExtensionAtoms`.
     /// Returns nil when CoreMedia rejects the construction — callers treat nil
     /// as "system path unavailable, fall back to software".
+    /// round-7 A/B 实验(#466):`omitDVDeclaration` = true 时不写入 dvcC/dvvC
+    /// 原子(纯 HDR10 HEVC 声明)——区分"压缩直通本身黑"vs"DV 声明致黑"。
+    /// UserDefaults `dvSystemOmitDVDeclaration`,DEBUG spike 专用。
     static func make(hvcC: [UInt8], width: Int32, height: Int32,
-                     dovi: AVDOVIDecoderConfigurationRecord) -> CMVideoFormatDescription? {
+                     dovi: AVDOVIDecoderConfigurationRecord,
+                     omitDVDeclaration: Bool = false) -> CMVideoFormatDescription? {
         let (dvType, dvPayload) = configBox(dovi)
-        let atoms: [String: Any] = [
+        var atoms: [String: Any] = [
             "hvcC": Data(hvcC),
-            dvType: dvPayload,
         ]
+        if !omitDVDeclaration {
+            atoms[dvType] = dvPayload
+        }
         let ext: [String: Any] = [
             kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms as String: atoms
         ]
@@ -71,7 +77,7 @@ enum SystemDVFormatDescription {
             logger.error("dvh1 format description create failed: \(status)")
             return nil
         }
-        logger.info("dvh1 FD created: \(dvType) profile=\(dovi.dv_profile) compat=\(dovi.dv_bl_signal_compatibility_id)")
+        logger.notice("dvh1 FD created: dvAtom=\(omitDVDeclaration ? "OMITTED(AB)" : dvType, privacy: .public) profile=\(dovi.dv_profile) compat=\(dovi.dv_bl_signal_compatibility_id)")
         return desc
     }
 }

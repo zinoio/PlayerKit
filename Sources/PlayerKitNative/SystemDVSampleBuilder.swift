@@ -32,11 +32,18 @@ final class SystemDVSampleBuilder {
     ///   - dovi: demuxer's parsed DV configuration record.
     /// Returns nil when the system path can't be set up (no usable hvcC, or
     /// CoreMedia rejects the format description) → strategy falls back.
-    init?(stream: UnsafeMutablePointer<AVStream>, dovi: AVDOVIDecoderConfigurationRecord) {
+        /// round-7 A/B 开关(实验完成,默认 false=带 DV 声明,语义与 v1 一致)。
+    /// A/B 结论(2026-11-06 真机):iOS 全屏 in-app 对压缩直通**无论声明与否
+    /// 均合成黑帧**(status=rendering/零错误/层就绪/PiP 有画面)——压缩直通
+    /// 路线在 iOS 不可行,唯一 in-app 路线 = 解码帧+RPU 附件(route b,依赖
+    /// VT HEVC 硬解修复为前置)。macOS/tvOS 不受影响。
+    init?(stream: UnsafeMutablePointer<AVStream>, dovi: AVDOVIDecoderConfigurationRecord,
+          omitDVDeclaration: Bool = UserDefaults.standard.object(forKey: "dvSystemOmitDVDeclaration") as? Bool ?? false) {
         let cp = stream.pointee.codecpar.pointee
         guard let hvcC = VTVideoDecoder.realExtradata(cp),
               let fd = SystemDVFormatDescription.make(
-                  hvcC: hvcC, width: cp.width, height: cp.height, dovi: dovi)
+                  hvcC: hvcC, width: cp.width, height: cp.height, dovi: dovi,
+                  omitDVDeclaration: omitDVDeclaration)
         else {
             logger.error("system DV sample builder init failed: no hvcC or FD rejected")
             return nil

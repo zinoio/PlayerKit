@@ -76,13 +76,20 @@ public struct SystemDVCapability: Sendable, Equatable {
     /// call site on the software path.
     public static let unavailable = SystemDVCapability(isAvailable: false)
 
-    /// Probe from a display capability snapshot. EDR-capable displays qualify
-    /// on all platforms (macOS since v1; iOS/tvOS since the phase-3 spike).
+    /// Probe from a display capability snapshot. macOS: EDR-capable displays
+    /// qualify. **iOS/tvOS: `.unavailable`(2026-11-06 spike 定案)**——七轮真机
+    /// 证实 iOS 全屏 in-app 对压缩 DV 直通(dvh1)合成黑帧(与 DV 声明无关,
+    /// PiP 可用),管线其余部分全绿;压缩直通路线定案不可行,iPhone 真 DV
+    /// 唯一路线 = route b(解码帧+RPU 附件),届时按其结论重开本探针。
+    /// 详见 reflux PR #466/#472 设计稿 §7(七轮判读)。
     /// Note (design §5.4): the result must be re-derived when the display
-    /// configuration changes — the display-change notification flow (macOS) or
-    /// the app-side foreground/screen observers (iOS/tvOS) handle that, no
-    /// extra observer here.
+    /// configuration changes — the display-change notification flow (macOS)
+    /// handles that, no extra observer here.
     public static func probe(display: DisplayCapability) -> SystemDVCapability {
+#if os(macOS)
         return SystemDVCapability(isAvailable: display.supportsEDR)
+#else
+        return .unavailable
+#endif
     }
 }
