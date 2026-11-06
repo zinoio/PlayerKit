@@ -13,7 +13,7 @@ concurrency:
 jobs:
   test:
     name: Build & Test (macOS)
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
         with:
@@ -44,7 +44,7 @@ jobs:
 
   lint:
     name: SwiftFormat (dry run)
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - name: Check formatting
@@ -54,7 +54,7 @@ jobs:
 
   docs:
     name: Generate Docs
-    runs-on: macos-14
+    runs-on: macos-15
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
