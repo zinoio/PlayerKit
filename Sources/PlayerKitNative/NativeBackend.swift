@@ -217,6 +217,13 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
     /// Written once in init(), only read afterwards — safe to access from any thread.
     private nonisolated(unsafe) var _injectedAudioOutput: (any AudioOutputBackend)?
 
+    /// 被动解码音频旁路(Playable.onDecodedAudio 的 NativeBackend 实现,#470 P3)。
+    /// `pcm` = 交错 float32(解码器输出格式 outputChannels/outputSampleRate)。
+    /// 在 audioDecodeQueue 上同步调用;回调方不得阻塞,需要留存请拷贝。写入方
+    /// (主线程设订阅)与读取方(解码队列)无同步 —— nonisolated(unsafe),
+    /// 订阅应在播放开始前完成,运行期换订阅由调用方自行承担时序。
+    public nonisolated(unsafe) var onDecodedAudio: ((_ pcm: Data, _ channels: Int, _ sampleRate: Double, _ pts: Double) -> Void)?
+
     /// User audio delay in CONTENT seconds, signed, ±5 clamp (zyno#104).
     /// Session-level by design: deliberately NOT part of PlayerState (state
     /// rebuilds on stop(); the delay must survive across play() calls — same
@@ -2278,6 +2285,9 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
                         if altCacheEnabled, cachePts.isFinite, let clone = av_packet_clone(packet) {
                             altAudioCache.append(stream: streamIndex, pts: cachePts, payload: clone)
                         }
+                        // PCM 旁路的包时间戳:音频流 timebase(不沿用 ptsFromPacket,
+                        // 那是视频流 timebase + video start_time 修正,对音频包语义不对)。
+                        let tapPts = Self.audioPacketPts(packet, demuxer: demuxer)
                         dLock.unlock()
                         handedOffPacket = true
                         let trackContent = AudioUnitOutput.tracksPlayedContent
@@ -2286,7 +2296,7 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
                         audioDecodeQueue.async {
                             self.decodeAndEnqueueAudio(packet: packet, decoder: currentDec, output: currentOut,
                                                        trackContent: trackContent, packetPts: packetPts,
-                                                       outputRate: outputRate)
+                                                       outputRate: outputRate, tapPts: tapPts)
                         }
                     }
                 } else if streamIndex == demuxer.subtitleStreamIndex,
@@ -2407,9 +2417,20 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
         }
     }
 
-    private nonisolated static func ptsFromPacket(_ packet: UnsafeMutablePointer<AVPacket>,
+    /// 音频包在内容时间轴上的秒(音频流 timebase;无 PTS → NaN)。PCM 旁路
+    /// 专用:不复用 ptsFromPacket(那是视频流 timebase + video start_time 修正,
+    /// 对音频包语义不对)。
+    private nonisolated static func audioPacketPts(_ packet: UnsafeMutablePointer<AVPacket>,
                                                    demuxer: any PacketDemuxing) -> Double {
-        guard let vs = demuxer.videoStream else { return .nan }
+        guard let aStream = demuxer.audioStream else { return .nan }
+        let tb = aStream.pointee.time_base
+        let nopts = Int64(bitPattern: 0x8000000000000000)
+        guard tb.den > 0, packet.pointee.pts != nopts else { return .nan }
+        return Double(packet.pointee.pts) * Double(tb.num) / Double(tb.den)
+    }
+
+    private nonisolated static func ptsFromPacket(_ packet: UnsafeMutablePointer<AVPacket>,
+                                                   demuxer: any PacketDemuxing) -> Double {        guard let vs = demuxer.videoStream else { return .nan }
         let tb = vs.pointee.time_base
         let nopts = Int64(bitPattern: 0x8000000000000000)
         guard tb.den > 0, packet.pointee.pts != nopts else { return .nan }
@@ -3964,9 +3985,14 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
                                                    decoder: FFmpegAudioDecoder?,
                                                    output: AudioUnitOutput?,
                                                    trackContent: Bool, packetPts: Double,
-                                                   outputRate: Double) {
+                                                   outputRate: Double, tapPts: Double) {
         let pcm = decoder?.decode(packet: packet)
         if let pcm {
+            // 被动解码音频旁路(#470 P3):tempo 拉伸之前给原始解码输出
+            // (交错 float32,解码器输出格式)。
+            if let cb = onDecodedAudio {
+                cb(pcm.data, Int(decoder?.outputChannels ?? 2), outputRate, tapPts)
+            }
             // Playback rate: time-stretch the decoded PCM
             // before it reaches the AudioQueue (zyno#99).
             // Emits 0..n frames; 1x bypasses untouched.
@@ -4037,7 +4063,7 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
             audioDecodeQueue.async {
                 self.decodeAndEnqueueAudio(packet: packet, decoder: newDecoder, output: newOutput,
                                            trackContent: trackContent, packetPts: trackContent ? pts : .nan,
-                                           outputRate: outputRate)
+                                           outputRate: outputRate, tapPts: pts)
             }
         }
         displayLoopLock.withLock {

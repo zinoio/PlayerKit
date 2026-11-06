@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 import QuartzCore
 #if canImport(AVKit)
@@ -35,6 +36,14 @@ public final class Player {
     }
 
     // MARK: - Playable forwarding
+
+    /// 被动解码音频旁路(Playable.onDecodedAudio 转发):每解码一段音频回调
+    /// 一次,交错 float32 PCM;回调在后台解码队列上,不得阻塞,需要留存请
+    /// 拷贝。PTS 无法确定时为 NaN。不支持的后端(MPV)为 no-op。
+    public var onDecodedAudio: ((_ pcm: Data, _ channels: Int, _ sampleRate: Double, _ pts: Double) -> Void)? {
+        get { backend.onDecodedAudio }
+        set { backend.onDecodedAudio = newValue }
+    }
 
     /// Start or restart playback at the given URL.
     /// - Parameters:

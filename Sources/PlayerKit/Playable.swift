@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 
 /// Main playback control protocol. All UI-facing playback goes through this.
@@ -78,11 +79,28 @@ public protocol Playable: AnyObject {
 
     /// Select a subtitle track, or pass nil to disable subtitles.
     func selectSubtitle(id: String?)
+
+    /// 被动解码音频旁路:每解码一段音频回调一次(交错 float32,后台解码队列
+    /// 上同步调用,不得阻塞)。默认实现为 no-op;支持的后端(NativeBackend)
+    /// 覆盖。见扩展里的完整回调约定。
+    var onDecodedAudio: ((_ pcm: Data, _ channels: Int, _ sampleRate: Double, _ pts: Double) -> Void)? { get set }
 }
 
 extension Playable {
     /// Manually trigger an onStateChange notification with the current state.
     public func notifyStateChange() {
         onStateChange?(state)
+    }
+
+    /// 被动解码音频旁路(通用能力):每解码一段音频就回调一次,供上层做音频
+    /// 分析(如片头片尾特征采集)而无需额外下载/解码。默认 nil = 后端不支持
+    /// 或未订阅,零开销。NativeBackend 覆盖此实现;回调约定:
+    ///  - `pcm` 为交错 float32(声道数/采样率随参数给出,解码器输出格式);
+    ///  - 在音频解码队列(后台)上同步调用,不得阻塞;需要留存请拷贝;
+    ///  - `pts` 是该段在内容时间轴上的秒,无法确定时为 NaN(消费方按 PTS 分窗);
+    ///  - 暂停/seek 后不保证连续。
+    public var onDecodedAudio: ((_ pcm: Data, _ channels: Int, _ sampleRate: Double, _ pts: Double) -> Void)? {
+        get { nil }
+        set {}
     }
 }
