@@ -183,4 +183,26 @@ final class VTVideoDecoderTests: XCTestCase {
         XCTAssertTrue(got.out.isEmpty)
         XCTAssertFalse(got.isIDR)
     }
+
+    // MARK: - Multi-parameter-set hvcC (4K remux)
+
+    /// Remuxed UHD titles often carry multiple SPS/PPS; the old code built the
+    /// format description from `[0]` only, which VT then rejected as BadData.
+    func testParseHVCC_retainsAllParameterSets() {
+        var hvcc: [UInt8] = [0x01]
+        hvcc += Array(repeating: 0x00, count: 21)
+        hvcc += [0x03] // numOfArrays
+        // VPS array with 2 NALUs
+        hvcc += [0x20, 0x00, 0x02, 0x00, 0x02, 0x40, 0x01, 0x00, 0x02, 0x40, 0x02]
+        // SPS array with 2 NALUs
+        hvcc += [0x21, 0x00, 0x02, 0x00, 0x02, 0x42, 0x01, 0x00, 0x02, 0x42, 0x02]
+        // PPS array with 1 NALU
+        hvcc += [0x22, 0x00, 0x01, 0x00, 0x02, 0x44, 0x01]
+
+        let ps = VTVideoDecoder.parseHVCC(hvcc)
+        XCTAssertEqual(ps?.vps.count, 2)
+        XCTAssertEqual(ps?.sps.count, 2)
+        XCTAssertEqual(ps?.pps.count, 1)
+        XCTAssertEqual(ps?.sps[1], [0x42, 0x02], "second SPS must be retained")
+    }
 }

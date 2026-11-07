@@ -43,6 +43,18 @@ final class VTVideoDecoder {
     /// happen during PiP/background transitions and are recoverable.
     private var transientErrorCount = 0
     private var maxTransientRetries = 3
+    /// Consecutive transient decode failures with zero output. A transient
+    /// storm (session churn / HW temporarily unavailable) must not feed the
+    /// 30-attempt zero-output fast path (that made HW vs SW decode flaky for
+    /// the same 4K HEVC file), but it should still eventually fall back if
+    /// the session never recovers: 90 frames ≈ 3s at 30fps.
+    private var transientStreakNoOutput = 0
+    /// Whether the attempt that just returned was a transient VT error
+    /// (recoverable, already retried via session recreation).
+    private var lastAttemptWasTransient = false
+    /// One-shot recovery: when the zero-output fast path fires, recreate the
+    /// VT session once (resetting counters) before declaring SW fallback.
+    private var zeroOutputRetryDone = false
 
     private let streamStartTime: Int64
     private let streamTimeBase: AVRational
@@ -72,7 +84,17 @@ final class VTVideoDecoder {
         // attempt sample). A healthy session never looks like this — every
         // attempt either decodes or errors, and 30 errors in a row on real
         // H.264/HEVC packets means the session cannot decode this stream.
-        if totalAttempts >= 30 && idrSuccessCount + nonIDRSuccessCount == 0 {
+        // Real decode errors only: transient session churn is excluded from
+        // totalAttempts (see decode()), so a bad start can no longer poison
+        // this counter — the root of the HW/SW flakiness.
+        if totalAttempts >= 30 && idrSuccessCount + nonIDRSuccessCount == 0,
+           failedAttempts >= 30 {
+            return true
+        }
+        // Persistent transient storm with no output: still fall back, just
+        // after 90 frames instead of 30 attempts (keeps a backgrounded/PiP
+        // blip from permanently degrading the session).
+        if transientStreakNoOutput >= 90 && idrSuccessCount + nonIDRSuccessCount == 0 {
             return true
         }
         // Must have meaningful sample size AND >90% real error rate.
@@ -279,22 +301,30 @@ final class VTVideoDecoder {
             decodeTimeStamp: dtsCMTime
         )
 
+        lastAttemptWasTransient = false
         let (pbOpt, outPTS) = vtDecode(lpData: lpData, session: session,
                                        formatDesc: formatDesc, timing: timing)
-        if pbOpt != nil {
+        // Transient VT errors are recoverable session churn; they must not be
+        // counted as real decode attempts (that used to let 30 transient
+        // failures trigger the permanent SW fallback, making HW decode
+        // intermittent for the same file).
+        let wasTransient = lastAttemptWasTransient
+        if wasTransient {
+            transientStreakNoOutput += 1
+        } else if pbOpt != nil {
             if isIDR { idrSuccessCount += 1 } else { nonIDRSuccessCount += 1 }
         } else {
             if isIDR { idrFailCount += 1 } else { nonIDRFailCount += 1 }
         }
         guard let pb = pbOpt else {
-            // VT decode failure path — still count attempts for fallback heuristics.
-            if !needsParamSetInit {
+            if !needsParamSetInit, !wasTransient {
                 totalAttempts += 1
                 if lastVTError { failedAttempts += 1 }
             }
+            maybeRecoverZeroOutput()
             return nil
         }
-        if !needsParamSetInit {
+        if !needsParamSetInit, !wasTransient {
             totalAttempts += 1
             if lastVTError { failedAttempts += 1 }
         }
@@ -334,7 +364,7 @@ final class VTVideoDecoder {
         if isH264, let sps = pendingSPS, let pps = pendingPPS {
             desc = VTVideoDecoder.makeH264FormatDesc(sps: sps, pps: pps)
         } else if let vps = pendingVPS, let sps = pendingSPS, let pps = pendingPPS {
-            desc = VTVideoDecoder.makeHEVCFormatDesc(vps: vps, sps: sps, pps: pps)
+            desc = VTVideoDecoder.makeHEVCFormatDesc(vps: [vps], sps: [sps], pps: [pps])
         } else { desc = nil }
 
         guard let d = desc, let s = VTVideoDecoder.makeSession(formatDesc: d, is10Bit: is10Bit) else {
@@ -415,8 +445,11 @@ final class VTVideoDecoder {
                         }
                     }
                 }
-                // Transient errors don't count toward fallback heuristic
+                // Transient errors don't count toward fallback heuristic.
+                // A successful recreate+retry is a normal decode, not a
+                // transient no-output attempt.
                 lastVTError = false
+                lastAttemptWasTransient = decodeStatus != noErr
             } else {
                 lastVTError = true
                 // zyno#114: this branch used to be completely silent — a
@@ -433,6 +466,7 @@ final class VTVideoDecoder {
         } else {
             lastVTError = false
             transientErrorCount = 0
+            transientStreakNoOutput = 0
         }
 
         // Tag HEVC Main 10 output with BT.2020/PQ colour metadata only when the
@@ -482,6 +516,35 @@ final class VTVideoDecoder {
         }
     }
 
+    /// One-shot recovery before permanent SW fallback: a session that
+    /// accepted 30 real decode attempts without a single frame may just be in
+    /// a bad state. Recreate it and reset the counters; only if the fresh
+    /// session also fails 30 attempts does `needsSoftwareFallback` stick.
+    private func maybeRecoverZeroOutput() {
+        guard !zeroOutputRetryDone,
+              totalAttempts >= 30,
+              failedAttempts >= 30,
+              idrSuccessCount + nonIDRSuccessCount == 0 else { return }
+        zeroOutputRetryDone = true
+
+        logger.notice("VT zero-output at \(self.totalAttempts, privacy: .public) attempts — recreating session once")
+        recreateSession()
+        guard session != nil else {
+            // Recreation failed: let the caller fall back instead of hanging
+            // on a nil session forever.
+            initFailed = true
+            return
+        }
+        totalAttempts = 0
+        failedAttempts = 0
+        idrSuccessCount = 0
+        idrFailCount = 0
+        nonIDRSuccessCount = 0
+        nonIDRFailCount = 0
+        transientErrorCount = 0
+        transientStreakNoOutput = 0
+    }
+
     // MARK: - Codec-parameter extraction (FFmpeg 8.x aware)
 
     /// Try extradata first; if it's a sentinel fall back to coded_side_data.
@@ -489,7 +552,7 @@ final class VTVideoDecoder {
         if let bytes = realExtradata(cp) {
             return isH264
                 ? parseAVCC(bytes).flatMap { makeH264FormatDesc(sps: $0.sps, pps: $0.pps) }
-                : parseHVCC(bytes).flatMap { makeHEVCFormatDesc(vps: $0.vps[0], sps: $0.sps[0], pps: $0.pps[0]) }
+                : parseHVCC(bytes).flatMap { makeHEVCFormatDesc(vps: $0.vps, sps: $0.sps, pps: $0.pps) }
         }
         return nil
     }
@@ -591,21 +654,36 @@ final class VTVideoDecoder {
         return result
     }
 
-    static func makeHEVCFormatDesc(vps: [UInt8], sps: [UInt8], pps: [UInt8]) -> CMVideoFormatDescription? {
-        var v = vps, s = sps, p = pps, desc: CMVideoFormatDescription?
-        let status: OSStatus = v.withUnsafeBufferPointer { vBuf in
-            s.withUnsafeBufferPointer { sBuf in
-                p.withUnsafeBufferPointer { pBuf in
-                    guard let vb = vBuf.baseAddress, let sb = sBuf.baseAddress,
-                          let pb = pBuf.baseAddress else { return -1 }
-                    var ptrs: [UnsafePointer<UInt8>] = [vb, sb, pb]
-                    var sizes = [vps.count, sps.count, pps.count]
-                    return CMVideoFormatDescriptionCreateFromHEVCParameterSets(
-                        allocator: kCFAllocatorDefault, parameterSetCount: 3,
-                        parameterSetPointers: &ptrs, parameterSetSizes: &sizes,
-                        nalUnitHeaderLength: 4, extensions: nil, formatDescriptionOut: &desc)
-                }
-            }
+    /// Build the format description with **every** parameter set in the hvcC
+    /// record (order: VPS…, SPS…, PPS…). Remuxed UHD titles often carry
+    /// multiple SPS (multi sub-layer); taking only `[0]` picked the wrong
+    /// one and made VT reject frames as BadData.
+    static func makeHEVCFormatDesc(vps: [[UInt8]], sps: [[UInt8]], pps: [[UInt8]]) -> CMVideoFormatDescription? {
+        let all = vps + sps + pps
+        guard !all.isEmpty else { return nil }
+
+        // Flatten into one contiguous buffer so every pointer stays valid for
+        // the whole CF call (pointers into individual arrays only live for
+        // their own withUnsafeBufferPointer scope).
+        var flat: [UInt8] = []
+        var offsets: [Int] = []
+        var sizes: [Int] = []
+        for set in all {
+            offsets.append(flat.count)
+            sizes.append(set.count)
+            flat.append(contentsOf: set)
+        }
+        guard !flat.isEmpty else { return nil }
+
+        var desc: CMVideoFormatDescription?
+        var ptrs: [UnsafePointer<UInt8>] = []
+        let status: OSStatus = flat.withUnsafeBufferPointer { buf in
+            guard let base = buf.baseAddress else { return -1 }
+            ptrs = offsets.map { base + $0 }
+            return CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+                allocator: kCFAllocatorDefault, parameterSetCount: all.count,
+                parameterSetPointers: &ptrs, parameterSetSizes: &sizes,
+                nalUnitHeaderLength: 4, extensions: nil, formatDescriptionOut: &desc)
         }
         if status != noErr { logger.error("HEVCFormatDesc failed: \(status, privacy: .public)") }
         return status == noErr ? desc : nil
