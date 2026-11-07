@@ -237,6 +237,9 @@ public enum RendererStrategy: Sendable, Equatable {
 /// Decision order (spec §5, design §5.1):
 /// 0. DoVi + system DV eligible (P5 / P8.1, `.system` preference, capability
 ///    available, EDR) → `doviSystem` — native compressed passthrough
+/// 0. `.hardwareHDR10` preference (smoothness first): P8.1 → `hdr10Static`,
+///    P8.4 → `hlgOOTF`, P8.2 → `sdr10Bit`, P7 → `degradedHDR10` (all VT
+///    hardware); P5 stays on the software path (no HDR10 base layer).
 /// 1. DoVi Profile 5 → `doviProfile5` (EDR) or `degradedHDR10` (non-EDR)
 /// 2. DoVi Profile 8 → `doviProfile8` (EDR) or `degradedHDR10` (non-EDR)
 /// 3. DoVi Profile 7 → `degradedHDR10` (always — VT handles as HDR10)
@@ -278,6 +281,25 @@ public func decideRendererStrategy(
         guard doviEnabled else {
             return edrCapable ? .hdr10Static(peakNits: 1000) : .sdr8Bit(matrix: .bt2020)
         }
+        // 0a. Smoothness-first (2026-11-07): VT hardware-decodes the base
+        // layer and shows its compatibility layer, dropping DV dynamic
+        // metadata. P5 has no HDR10 base layer (would tint), so it stays on
+        // the software path. P7 already degrades to HDR10 + hardware below.
+        if dolbyVisionOutput == .hardwareHDR10, stream.doviProfile != 5 {
+            switch stream.doviProfile {
+            case 8 where stream.blSignalCompatibilityId == 4:
+                return edrCapable ? .hlgOOTF : .sdr8Bit(matrix: .bt2020)
+            case 8 where stream.blSignalCompatibilityId == 2:
+                return edrCapable ? .sdr10Bit : .sdr8Bit(matrix: .bt709)
+            case 8:
+                // P8.1 (or unknown compat): HDR10 base layer.
+                return edrCapable ? .hdr10Static(peakNits: 1000) : .sdr8Bit(matrix: .bt2020)
+            default:
+                // P7 / unknown profile: VT hardcodes the base layer as HDR10.
+                return .degradedHDR10
+            }
+        }
+
         // 0. Native DV system path (design §5.1). Placed after the free-tier
         // guard (system path is gated by the same doviEnabled) and before the
         // per-profile software switch. All conditions must hold, else fall

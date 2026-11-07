@@ -11,8 +11,16 @@ import Foundation
 /// Changing the preference requires reopening the playback chain; the player
 /// surface decides when to rebuild (see reflux `PlayerController`).
 public enum DolbyVisionOutputPreference: Sendable, Equatable {
+    /// Native system DV passthrough (macOS EDR; iOS currently unavailable).
     case system
+    /// Software decode + DV RPU rendering (quality first; current Pro path).
     case software
+    /// Smoothness first (2026-11-07): VT hardware-decodes the base layer and
+    /// the renderer shows the compatibility layer (HDR10/HLG/SDR), dropping DV
+    /// dynamic metadata. P5 has no HDR10-compatible base layer and deliberately
+    /// stays on the software path. See
+    /// `docs/superpowers/specs/2026-11-07-dv-hardware-fallback-design.md`.
+    case hardwareHDR10
 }
 
 /// Which pipeline carries video to the renderer.
