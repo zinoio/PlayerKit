@@ -105,9 +105,11 @@ final class VTVideoDecoderTests: XCTestCase {
         return (Array(data), idr)
     }
 
-    /// Byte-for-byte parity with the legacy two-scan pipeline:
-    /// splitAnnexB → filter out parameter sets → length-prefixed join.
-    func testClassified_matchesLegacyFilteredOutput_h264() {
+    /// Byte-for-byte parity with the plain NAL pipeline: splitAnnexB →
+    /// length-prefixed join of every NAL (parameter sets included — see
+    /// zinoio/zinora#492; stripping them broke mid-stream parameter-set
+    /// activation on multi-SPS remuxes).
+    func testClassified_matchesFullNALEmission_h264() {
         let input: [UInt8] = [
             0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00,       // SPS (type 7)
             0x00, 0x00, 0x00, 0x01, 0x68, 0xEB,             // PPS (type 8)
@@ -116,11 +118,7 @@ final class VTVideoDecoderTests: XCTestCase {
         ]
         let got = classified(input, isH264: true)
 
-        let nalUnits = VTVideoDecoder.splitAnnexB(input).filter { nalu -> Bool in
-            guard !nalu.isEmpty else { return false }
-            let t = Int(nalu[0] & 0x1F)
-            return t != 7 && t != 8
-        }
+        let nalUnits = VTVideoDecoder.splitAnnexB(input).filter { !$0.isEmpty }
         var expected = Data()
         for nalu in nalUnits {
             var len = UInt32(nalu.count).bigEndian
@@ -153,7 +151,9 @@ final class VTVideoDecoderTests: XCTestCase {
         XCTAssertFalse(classified(trailR, isH264: false).isIDR)
     }
 
-    func testClassified_stripsHEVCParameterSets() {
+    /// Parameter sets are delivered with the packet (zinoio/zinora#492): VT
+    /// honors in-band VPS/SPS/PPS, which mid-stream activation requires.
+    func testClassified_deliversHEVCParameterSets() {
         let input: [UInt8] = [
             0x00, 0x00, 0x00, 0x01, 0x40, 0x01,             // VPS (type 32)
             0x00, 0x00, 0x00, 0x01, 0x42, 0x01,             // SPS (type 33)
@@ -162,19 +162,26 @@ final class VTVideoDecoderTests: XCTestCase {
         ]
         let got = classified(input, isH264: false)
 
-        // Only the IDR NAL survives, as a 4-byte length prefix + NAL bytes.
-        let expected: [UInt8] = [0x00, 0x00, 0x00, 0x03, 0x28, 0x01, 0x01]
+        // All four NALs survive, each with a 4-byte length prefix + NAL bytes.
+        let expected: [UInt8] = [
+            0x00, 0x00, 0x00, 0x02, 0x40, 0x01,             // VPS (type 32)
+            0x00, 0x00, 0x00, 0x02, 0x42, 0x01,             // SPS (type 33)
+            0x00, 0x00, 0x00, 0x02, 0x44, 0x01,             // PPS (type 34)
+            0x00, 0x00, 0x00, 0x03, 0x28, 0x01, 0x01        // IDR (type 20)
+        ]
         XCTAssertEqual(got.out, expected)
         XCTAssertTrue(got.isIDR)
     }
 
-    func testClassified_allParameterSetsYieldsEmptyAndNoIDR() {
+    /// A parameter-set-only packet emits its NALs and is still not an IDR packet.
+    func testClassified_allParameterSetsYieldsOutputAndNoIDR() {
         let input: [UInt8] = [
             0x00, 0x00, 0x00, 0x01, 0x67, 0x64,
             0x00, 0x00, 0x00, 0x01, 0x68, 0xEB
         ]
         let got = classified(input, isH264: true)
-        XCTAssertTrue(got.out.isEmpty)
+        XCTAssertFalse(got.out.isEmpty)
+        XCTAssertEqual(got.out.count, (4 + 2) + (4 + 2))
         XCTAssertFalse(got.isIDR)
     }
 

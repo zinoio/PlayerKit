@@ -777,8 +777,13 @@ final class VTVideoDecoder {
     }
 
     /// Emits the NAL spanning [start, end) of `raw` into `out` with a 4-byte
-    /// big-endian length prefix unless it is a parameter-set NAL (H.264
-    /// SPS/PPS, HEVC VPS/SPS/PPS). The NAL header byte is the first byte
+    /// big-endian length prefix. Parameter-set NALs (H.264 SPS/PPS, HEVC
+    /// VPS/SPS/PPS) are delivered like any other NAL unit: VT sessions built
+    /// from container codecpar honor in-band parameter sets carried in the
+    /// sample buffer, and streams that activate new parameter sets MID-stream
+    /// (multi-SPS UHD remuxes) depend on them reaching the session — stripping
+    /// them caused kVTVideoDecoderBadDataErr (-12909) from the activation
+    /// point on (zinoio/zinora#492). The NAL header byte is the first byte
     /// after the start code, so it is readable directly at `start`. Returns
     /// whether the emitted NAL is an IDR slice (H.264 type 5, HEVC 19/20).
     private static func emitLengthPrefixedNAL(
@@ -789,8 +794,6 @@ final class VTVideoDecoder {
         guard len > 0 else { return false }
         let b = raw[start]
         let t = isH264 ? Int(b & 0x1F) : Int((b >> 1) & 0x3F)
-        let isParam = isH264 ? (t == 7 || t == 8) : (t == 32 || t == 33 || t == 34)
-        guard !isParam else { return false }
         var lp = UInt32(len).bigEndian
         withUnsafeBytes(of: &lp) { out.append(contentsOf: $0) }
         out.append(contentsOf: UnsafeBufferPointer(rebasing: raw[start..<end]))
