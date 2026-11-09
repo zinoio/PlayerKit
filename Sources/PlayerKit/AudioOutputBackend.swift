@@ -41,4 +41,10 @@ public extension AudioOutputBackend {
     /// content-time accounting converts consumed OUTPUT samples back to
     /// CONTENT samples (playback rate ≠ output sample rate).
     func setPlaybackRate(_ rate: Double) {}
+    /// Default: volume is state-only (NativeBackend records it in
+    /// `state.volume`). PCM 后端(AudioUnitOutput)覆盖以真正衰减输出增益;
+    /// 码流直通(PassthroughOutput)物理上无法对已编码码流做音量,维持
+    /// no-op——state 仍记录、UI 可显示,听感不变(透传时音量交由功放)。
+    /// 0.0 = 静音,1.0 = 原始增益。
+    func setVolume(_ volume: Double) {}
 }

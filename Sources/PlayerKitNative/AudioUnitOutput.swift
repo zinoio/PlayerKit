@@ -53,6 +53,11 @@ public final class AudioUnitOutput: AudioOutputBackend {
     /// tests). Reset in test tearDown.
     nonisolated(unsafe) static var pauseImpl: (AudioQueueRef) -> OSStatus = { AudioQueuePause($0) }
     nonisolated(unsafe) static var startImpl: (AudioQueueRef) -> OSStatus = { AudioQueueStart($0, nil) }
+    /// 音量参数 seam(2026-11-09 macOS 播放器音量 UI 前置):生产用真实现,
+    /// 测试替换以断言"clamped 值被应用到活队列/建队时补挂",不依赖真实设备。
+    nonisolated(unsafe) static var setVolumeParamImpl: (AudioQueueRef, Float) -> OSStatus = {
+        AudioQueueSetParameter($0, kAudioQueueParam_Volume, $1)
+    }
 
     /// Serial queue that owns every AudioQueue control call (Pause/Start).
     ///
@@ -306,6 +311,13 @@ public final class AudioUnitOutput: AudioOutputBackend {
         }
 
         if Self.mutedForTesting { AudioQueueSetParameter(queue, kAudioQueueParam_Volume, 0) }
+        // 用户音量(0~1)在(重)建队时补挂:换轨/starve 重建会换新 queue ref,
+        // 不补的话每次重建音量都跳回 1.0。mutedForTesting 已置 0 时跳过,
+        // 保住测试静音语义。
+        let savedVolume = currentVolume()
+        if !Self.mutedForTesting, savedVolume != 1.0 {
+            Self.setVolumeParamImpl(queue, savedVolume)
+        }
 
         // Primer: 3 silence buffers to prevent initial underrun.
         // startPrimer() creates a negative debt and records the pending count so
@@ -771,6 +783,33 @@ public final class AudioUnitOutput: AudioOutputBackend {
         let due = delayLine.setTarget(targetContent / max(0.25, effective))
         _syncHoldToClock()
         for f in due { enqueueDirect(f.frame, contentPts: f.contentPts) }
+    }
+
+    // MARK: - 用户音量(2026-11-09,macOS 播放器音量 UI 前置)
+
+    /// 用户音量 0~1(1 = 原始增益)。Guarded by lock。此前 `Playable.setVolume`
+    /// 只写 `state.volume`、没有任何消费者(UI 是空转的);这里经
+    /// `kAudioQueueParam_Volume` 真正衰减 AudioQueue 输出,建队/重建时补挂。
+    private var _volume: Float = 1.0
+
+    /// 短临界区读当前音量(start() 不持锁运行,不能裸读)。
+    private func currentVolume() -> Float {
+        lock.lock(); defer { lock.unlock() }
+        return _volume
+    }
+
+    public func setVolume(_ volume: Double) {
+        // 与 setPlaybackRate 同款收口:非有限值回 1.0,越界夹取。
+        let clamped = Float(max(0.0, min(1.0, volume.isFinite ? volume : 1.0)))
+        lock.lock()
+        _volume = clamped
+        let queue = audioQueue
+        lock.unlock()
+        // AudioQueueSetParameter 是轻量参数调用(非 Pause/Start 那类要进
+        // AudioToolbox 串行 server 上下文的控制调用),不必 dispatch 到
+        // controlQueue;无活队列(未起播/已停)时只存值,建队时补挂。
+        guard let queue else { return }
+        Self.setVolumeParamImpl(queue, clamped)
     }
 
     /// Proxy for clock.audioTime.
