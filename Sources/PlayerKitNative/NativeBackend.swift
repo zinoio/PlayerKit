@@ -3902,7 +3902,16 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
         notifyStateChange()
     }
 
-    public func setVolume(_ volume: Double) { state.volume = volume; notifyStateChange() }
+    /// 用户音量(0~1):state 记录 + 转发 PCM 输出真正衰减(AudioQueue
+    /// kAudioQueueParam_Volume,见 AudioUnitOutput.setVolume;2026-11-09 前
+    /// 只有 state 记录、无消费者,UI 音量控制是空转)。透传后端走协议默认
+    /// no-op(码流无法做增益),state 照常记录。
+    public func setVolume(_ volume: Double) {
+        let clamped = max(0.0, min(1.0, volume.isFinite ? volume : 1.0))
+        state.volume = clamped
+        audioUnitOutput?.setVolume(clamped)
+        notifyStateChange()
+    }
     public func setRate(_ rate: Double) {
         let clamped = max(0.25, min(4.0, rate.isFinite ? rate : 1.0))
         state.rate = clamped
