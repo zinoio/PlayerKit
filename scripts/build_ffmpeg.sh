@@ -91,14 +91,22 @@ CODEC_FLAGS=(
   --enable-parser=ac3
   --enable-parser=mpegaudio
 
-  # Legacy video decoders — RealVideo (RMVB), MPEG-4 ASP (DivX/Xvid), MPEG-2.
+  # Legacy video decoders — RealVideo (RMVB), MPEG-4 ASP (DivX/Xvid), MPEG-1/2.
   # Software-only, but cheap to enable and covers a long tail of old media.
   --enable-decoder=rv10
   --enable-decoder=rv20
   --enable-decoder=rv30
   --enable-decoder=rv40
   --enable-decoder=mpeg4
+  --enable-decoder=mpeg1video
   --enable-decoder=mpeg2video
+  --enable-parser=mpegvideo
+
+  # MPEG-1 Layer II audio — the standard audio track of .mpg/.vob (MPEG-PS).
+  # Without it an .mpg plays video-only or stalls on audio-track open
+  # (2026-11-11 真机:大秦帝国 .mpg 起播异常). mp2 is a separate decoder
+  # from mp3/mp3float — the latter do NOT cover Layer II.
+  --enable-decoder=mp2
 
   # Subtitle decoders — bitmap-based (PGS/Blu-ray, VOBSUB/DVD).
   # Text-based subtitles (ASS/SRT/WebVTT/MOV_TEXT) are parsed inline in
