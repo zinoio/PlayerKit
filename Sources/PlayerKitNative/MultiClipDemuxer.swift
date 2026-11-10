@@ -127,7 +127,13 @@ final class MultiClipDemuxer: @unchecked Sendable {
             if let pre { pre.demuxer.close(releaseReader: false) }
             let demuxer = FFmpegDemuxer()
             do {
+                // 有可信时长(MPLS/ISO 扫描写入)时跳过时长探测:裸 TS 的
+                // seekRefine 会 seek 到深偏移尾部读包再跳回 0——云盘 reader 下
+                // 等于 2 次深偏移随机 Range + 3 次 8MB 顺序缓冲丢弃重拉,
+                // 115 随机偏移响应慢,起播黑屏 30s+ 的主因。knownDurationSecs>0
+                // 时 finishOpen 本就直接采用它,探测只白烧网络。
                 try demuxer.open(reader: readers[clipIndex],
+                                 skipDurationProbe: timeline.durationsSecs[clipIndex] > 0,
                                  knownDurationSecs: timeline.durationsSecs[clipIndex])
             } catch {
                 // The failed open may have bound the clip's reader to an
@@ -224,7 +230,10 @@ final class MultiClipDemuxer: @unchecked Sendable {
         preOpenQueue.async { [weak self] in
             let demuxer = FFmpegDemuxer()
             do {
-                try demuxer.open(reader: nextReader, knownDurationSecs: nextDuration)
+                // 同 switchTo:可信时长直接采用,跳过深偏移时长探测。
+                try demuxer.open(reader: nextReader,
+                                 skipDurationProbe: nextDuration > 0,
+                                 knownDurationSecs: nextDuration)
                 self?.preOpenedNext = (nextIndex, demuxer)
             } catch {
                 // A failed pre-open may still have bound the clip's reader to
