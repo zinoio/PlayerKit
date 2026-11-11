@@ -130,6 +130,13 @@ CODEC_FLAGS=(
   --enable-demuxer=aac
   --enable-demuxer=rm         # RealMedia (.rm/.rmvb)
   --enable-demuxer=mpegps     # MPEG-PS (.vob/.mpg/.mpeg)
+  # 裸 ES 探测族:MPEG-PS 无 PSM 时视频流走 request_probe 路径,靠这些 raw
+  # demuxer 的 read_probe 识别载荷。缺 mpegvideo 时视频流会被唯一候选 mp3
+  # 探测(score=1)误判成音频流 → .mpg 只出音频不出画面(2026-11-11 排查)。
+  --enable-demuxer=mpegvideo  # 裸 MPEG-1/2 ES(识别 00 00 01 b3 序列头)
+  --enable-demuxer=h264       # 裸 H.264 ES
+  --enable-demuxer=hevc       # 裸 HEVC ES
+  --enable-demuxer=m4v        # 裸 MPEG-4 ES
 
   # Network protocols
   --enable-protocol=file
