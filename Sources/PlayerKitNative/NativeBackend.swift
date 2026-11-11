@@ -325,6 +325,19 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
     /// via AudioUnitOutput drives the audioClock normally.
     /// Written at stream open (main actor), read every display tick.
     private nonisolated(unsafe) var isPassthroughActive = false
+    /// True when the injected backend consumes decoded PCM (PRO DSPOutput):
+    /// the demux loop routes decoded+tempo-stretched buffers to
+    /// `_injectedAudioOutput.outputPCM` instead of AudioUnitOutput, and
+    /// NativeBackend paces off the injected backend's playbackTime exactly
+    /// like the passthrough path. Evaluated per audio packet (the injected
+    /// output can be swapped mid-session via replaceInjectedAudioOutput).
+    private nonisolated(unsafe) var isInjectedPCMActive = false
+    /// Either injected-backend mode is driving the A/V master clock
+    /// (passthrough OR injected PCM). Gates clock consultation in the demux
+    /// throttle, currentMasterAudioTime and the audioEnded probe.
+    private nonisolated var injectedClockActive: Bool {
+        isPassthroughActive || isInjectedPCMActive
+    }
     private let jitterBuffer = VideoJitterBuffer()
     /// P2: ticked from the display thread; internally lock-guarded (see SyncController).
     nonisolated(unsafe) private let syncController = SyncController()
@@ -1598,6 +1611,7 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
             let out = AudioUnitOutput(clock: audioClock, delaySecs: audioDelay)
             audioUnitOutput = out
             isPassthroughActive = false
+            isInjectedPCMActive = false
             logger.info("audio: \(dec.outputSampleRate)Hz \(dec.outputChannels)ch")
             if demuxer.audioStreamIndex >= 0 {
                 state.selectedAudioTrackId = Int(demuxer.audioStreamIndex)
@@ -2088,19 +2102,20 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
                     // enough that the 50ms throttle × 24fps = 1.2s/s of sleep
                     // starves the audio path entirely.
                     let audioPos: Double
-                    if _injectedAudioOutput != nil && isPassthroughActive,
+                    if _injectedAudioOutput != nil && injectedClockActive,
                        let pt = _injectedAudioOutput?.playbackTime {
-                        // Passthrough: the PCM AudioClock never runs; pace the
-                        // read-ahead against the passthrough renderer's clock
-                        // instead, or the demux loop would enqueue the entire
-                        // file's audio into the renderer at decode speed.
+                        // Passthrough / injected-PCM (DSP): the PCM AudioClock
+                        // never runs; pace the read-ahead against the injected
+                        // backend's clock instead, or the demux loop would
+                        // enqueue the entire file's audio into the renderer at
+                        // decode speed.
                         // zyno#127: apply the full signed delay as a clock
                         // offset (read-ahead tracks the picture, which runs
                         // d ahead for d>0 and |d| behind for d<0), same
                         // semantics as the PCM path's audioTime.
                         audioPos = pt + audioClock.fullDelay
                         passthroughWallClockAnchor = nil
-                    } else if _injectedAudioOutput != nil && isPassthroughActive {
+                    } else if _injectedAudioOutput != nil && injectedClockActive {
                         // Passthrough clock unavailable (backend without a
                         // device timeline, or not yet anchored). Pace against
                         // WALL TIME anchored to the first finite read-ahead
@@ -2271,12 +2286,21 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
                         // passthrough clock that no longer receives packets —
                         // the demux then lost its pacing reference.
                         if isPassthroughActive { isPassthroughActive = false }
+                        // 注入输出若是 PCM 处理型(PRO DSPOutput):解码后的 PCM
+                        // 改送注入后端 outputPCM,AudioUnitOutput 保持闲置(open
+                        // 时建好、paused、零缓冲)。标志逐包重估——注入输出可被
+                        // replaceInjectedAudioOutput 会话中途换掉。
+                        let pcmToInjected = self._injectedAudioOutput?.acceptsPCM == true
+                        if pcmToInjected != isInjectedPCMActive {
+                            isInjectedPCMActive = pcmToInjected
+                        }
                         // may replace self.audioDecoder/audioUnitOutput before
                         // this actually runs on the queue; currentDec/currentOut
                         // stay bound to whatever was current when this packet was
                         // read, matching the previous synchronous behavior.
                         let currentDec = self.audioDecoder
                         let currentOut = self.audioUnitOutput
+                        let currentSink = pcmToInjected ? self._injectedAudioOutput : nil
                         // zyno#196: 当前音轨的包也克隆进缓存。切走瞬间缓存里已有
                         // "播放位置到读头"的旧轨包,立刻切回就能命中快路径,不必等
                         // 它变回备选后重新积累。透传/discard 分支不缓存:前者快路径
@@ -2295,6 +2319,7 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
                         let outputRate = Double(currentDec?.outputSampleRate ?? 48000)
                         audioDecodeQueue.async {
                             self.decodeAndEnqueueAudio(packet: packet, decoder: currentDec, output: currentOut,
+                                                       pcmSink: currentSink,
                                                        trackContent: trackContent, packetPts: packetPts,
                                                        outputRate: outputRate, tapPts: tapPts)
                         }
@@ -2776,12 +2801,18 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
         let (stillNeedsCal, clockReady) = displayLoopLock.withLock {
             (needsClockCalibration, audioClockReady)
         }
-        // Audio stream finished and the output fully drained (PCM path only —
-        // the passthrough renderer's pending state is not observable here).
-        // Nothing advances the clock anymore: sync's reference is dead, so the
-        // tail must free-run instead of freezing (see both uses below).
-        let audioEnded = !isPassthroughActive && jitterBuffer.atEOF
-            && !(audioUnitOutput?.hasPendingOutput ?? false)
+        // Audio stream finished and the output fully drained. Nothing advances
+        // the clock anymore: sync's reference is dead, so the tail must
+        // free-run instead of freezing (see both uses below).
+        let audioEnded: Bool
+        if injectedClockActive {
+            // 注入后端模式(透传/DSP):AudioUnitOutput 未消费,hasPendingOutput
+            // 不可观测;用注入后端自己的缓冲余量判断排空。
+            audioEnded = jitterBuffer.atEOF && (_injectedAudioOutput?.bufferedDuration ?? 0) <= 0
+        } else {
+            audioEnded = jitterBuffer.atEOF
+                && !(audioUnitOutput?.hasPendingOutput ?? false)
+        }
         if syncController.hasDisplayedFrame, !stillNeedsCal, clockReady {
             // Guard window = compensation + 2 frames, scaled by max(1, rate)
             // — see SyncController.guardWindow. The old fixed 60ms sat 10ms
@@ -2853,6 +2884,13 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
         // leaving the display free-running (unsynced) through the entire
         // negative window instead of holding the picture there.
         if !clockReady, audioClock.hasConsumedOutput {
+            displayLoopLock.withLock { audioClockReady = true }
+        }
+        // 注入 PCM 后端(DSP):AudioClock 永不消费,就绪判据换成注入后端
+        // 自己的播放时钟可读(已锚定、正在推进)。透传沿用旁路 pacing 语义
+        // (锚定前 playbackTime 为 nil,不翻转),与既有行为一致。
+        if !clockReady, injectedClockActive, !isPassthroughActive,
+           let pt = _injectedAudioOutput?.playbackTime, pt.isFinite, pt >= 0 {
             displayLoopLock.withLock { audioClockReady = true }
         }
 
@@ -3081,11 +3119,11 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
         return t - currentMasterAudioTime()
     }
 
-    /// 主时钟(音频)对外时间。passthrough 时 = 注入后端播放时间 + 全符号延迟
+    /// 主时钟(音频)对外时间。注入后端(透传/DSP)= 后端播放时间 + 全符号延迟
     /// (zyno#127);PCM = audioClock.audioTime。软件/系统两条路径共用同一口径:
     /// 这里**不做**任何输出延迟加减(#357 保持单一约定,修复后两路一起受益)。
     private nonisolated func currentMasterAudioTime() -> Double {
-        if _injectedAudioOutput != nil && isPassthroughActive,
+        if _injectedAudioOutput != nil && injectedClockActive,
            let pt = _injectedAudioOutput?.playbackTime, pt.isFinite, pt >= 0 {
             return pt + audioClock.fullDelay
         }
@@ -3910,6 +3948,11 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
         let clamped = max(0.0, min(1.0, volume.isFinite ? volume : 1.0))
         state.volume = clamped
         audioUnitOutput?.setVolume(clamped)
+        // 注入 PCM 处理型输出(DSP)在消费 PCM 时同享用户音量;透传后端走
+        // 协议默认 no-op(码流无法做增益)。
+        if _injectedAudioOutput?.acceptsPCM == true {
+            _injectedAudioOutput?.setVolume(clamped)
+        }
         notifyStateChange()
     }
     public func setRate(_ rate: Double) {
@@ -3923,8 +3966,40 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
         //   - the display loop's guard window and sync normalization
         audioTempo.setRate(clamped)
         audioUnitOutput?.setPlaybackRate(clamped)
+        // 注入 PCM 后端(DSP)的 playbackTime 换算消费 output 样本 → 内容秒,
+        // 需要同步知道当前速率(换算用),与 AudioUnitOutput 同语义。
+        if _injectedAudioOutput?.acceptsPCM == true {
+            _injectedAudioOutput?.setPlaybackRate(clamped)
+        }
         // 系统路径:层 timebase 同步变 rate。
         systemDVRenderer?.setRate(Float(clamped))
+        notifyStateChange()
+    }
+
+    /// 会话中途替换注入音频输出(DSP↔透传仲裁,宿主播放器设置面板调用)。
+    ///
+    /// 注入槽在 init 一次性注入(PassthroughOutput 先例)的形态下,宿主无法
+    /// 在"用户播放中把音效增强开/关"时换输出——本 API 补上这个缝:demuxLock
+    /// 串行化与 demux 循环的逐包读取(与 selectAudioTrack 的锁纪律一致),
+    /// 换完后路由/时钟标志全部清零,由下一个音频包按新后端的能力
+    /// (supportsPassthrough / acceptsPCM)重新判定走位流、注入 PCM 还是
+    /// 内置 AudioUnitOutput;新后端首个有限 pts 锚定它的播放时钟。
+    /// 旧后端 flush 丢弃在途缓冲。无需重启播放。
+    public func replaceInjectedAudioOutput(_ output: (any AudioOutputBackend)?) {
+        demuxLock.lock()
+        let old = _injectedAudioOutput
+        _injectedAudioOutput = output
+        isPassthroughActive = false
+        isInjectedPCMActive = false
+        demuxLock.unlock()
+        // 时钟基线作废:换回 PCM 路径时由 audioClock.hasConsumedOutput 重新
+        // 就绪;换到注入后端时由其 playbackTime 首次可读触发(见 display tick)。
+        displayLoopLock.withLock {
+            needsClockCalibration = true
+            audioClockReady = false
+        }
+        passthroughWallClockAnchor = nil
+        old?.flush()
         notifyStateChange()
     }
     /// zyno#171: 切轨的重负载段(flush/seek/管线重建)调度到专用串行队列,
@@ -3990,9 +4065,14 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
     /// 解码一个音频包并送入输出;在 audioDecodeQueue 上运行,负责释放该包。
     /// 实时解复用循环与切轨快路径(回放缓存包)共用,保证两条路径的变速/内容时间
     /// 记账完全一致(zyno#171)。
+    /// `pcmSink` 非空时(注入 PCM 处理型输出,PRO DSPOutput)解码+tempo 拉伸后的
+    /// 缓冲改送 `outputPCM(buffer, pts:)`——pts 用音频流 timebase 的内容时间
+    /// (tapPts),注入后端的播放时钟以首个有限 pts 锚定;内容时间记账
+    /// (tracksPlayedContent 测试缝)是 AudioUnitOutput 专属,sink 路径不更新。
     private nonisolated func decodeAndEnqueueAudio(packet: UnsafeMutablePointer<AVPacket>,
                                                    decoder: FFmpegAudioDecoder?,
                                                    output: AudioUnitOutput?,
+                                                   pcmSink: (any AudioOutputBackend)? = nil,
                                                    trackContent: Bool, packetPts: Double,
                                                    outputRate: Double, tapPts: Double) {
         let pcm = decoder?.decode(packet: packet)
@@ -4006,17 +4086,60 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
             // before it reaches the AudioQueue (zyno#99).
             // Emits 0..n frames; 1x bypasses untouched.
             let stretched = audioTempo.process(pcm)
-            var contentPts = Double.nan
-            if trackContent {
-                contentPts = packetPts.isFinite ? packetPts : playedContentTrackerEnd
-                playedContentTrackerEnd = contentPts + Double(pcm.sampleCount) / outputRate
-            }
-            for out in stretched {
-                output?.enqueue(out, contentPts: contentPts)
+            if let sink = pcmSink {
+                let sinkPts = tapPts.isFinite ? tapPts : .nan
+                let sinkChannels = Int32(decoder?.outputChannels ?? 2)
+                for out in stretched {
+                    if let buf = Self.makeInjectedPCMBuffer(
+                        frame: out, sampleRate: outputRate, channels: sinkChannels) {
+                        sink.outputPCM(buf, pts: sinkPts)
+                    }
+                }
+            } else {
+                var contentPts = Double.nan
+                if trackContent {
+                    contentPts = packetPts.isFinite ? packetPts : playedContentTrackerEnd
+                    playedContentTrackerEnd = contentPts + Double(pcm.sampleCount) / outputRate
+                }
+                for out in stretched {
+                    output?.enqueue(out, contentPts: contentPts)
+                }
             }
         }
         var p: UnsafeMutablePointer<AVPacket>? = packet
         av_packet_free(&p)
+    }
+
+    /// PCMFrame(FFmpeg 解码输出,交错 float32)→ 非交错 AVAudioPCMBuffer,
+    /// 供注入 PCM 处理型输出(PRO DSPOutput,AVAudioEngine 侧)消费。
+    /// 样本数/声道数不齐或空数据返回 nil(该包静默丢弃,与解码失败同口径)。
+    private nonisolated static func makeInjectedPCMBuffer(frame: PCMFrame,
+                                                          sampleRate: Double,
+                                                          channels: Int32) -> AVAudioPCMBuffer? {
+        let ch = Int(channels)
+        guard ch > 0, sampleRate > 0, frame.sampleCount > 0 else { return nil }
+        guard let format = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                                         sampleRate: sampleRate,
+                                         channels: AVAudioChannelCount(channels),
+                                         interleaved: false) else { return nil }
+        let frames = frame.sampleCount
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: format,
+                                            frameCapacity: AVAudioFrameCount(frames)) else { return nil }
+        let expected = frames * ch
+        guard frame.data.count >= expected * MemoryLayout<Float>.size else { return nil }
+        buffer.frameLength = AVAudioFrameCount(frames)
+        frame.data.withUnsafeBytes { raw in
+            guard let srcBase = raw.baseAddress else { return }
+            let src = srcBase.assumingMemoryBound(to: Float.self)
+            guard let dst = buffer.floatChannelData else { return }
+            for c in 0..<ch {
+                let channel = dst[c]
+                for i in 0..<frames {
+                    channel[i] = src[i * ch + c]
+                }
+            }
+        }
+        return buffer
     }
 
     /// 切轨快路径(zyno#171):新轨的包已在备选缓存里覆盖当前播放位置 → 不 seek、
@@ -4029,7 +4152,10 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
         // 不合格就别去抢(zyno#171)。持锁后下面会再校验一次。
         guard altAudioStreams.contains(newStream), state.isPlaying else { return false }
         demuxLock.lock()
-        guard altAudioStreams.contains(newStream), state.isPlaying, !isPassthroughActive else {
+        // 注入 PCM 处理型输出(DSP)激活时同样走慢路径:快路径重建的是
+        // AudioUnitOutput,缓存包会灌进它,与注入输出的逐包路由打架。
+        guard altAudioStreams.contains(newStream), state.isPlaying,
+              !isPassthroughActive, _injectedAudioOutput?.acceptsPCM != true else {
             demuxLock.unlock(); return false
         }
         let posSecs = Double(state.position.components.seconds)

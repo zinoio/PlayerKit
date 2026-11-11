@@ -5,6 +5,14 @@ import Foundation
 public protocol AudioOutputBackend: AnyObject {
     /// Whether this backend supports compressed audio passthrough (AC3/DTS/Atmos).
     var supportsPassthrough: Bool { get }
+    /// Whether this backend consumes decoded PCM buffers via `outputPCM`.
+    /// True for the open-source AudioUnitOutput and PRO DSPOutput; false for
+    /// PassthroughOutput (compressed bitstream only). NativeBackend routes
+    /// decoded PCM to the injected backend only when this is true — otherwise
+    /// the packets fall through to the built-in AudioUnitOutput path, which
+    /// also keeps the zyno#105 passthrough runtime fallback (bitstream route
+    /// fails → PCM decode) audible instead of silently dropped.
+    var acceptsPCM: Bool { get }
     /// Buffered audio duration in seconds.
     var bufferedDuration: Double { get }
 
@@ -34,6 +42,9 @@ public protocol AudioOutputBackend: AnyObject {
 }
 
 public extension AudioOutputBackend {
+    /// Default: consumes PCM (AudioUnitOutput, DSPOutput). PassthroughOutput
+    /// overrides to false.
+    var acceptsPCM: Bool { true }
     /// Default: no playback clock — NativeBackend falls back to its AudioClock.
     var playbackTime: Double? { nil }
     /// Default: rate is ignored (no real clock or no tempo support). Backends
