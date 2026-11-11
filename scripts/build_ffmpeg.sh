@@ -91,14 +91,22 @@ CODEC_FLAGS=(
   --enable-parser=ac3
   --enable-parser=mpegaudio
 
-  # Legacy video decoders — RealVideo (RMVB), MPEG-4 ASP (DivX/Xvid), MPEG-2.
+  # Legacy video decoders — RealVideo (RMVB), MPEG-4 ASP (DivX/Xvid), MPEG-1/2.
   # Software-only, but cheap to enable and covers a long tail of old media.
   --enable-decoder=rv10
   --enable-decoder=rv20
   --enable-decoder=rv30
   --enable-decoder=rv40
   --enable-decoder=mpeg4
+  --enable-decoder=mpeg1video
   --enable-decoder=mpeg2video
+  --enable-parser=mpegvideo
+
+  # MPEG-1 Layer II audio — the standard audio track of .mpg/.vob (MPEG-PS).
+  # Without it an .mpg plays video-only or stalls on audio-track open
+  # (2026-11-11 真机:大秦帝国 .mpg 起播异常). mp2 is a separate decoder
+  # from mp3/mp3float — the latter do NOT cover Layer II.
+  --enable-decoder=mp2
 
   # Subtitle decoders — bitmap-based (PGS/Blu-ray, VOBSUB/DVD).
   # Text-based subtitles (ASS/SRT/WebVTT/MOV_TEXT) are parsed inline in
@@ -122,6 +130,13 @@ CODEC_FLAGS=(
   --enable-demuxer=aac
   --enable-demuxer=rm         # RealMedia (.rm/.rmvb)
   --enable-demuxer=mpegps     # MPEG-PS (.vob/.mpg/.mpeg)
+  # 裸 ES 探测族:MPEG-PS 无 PSM 时视频流走 request_probe 路径,靠这些 raw
+  # demuxer 的 read_probe 识别载荷。缺 mpegvideo 时视频流会被唯一候选 mp3
+  # 探测(score=1)误判成音频流 → .mpg 只出音频不出画面(2026-11-11 排查)。
+  --enable-demuxer=mpegvideo  # 裸 MPEG-1/2 ES(识别 00 00 01 b3 序列头)
+  --enable-demuxer=h264       # 裸 H.264 ES
+  --enable-demuxer=hevc       # 裸 HEVC ES
+  --enable-demuxer=m4v        # 裸 MPEG-4 ES
 
   # Network protocols
   --enable-protocol=file
