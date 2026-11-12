@@ -2443,15 +2443,26 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
     }
 
     /// 音频包在内容时间轴上的秒(音频流 timebase;无 PTS → NaN)。PCM 旁路
-    /// 专用:不复用 ptsFromPacket(那是视频流 timebase + video start_time 修正,
-    /// 对音频包语义不对)。
+    /// 专用:不复用 ptsFromPacket(那是视频流 timebase,跨流语义不对)。
+    ///
+    /// start_time 归一必须与视频侧对称(ptsFromPacket / FFmpegVideoDecoder
+    /// 都减各自流的 start_time)。点播文件 start_time 通常≈0,不减也看不出来;
+    /// 但 HLS/TS 直播的 PTS 是从服务端运行纪元起的绝对值(实测 66253s),
+    /// 视频减完落到 1.00s、音频不减停在 66253s → audioTime 领先视频 18 小时,
+    /// sync 把每一帧都判成"远落后音频"丢弃,表现为有声音、画面定格首帧
+    /// (2026-11-12 江苏移动 OTT 直播真机复现)。
     private nonisolated static func audioPacketPts(_ packet: UnsafeMutablePointer<AVPacket>,
                                                    demuxer: any PacketDemuxing) -> Double {
         guard let aStream = demuxer.audioStream else { return .nan }
         let tb = aStream.pointee.time_base
         let nopts = Int64(bitPattern: 0x8000000000000000)
         guard tb.den > 0, packet.pointee.pts != nopts else { return .nan }
-        return Double(packet.pointee.pts) * Double(tb.num) / Double(tb.den)
+        let pts = Double(packet.pointee.pts) * Double(tb.num) / Double(tb.den)
+        if aStream.pointee.start_time != nopts {
+            let startOffset = Double(aStream.pointee.start_time) * Double(tb.num) / Double(tb.den)
+            return pts - startOffset
+        }
+        return pts
     }
 
     private nonisolated static func ptsFromPacket(_ packet: UnsafeMutablePointer<AVPacket>,
