@@ -1959,6 +1959,14 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
                     if result.didSwitchClip, rawPTS.isFinite {
                         ptsValidator.forceRebase(to: rawPTS)
                         pts = rawPTS
+                        // 跨 clip 接缝:重建字幕解码器/渲染器。MultiClipDemuxer
+                        // switchTo 已按缓存重挂字幕流(新 clip 的 discard 布局
+                        // 恢复),但解码器仍持有已 close 的旧 clip AVStream 指针。
+                        // 本处处于 demuxLock(dLock)持有中,与 selectSubtitle
+                        // 同锁环境,直接重建安全。
+                        if let trackId = state.selectedSubtitleTrackId {
+                            recreateSubtitleRenderers(demuxer: demuxer, trackId: trackId)
+                        }
                     } else {
                         pts = ptsValidator.validate(rawPTS)
                         // [diag] count rewritten PTS (blind clock / anomaly path)
@@ -4433,37 +4441,45 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
             notifyStateChange()
         }
 
+        recreateSubtitleRenderers(demuxer: demuxer, trackId: trackId)
+
+        // No seek here: seeking would flush the video pipeline and cause 2-5s
+        // re-buffering on network streams, which users misread as "subtitle failed
+        // to load." The demux loop is already 2s ahead of playback; future subtitle
+        // packets for the newly selected stream are processed naturally. The
+        // currently-active cue (whose packet was already read) may not appear until
+        // the next subtitle event — an acceptable trade-off vs. visible re-buffering.
+    }
+
+    /// 字幕解码器/渲染器重建(PGS/DVD→位图解码器,ASS→渲染器)。两个调用点:
+    /// selectSubtitle(用户切轨)与 demux 循环的跨 clip 接缝——接缝处旧解码器
+    /// 持有已 close 的上一个 clip 的 AVStream 指针,必须重建(2026-11-14
+    /// 复联4 ISO 原盘切字幕跨接缝 PGS 静默消失的根因)。调用方须持 demuxLock。
+    private func recreateSubtitleRenderers(demuxer: any PacketDemuxing, trackId: Int?) {
         subtitleDecoder = nil
         assRenderer = nil
-        if let resolvedTrackId = trackId {
-            let nb = Int(demuxer.formatContext?.pointee.nb_streams ?? 0)
-            for i in 0..<nb {
-                guard let s = demuxer.formatContext?.pointee.streams[i],
-                      Int(s.pointee.index) == resolvedTrackId else { continue }
-                let codecId = s.pointee.codecpar.pointee.codec_id
-                if codecId == AV_CODEC_ID_HDMV_PGS_SUBTITLE || codecId == AV_CODEC_ID_DVD_SUBTITLE {
-                    subtitleDecoder = FFmpegSubtitleDecoder(
-                        stream: s,
-                        videoSize: CGSize(width: codedVideoWidth, height: codedVideoHeight)
-                    )
-                    logger.notice("[sub] PGS/DVD decoder created: \(self.subtitleDecoder != nil ? "OK" : "FAILED")")
-                } else if codecId == AV_CODEC_ID_ASS || codecId == AV_CODEC_ID_SSA {
-                    let r = Self.makeASSRenderer(
-                        stream: s,
-                        videoSize: CGSize(width: codedVideoWidth, height: codedVideoHeight),
-                        fontFamily: subtitleFontFamily
-                    )
-                    assRenderer = r
-                    logger.notice("[sub] ASS renderer \(r != nil ? "created" : "unavailable (no extradata)")")
-                }
-                break
+        guard let resolvedTrackId = trackId else { return }
+        let nb = Int(demuxer.formatContext?.pointee.nb_streams ?? 0)
+        for i in 0..<nb {
+            guard let s = demuxer.formatContext?.pointee.streams[i],
+                  Int(s.pointee.index) == resolvedTrackId else { continue }
+            let codecId = s.pointee.codecpar.pointee.codec_id
+            if codecId == AV_CODEC_ID_HDMV_PGS_SUBTITLE || codecId == AV_CODEC_ID_DVD_SUBTITLE {
+                subtitleDecoder = FFmpegSubtitleDecoder(
+                    stream: s,
+                    videoSize: CGSize(width: codedVideoWidth, height: codedVideoHeight)
+                )
+                logger.notice("[sub] PGS/DVD decoder recreated: \(self.subtitleDecoder != nil ? "OK" : "FAILED")")
+            } else if codecId == AV_CODEC_ID_ASS || codecId == AV_CODEC_ID_SSA {
+                let r = Self.makeASSRenderer(
+                    stream: s,
+                    videoSize: CGSize(width: codedVideoWidth, height: codedVideoHeight),
+                    fontFamily: subtitleFontFamily
+                )
+                assRenderer = r
+                logger.notice("[sub] ASS renderer \(r != nil ? "created" : "unavailable (no extradata)")")
             }
-            // No seek here: seeking would flush the video pipeline and cause 2-5s
-            // re-buffering on network streams, which users misread as "subtitle failed
-            // to load." The demux loop is already 2s ahead of playback; future subtitle
-            // packets for the newly selected stream are processed naturally. The
-            // currently-active cue (whose packet was already read) may not appear until
-            // the next subtitle event — an acceptable trade-off vs. visible re-buffering.
+            break
         }
     }
 
