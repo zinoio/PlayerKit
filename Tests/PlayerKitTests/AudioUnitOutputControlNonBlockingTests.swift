@@ -141,12 +141,16 @@ final class AudioUnitOutputControlNonBlockingTests: XCTestCase {
         output.resume()
 
         let expected = Double(total * 512) / 48000.0
+        // 容差 50ms(原 20ms):paused 后到达的回调按用户暂停语义不再推进
+        // 时钟(见 AudioUnitOutput._callbackConsumed 的 paused 兜底),暂停
+        // 边界会有 1-3 帧不计时;CI runner 的音频回调调度也会抖 1-2 帧,
+        // 30ms 在 GitHub macOS runner 上偶发不够(实测 0.3947 vs 0.3967)。
         let deadline = Date().addingTimeInterval(5.0)
         while Date() < deadline {
-            if clock.audioTime >= expected - 0.02 { break }
+            if clock.audioTime >= expected - 0.05 { break }
             Thread.sleep(forTimeInterval: 0.01)
         }
-        XCTAssertGreaterThanOrEqual(clock.audioTime, expected - 0.02,
+        XCTAssertGreaterThanOrEqual(clock.audioTime, expected - 0.05,
             "audio must keep playing after the async pause/resume pair (clock reached \(clock.audioTime)s of \(expected)s)")
     }
 }

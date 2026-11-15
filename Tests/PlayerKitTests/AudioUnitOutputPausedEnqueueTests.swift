@@ -50,7 +50,9 @@ final class AudioUnitOutputPausedEnqueueTests: XCTestCase {
         output.resume()
 
         let expected = Double(total * samplesPerFrame) / Double(sampleRate)  // 1.0667 s
-        let reached = waitUntil(timeout: 4.0) { abs(clock.audioTime - expected) < 0.02 }
+        // 容差 30ms(原 20ms):暂停边界 1-2 帧的回调按用户暂停语义不计时
+        // (见 AudioUnitOutput._callbackConsumed 的 paused 兜底)。
+        let reached = waitUntil(timeout: 4.0) { abs(clock.audioTime - expected) < 0.03 }
         XCTAssertTrue(reached,
             "expected ≈\(String(format: "%.3f", expected))s of audio to be played, "
             + "clock reached \(String(format: "%.3f", clock.audioTime))s "

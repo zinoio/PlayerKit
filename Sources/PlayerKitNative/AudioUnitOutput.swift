@@ -714,6 +714,14 @@ public final class AudioUnitOutput: AudioOutputBackend {
         }
         let now = ProcessInfo.processInfo.systemUptime
         lock.lock()
+        // 用户暂停兜底:pause() 同步置 paused,但真正的 AudioQueuePause 是
+        // controlQueue.async 下发的,AudioToolbox 内部 IO-cycle 等待可能让它
+        // 晚到;此间回调若继续消耗缓冲,会把音频时钟推过暂停位置(2026-11-15
+        // 真机:恢复后位置 = 暂停位置 + 暂停时长,画面跳过整个暂停段)。
+        if paused {
+            lock.unlock()
+            return
+        }
         if bufferedFrameCount > 0 { bufferedFrameCount &-= 1 }
         let ch = _channels
         let rate = _playbackRate

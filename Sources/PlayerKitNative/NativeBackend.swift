@@ -444,6 +444,11 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
     /// fire and advance audioClock past 0 — without this, seek-to-0 freezes because
     /// primer debt keeps audioClock at 0 while video PTS advances past the 60ms threshold.
     private nonisolated(unsafe) var audioClockReady: Bool = false
+    /// pause() 记下的播放位置(内容秒)。resume() 据此 seek 回暂停位置,
+    /// 让音视频都从暂停那一帧重新解码 —— 只保留缓冲/冻结时钟不够:音频
+    /// 解码/输出侧会积压暂停后的 PCM(实测 +1.7s),重建时被计入时钟会把
+    /// 画面拉去追赶。主线程生命周期路径读写。
+    private var pausedClockPosition: Double?
     // demuxCancelled is written under demuxStateLock (never demuxLock — see there) and
     // read from DispatchQueue.global().
     // Bool reads/writes are atomic on ARM64 in practice; nonisolated(unsafe) makes
@@ -3486,6 +3491,7 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
     }
 
     public func pause() {
+        pausedClockPosition = max(0, currentMasterAudioTime())
         logger.info("pause")
         displayLink?.invalidate(); displayLink = nil
         displayLoopLock.withLock { displayLoopStopped = true }
@@ -3500,6 +3506,11 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
         displayLinkProxy = nil
         #endif
         audioUnitOutput?.pause()
+        // 注入输出(Pro DSPOutput 等)是 PCM 路径的主时钟来源:
+        // currentMasterAudioTime() 优先读它的 playbackTime。漏停它 → 用户
+        // 暂停后引擎继续渲染、主时钟按墙钟前进,恢复时位置直接跳过整个暂停
+        // 时长(2026-11-15 真机:pause clock=421.4 → resume 后 426.5)。
+        _injectedAudioOutput?.pause()
         // 系统路径:层 timebase 同步冻结(音频时钟停了,画面必须一起停)。
         systemDVRenderer?.setRate(0)
         // Stop the demux loop so jitterBuffer doesn't fill up while audio is
@@ -3538,21 +3549,36 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
         // 音频时钟归零重校准产生咔哒。只有真正 pause 过(循环已取消)才需要
         // 走完整的重建路径。
         let resumingContinuous = demuxStateLock.withLock { demuxLoopRunning && !demuxCancelled }
+        // 用户主动暂停:恢复时对暂停位置做一次 seek,让音视频都从暂停那一帧
+        // 重新解码。只保留 jitter/冻结时钟不够 —— 音频解码/输出侧会积压暂停
+        // 后的 PCM(真机实测恢复瞬间音频时钟 +1.7s),重建时被计入主时钟,
+        // sync 就会把画面拉去追赶,表现为"恢复画面比暂停画面靠后"。
+        // 代价:恢复多一次 seek/填充(0.1-0.5s),换来完全对齐。
+        if !resumingContinuous, let paused = pausedClockPosition {
+            pausedClockPosition = nil
+            logger.info("resume: realign to paused position \(String(format: "%.3f", paused), privacy: .public)s")
+            startDemuxLoop()
+            startDisplayLink()
+            state.isPlaying = true
+            notifyStateChange()
+            _seek(to: Duration.seconds(paused), synchronousDemuxerSeek: false,
+                  keepDisplayedFrame: true)
+            return
+        }
         if !resumingContinuous {
-            // 重建音频输出。后台期间(PiP 未激活/不支持/启动失败)音频会话被系统
-            // 暂停,AudioQueue 停止消费,音频时钟停在暂停位置;而 demux/解码器在
-            // app 未被挂起时继续推进 —— resume 时音频时钟落后视频帧 PTS 可达
-            // 数十秒,freeze-ahead 把超前帧全部冻结 → 画面长时间卡死。flush()
-            // 丢弃后台积压的旧帧(它们的内容与校准后的时钟会错位),时钟归零,
-            // 首个校准帧强制校准到帧 PTS(见 forceClockCalibration),让音频从
-            // 当前视频位置重新起步,而不是从暂停位置慢速追赶。
+            // 用户主动暂停(pause() 已停 demux、音频时钟冻结在暂停位置):
+            // 只丢弃音频输出侧暂停前排队的 PCM,保留 jitter 缓冲与时钟位置
+            // —— 恢复从暂停的那一帧继续。
+            //
+            // 旧实现还 flush jitter + audioClock.reset(0) + 强校准到首帧。
+            // 但 demux 循环可能正卡在在途网络读里,暂停期间又读进一段,
+            // demuxer 位置已经超前;flush 掉旧帧后从超前位置起播,真机现象
+            // 就是"恢复画面比暂停画面往前走了 2-6 秒"(2026-11-15)。
             audioUnitOutput?.flush()
+            _injectedAudioOutput?.flush()
             let resumeSR = audioDecoder?.outputSampleRate ?? 44100
             let resumeCh = audioDecoder?.outputChannels ?? 2
             audioUnitOutput?.start(sampleRate: resumeSR, channels: resumeCh)
-            audioUnitOutput?.pause()
-            audioClock.reset(to: 0, sampleRate: resumeSR)
-            displayLoopLock.withLock { forceClockCalibration = true }
         }
         // Continuous path (pipeline never stopped, e.g. PiP): resume audio output
         // regardless of jitter buffer state.
@@ -3572,9 +3598,10 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
         // ~1 s the video needs to refill, after which the clock was calibrated to the
         // first video frame: sound stayed ahead of the picture by that second
         // (measured +0.97 s on the real movie).
-        if resumingContinuous {
-            audioUnitOutput?.resume()
-        }
+        // 两条路径都恢复音频输出:pause() 停过它;下面也不再 flush jitter /
+        // 重置时钟(rebuild 同样保留暂停位置),不会出现"音频比画面提前 1s"。
+        audioUnitOutput?.resume()
+        _injectedAudioOutput?.resume()
         // Invalidate any existing display link before creating a new one.
         // Without this, calling resume() on an already-playing player (e.g. when
         // pip.start() was attempted but PiP never fully activated) would leave
@@ -3591,14 +3618,11 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
         // freeze-ahead stutter on resume. PiP 连续播放场景跳过 —— jitter
         // 里全是新鲜帧,flush 只会造成恢复瞬间无帧可显示(PiP 画面一闪)。
         if !resumingContinuous {
-            jitterBuffer.flush()
+            // 不 flush jitter:保留暂停位置的连续帧(见上面 rebuild 分支注释)。
+            // syncController 重置帧计时,VT 解码器清掉重排序延迟帧(系统可能
+            // 在暂停期间 invalidate 过 session,下一帧会重建)。
             syncController.reset()
             displayLoopLock.withLock { lastBypassPopTime = 0 }
-            // Flush the video decoder after a pause/resume or PiP/background
-            // transition. VTDecompressionSession may have been invalidated by
-            // the system during the transition — VTVideoDecoder will recreate
-            // its session on the next transient error, but we flush delayed
-            // frames first to avoid feeding stale reordered frames.
             if let vt = videoDecoder as? VTVideoDecoder {
                 vt.flush()
             }
@@ -3613,15 +3637,9 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
             _injectedAudioOutput?.resume()
             state.isBuffering = false
         }
-        // Calibrate audioClock to the first post-resume frame (like post-seek).
-        // PiP 连续场景时钟从未停,无需校准。
-        if !resumingContinuous {
-            displayLoopLock.withLock {
-                needsClockCalibration = true
-                audioClockReady = false
-                discardLock.withLock { audioAnchoredAtTarget = false }   // zyno#358: resume does not fine-seek
-            }
-        }
+        // 时钟不重置、也不强制校准到首帧:暂停期间音频时钟已冻结在暂停位置,
+        // jitter 保留的是从该位置起的连续帧;再校准到"首帧 PTS"只会把时钟
+        // 往后拉(demuxer 已超前)。正常 ClockCalibrationPolicy 足以收敛。
         state.isPlaying = true; notifyStateChange()
     }
 
@@ -3637,7 +3655,8 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
     ///   (2026-09-02 用户反馈"播放不出来"实锤,音频时钟已到 75s 而视频还停在
     ///   0.04s)。初始 open 阶段本来就有秒级的网络探测延迟,这里多等几百毫秒
     ///   完全不影响体验,不像交互式拖动 seek 那样对主线程阻塞敏感。
-    private func _seek(to: Duration, synchronousDemuxerSeek: Bool) {
+    private func _seek(to: Duration, synchronousDemuxerSeek: Bool,
+                       keepDisplayedFrame: Bool = false) {
         let secs = to.secondsDouble
         logger.info("seek to \(String(format:"%.1f",secs))s")
         // [diag] arm the seek-landing capture: the first displayed frame of the
@@ -3670,7 +3689,11 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
         passthroughWallClockAnchor = nil
         // Clear the displayed frame so the pre-seek frame doesn't linger on
         // screen until the first post-seek frame is decoded and rendered.
-        _renderer.flush()
+        // keepDisplayedFrame: 暂停恢复的 realign seek 例外 —— 目标位置就是
+        // 暂停画面本身,清屏只会让恢复时黑一下;保留旧帧直到新帧替换。
+        if !keepDisplayedFrame {
+            _renderer.flush()
+        }
         // 系统路径:同步释放层内会话内容(design §6.5 的 seek 形态——不重建
         // 渲染器,flush + 重设 timebase 即可;-12910 冲突只在新建会话时发生)。
         if systemDVActive {
