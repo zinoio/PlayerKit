@@ -3265,8 +3265,15 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
         systemDVBuilder = nil
         systemDVActive = false
         systemDVStarted = false
-        activeVideoPipeline = .decodedFrames
+        // currentMasterAudioTime 必须在 pipeline 写入之前完成:它新增的
+        // devicePlaybackTime 分支会调 AudioQueueGetCurrentTime,在无真实音频
+        // 设备的环境(CI runner)上这个调用可能慢到百毫秒级——夹在
+        // 「activeVideoPipeline = .decodedFrames」与「onSystemDVFallback?()」
+        // 之间时,轮询 pipeline 的观察者(测试的 waitUntil、UI 层同理)会在
+        // 窗口里观察到"已回退但回调未触发"(CI testFallbackOnInjectedFailure
+        // 实测 count1=0 而稍后的 count2=1)。管线切换与回调相邻,窗口消失。
         let pos = max(0, currentMasterAudioTime())
+        activeVideoPipeline = .decodedFrames
         onSystemDVFallback?()
         Task { @MainActor [weak self] in
             self?.rebuildSoftwareDVChain(currentPosition: pos)
