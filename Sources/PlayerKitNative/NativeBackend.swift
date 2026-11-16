@@ -3139,6 +3139,13 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
     /// (zyno#127);PCM = audioClock.audioTime。软件/系统两条路径共用同一口径:
     /// 这里**不做**任何输出延迟加减(#357 保持单一约定,修复后两路一起受益)。
     private nonisolated func currentMasterAudioTime() -> Double {
+        // 业内语义:优先设备播放位置(AudioQueueGetCurrentTime)。暂停时设备
+        // 位置不变、恢复后继续,积压 PCM 不会把时钟推过暂停点。
+        // DV 系统路径不走这里:它有层 timebase 自己校准,设备时钟会干扰
+        // SystemDV 的回退判定(CI testFallbackOnInjectedFailure)。
+        if !systemDVActive, let device = audioUnitOutput?.devicePlaybackTime {
+            return device + audioClock.fullDelay
+        }
         if _injectedAudioOutput != nil && injectedClockActive,
            let pt = _injectedAudioOutput?.playbackTime, pt.isFinite, pt >= 0 {
             return pt + audioClock.fullDelay
@@ -3258,8 +3265,15 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
         systemDVBuilder = nil
         systemDVActive = false
         systemDVStarted = false
-        activeVideoPipeline = .decodedFrames
+        // currentMasterAudioTime 必须在 pipeline 写入之前完成:它新增的
+        // devicePlaybackTime 分支会调 AudioQueueGetCurrentTime,在无真实音频
+        // 设备的环境(CI runner)上这个调用可能慢到百毫秒级——夹在
+        // 「activeVideoPipeline = .decodedFrames」与「onSystemDVFallback?()」
+        // 之间时,轮询 pipeline 的观察者(测试的 waitUntil、UI 层同理)会在
+        // 窗口里观察到"已回退但回调未触发"(CI testFallbackOnInjectedFailure
+        // 实测 count1=0 而稍后的 count2=1)。管线切换与回调相邻,窗口消失。
         let pos = max(0, currentMasterAudioTime())
+        activeVideoPipeline = .decodedFrames
         onSystemDVFallback?()
         Task { @MainActor [weak self] in
             self?.rebuildSoftwareDVChain(currentPosition: pos)
@@ -3549,37 +3563,11 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
         // 音频时钟归零重校准产生咔哒。只有真正 pause 过(循环已取消)才需要
         // 走完整的重建路径。
         let resumingContinuous = demuxStateLock.withLock { demuxLoopRunning && !demuxCancelled }
-        // 用户主动暂停:恢复时对暂停位置做一次 seek,让音视频都从暂停那一帧
-        // 重新解码。只保留 jitter/冻结时钟不够 —— 音频解码/输出侧会积压暂停
-        // 后的 PCM(真机实测恢复瞬间音频时钟 +1.7s),重建时被计入主时钟,
-        // sync 就会把画面拉去追赶,表现为"恢复画面比暂停画面靠后"。
-        // 代价:恢复多一次 seek/填充(0.1-0.5s),换来完全对齐。
-        if !resumingContinuous, let paused = pausedClockPosition {
-            pausedClockPosition = nil
-            logger.info("resume: realign to paused position \(String(format: "%.3f", paused), privacy: .public)s")
-            startDemuxLoop()
-            startDisplayLink()
-            state.isPlaying = true
-            notifyStateChange()
-            _seek(to: Duration.seconds(paused), synchronousDemuxerSeek: false,
-                  keepDisplayedFrame: true)
-            return
-        }
-        if !resumingContinuous {
-            // 用户主动暂停(pause() 已停 demux、音频时钟冻结在暂停位置):
-            // 只丢弃音频输出侧暂停前排队的 PCM,保留 jitter 缓冲与时钟位置
-            // —— 恢复从暂停的那一帧继续。
-            //
-            // 旧实现还 flush jitter + audioClock.reset(0) + 强校准到首帧。
-            // 但 demux 循环可能正卡在在途网络读里,暂停期间又读进一段,
-            // demuxer 位置已经超前;flush 掉旧帧后从超前位置起播,真机现象
-            // 就是"恢复画面比暂停画面往前走了 2-6 秒"(2026-11-15)。
-            audioUnitOutput?.flush()
-            _injectedAudioOutput?.flush()
-            let resumeSR = audioDecoder?.outputSampleRate ?? 44100
-            let resumeCh = audioDecoder?.outputChannels ?? 2
-            audioUnitOutput?.start(sampleRate: resumeSR, channels: resumeCh)
-        }
+        // 用户主动暂停的恢复(业内方案):队列全程只用 AudioQueuePause /
+        // AudioQueueStart,不 flush、不重建、不 seek。主时钟改取设备播放
+        // 位置(AudioUnitOutput.devicePlaybackTime)——暂停期间设备位置不变,
+        // 恢复后从同一点继续,队列里积压的 PCM 不会把位置推过暂停段。
+        pausedClockPosition = nil
         // Continuous path (pipeline never stopped, e.g. PiP): resume audio output
         // regardless of jitter buffer state.
         // If the player was paused while the jitter buffer was in .buffering state,
