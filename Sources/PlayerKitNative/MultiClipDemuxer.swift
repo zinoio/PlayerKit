@@ -81,6 +81,11 @@ final class MultiClipDemuxer: @unchecked Sendable {
 
     /// zyno#171:备选音轨缓存配置,切片段后对新片段重新生效。
     fileprivate var cachedAudioStreams: Set<Int32> = []
+    // 2026-11-14:选中的字幕流 id 缓存——跨 clip 重挂。此前切 clip 后新片段的
+    // subtitleStream 恒为未选中(applyStreamDiscard 把所有字幕流标 AVDISCARD_ALL),
+    // PGS 包静默消失(用户反馈复联4 ISO 原盘切字幕跨接缝不显示)。各 clip 出自
+    // 同一 playlist,流布局一致,缓存的流 id 跨 clip 有效。
+    fileprivate var cachedSubtitleStreamID: Int32? = nil
 
     private func switchTo(clipIndex: Int, localSeekSecs: Double?) throws {
         // Same-clip seek fast path: the clip's demuxer is already fully open,
@@ -149,6 +154,12 @@ final class MultiClipDemuxer: @unchecked Sendable {
         }
         currentIndex = clipIndex
         if !cachedAudioStreams.isEmpty { current?.setCachedAudioStreams(cachedAudioStreams) }
+        // 跨 clip 重挂字幕选择:selectSubtitleStream 带 defer applyStreamDiscard,
+        // 重挂即恢复新 clip 的 discard 布局(选中字幕+音频+缓存备选),PGS 包
+        // 恢复路由。
+        if let sid = cachedSubtitleStreamID {
+            current?.selectSubtitleStream(by: Int(sid))
+        }
         pendingSwitchFlag = true
         logger.info("switched to clip \(clipIndex) offset=\(String(format: "%.3f", self.timeline.startOffsets[clipIndex]))s\(reusedPreOpened ? " (pre-opened)" : "")")
     }
@@ -326,7 +337,10 @@ extension MultiClipDemuxer: PacketDemuxing {
         cachedAudioStreams = indices
         current?.setCachedAudioStreams(indices)
     }
-    func selectSubtitleStream(by id: Int?) { currentDemuxer?.selectSubtitleStream(by: id) }
+    func selectSubtitleStream(by id: Int?) {
+        cachedSubtitleStreamID = id.flatMap(Int32.init)
+        currentDemuxer?.selectSubtitleStream(by: id)
+    }
     // zyno#360: forward the interruption to the active clip's demuxer/reader.
     func interruptPendingReads() -> UInt64 { currentDemuxer?.interruptPendingReads() ?? 0 }
     func resumeReads(after token: UInt64) { currentDemuxer?.resumeReads(after: token) }
