@@ -344,6 +344,10 @@ public final class AudioUnitOutput: AudioOutputBackend {
         audioQueue = queue
         running = true
         paused = false
+        // 新队列的 sampleTime 从 0 起算,内容基准取当前时钟位置(seek 时
+        // 调用方已先 audioClock.reset(to: target),这里正好对上)。
+        _deviceBaseContent = clock.audioTime
+        _deviceBaseSample = 0
         enqueuedFrames = 0
         bufferedFrameCount = 0
         pendingPrimerCallbacks = primerCount
@@ -714,6 +718,14 @@ public final class AudioUnitOutput: AudioOutputBackend {
         }
         let now = ProcessInfo.processInfo.systemUptime
         lock.lock()
+        // 用户暂停兜底:pause() 同步置 paused,但真正的 AudioQueuePause 是
+        // controlQueue.async 下发的,AudioToolbox 内部 IO-cycle 等待可能让它
+        // 晚到;此间回调若继续消耗缓冲,会把音频时钟推过暂停位置(2026-11-15
+        // 真机:恢复后位置 = 暂停位置 + 暂停时长,画面跳过整个暂停段)。
+        if paused {
+            lock.unlock()
+            return
+        }
         if bufferedFrameCount > 0 { bufferedFrameCount &-= 1 }
         let ch = _channels
         let rate = _playbackRate
@@ -771,8 +783,26 @@ public final class AudioUnitOutput: AudioOutputBackend {
     private var _playbackRate: Double = 1.0
 
     public func setPlaybackRate(_ rate: Double) {
+        let clamped = max(0.25, min(4.0, rate.isFinite ? rate : 1.0))
+        // 倍速变更:设备时钟按"输出样本 × rate"换算内容秒,先把基准重锚到
+        // 当前内容位置与当前 sampleTime,避免整段历史按新 rate 重算导致跳变。
+        var sampleTime: Double?
         lock.lock()
-        _playbackRate = max(0.25, min(4.0, rate.isFinite ? rate : 1.0))
+        let queue = audioQueue
+        lock.unlock()
+        if let queue {
+            var ts = AudioTimeStamp()
+            if AudioQueueGetCurrentTime(queue, nil, &ts, nil) == noErr,
+               ts.mFlags.contains(.sampleTimeValid) {
+                sampleTime = ts.mSampleTime
+            }
+        }
+        lock.lock()
+        if let st = sampleTime {
+            _deviceBaseContent = clock.audioTime
+            _deviceBaseSample = st
+        }
+        _playbackRate = clamped
         let targetContent = _delayTargetContent
         let effective = _playbackRate
         lock.unlock()
@@ -791,6 +821,36 @@ public final class AudioUnitOutput: AudioOutputBackend {
     /// 只写 `state.volume`、没有任何消费者(UI 是空转的);这里经
     /// `kAudioQueueParam_Volume` 真正衰减 AudioQueue 输出,建队/重建时补挂。
     private var _volume: Float = 1.0
+
+    /// 设备时钟的内容基准:队列创建时对应的内容秒。设备播放位置 =
+    /// base + AudioQueueGetCurrentTime 的 sampleTime / sampleRate。
+    ///
+    /// AudioQueue 的 sampleTime 在 Pause 期间不变、Start 后继续,所以暂停/
+    /// 恢复天然连续,恢复时队列里积压的 PCM 也不会把时钟推过暂停点 ——
+    /// 这正是业内做法(时钟取设备位置,而不是累计消费样本)。Guarded by lock。
+    private var _deviceBaseContent: Double = 0
+    /// 基准时刻的设备 sampleTime(队列时间轴)。倍速切换时与 _deviceBaseContent
+    /// 一起重锚,保证内容时间 = base + (sample - baseSample)/sr × rate。
+    private var _deviceBaseSample: Double = 0
+
+    /// 设备播放位置(内容秒)。nil = 队列不可用/取不到有效采样时间。
+    /// AudioQueue API 在锁外调用(与 enqueue 路径的锁纪律一致)。
+    var devicePlaybackTime: Double? {
+        lock.lock()
+        let queue = audioQueue
+        let base = _deviceBaseContent
+        let baseSample = _deviceBaseSample
+        let sr = clock.sampleRate
+        let rate = _playbackRate
+        lock.unlock()
+        guard let queue, sr > 0 else { return nil }
+        var ts = AudioTimeStamp()
+        guard AudioQueueGetCurrentTime(queue, nil, &ts, nil) == noErr,
+              ts.mFlags.contains(.sampleTimeValid) else { return nil }
+        // sampleTime 是输出(墙钟)样本;内容时间与 AudioClock.advance 同口径,
+        // 需要乘播放倍速(2x 时 1 秒输出 = 2 秒内容),否则倍速播放位置只走 1x。
+        return base + max(0, Double(ts.mSampleTime) - baseSample) / Double(sr) * Double(rate)
+    }
 
     /// 短临界区读当前音量(start() 不持锁运行,不能裸读)。
     private func currentVolume() -> Float {

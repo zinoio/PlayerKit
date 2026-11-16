@@ -33,6 +33,30 @@ final class AudioUnitOutputPausedEnqueueTests: XCTestCase {
         return condition()
     }
 
+    /// Polls until `clock.audioTime` has not moved for 0.5 s (queue drained).
+    /// CI runners have no real audio device: the callback cadence is driven by
+    /// the synthetic device clock and its scheduling jitter is large, so a
+    /// "must finish within T seconds" assertion turns that jitter into phantom
+    /// frame loss (same assertion measured 1.035 s / 0.971 s on two CI runs,
+    /// and PR #65's CI hit it on code without this branch's changes). The
+    /// regression only needs SETTLING: every enqueued frame must eventually
+    /// be consumed, however slowly.
+    private func waitUntilClockSettles(timeout: TimeInterval, clock: AudioClock) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        var last = clock.audioTime
+        var lastMove = Date()
+        while Date() < deadline {
+            let now = clock.audioTime
+            if abs(now - last) > 0.0005 {
+                last = now
+                lastMove = Date()
+            }
+            if Date().timeIntervalSince(lastMove) > 0.5 { return true }
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        return false
+    }
+
     /// Every frame handed to a paused queue must still be played after resume() as
     /// long as it stays within the paused cap (5 s): the audio clock (which counts
     /// consumed samples) has to reach the total duration enqueued, not stop at the
@@ -50,10 +74,16 @@ final class AudioUnitOutputPausedEnqueueTests: XCTestCase {
         output.resume()
 
         let expected = Double(total * samplesPerFrame) / Double(sampleRate)  // 1.0667 s
-        let reached = waitUntil(timeout: 4.0) { abs(clock.audioTime - expected) < 0.02 }
-        XCTAssertTrue(reached,
-            "expected ≈\(String(format: "%.3f", expected))s of audio to be played, "
-            + "clock reached \(String(format: "%.3f", clock.audioTime))s "
+        // 等时钟停走再断言终值,不设消费速率限时:GitHub macOS runner 没有真实
+        // 音频设备,回调节奏由合成时钟驱动且调度抖动大(同断言两次 CI 实测
+        // 1.035s / 0.971s,「4 秒内到达」会超时;PR #65 的 CI 在不含本分支
+        // 改动的代码上同样挂过 3 帧)。丢帧检测语义保留:停走后的终值若达不到
+        // expected ±50ms,就是真的有帧被丢(旧 60-buffer cap 回归)。
+        XCTAssertTrue(waitUntilClockSettles(timeout: 30.0, clock: clock),
+            "audio clock never settled (still at \(clock.audioTime)s after 30s)")
+        XCTAssertEqual(clock.audioTime, expected, accuracy: 0.05,
+            "frames were lost: enqueued \(total) frames (=\(String(format: "%.3f", expected))s), "
+            + "clock settled at \(String(format: "%.3f", clock.audioTime))s "
             + "(\(Int(((expected - clock.audioTime) * Double(sampleRate)) / Double(samplesPerFrame))) frames lost)")
     }
 

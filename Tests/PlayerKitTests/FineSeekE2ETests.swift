@@ -90,10 +90,17 @@ final class FineSeekE2ETests: XCTestCase {
         }
         let first = try await waitForFirstFrame(recorder, backend: backend)
 
+        // Failure messages carry the first rendered frame sequence: the CI
+        // runner produced a bitwise-identical 6.04 first frame across four
+        // runs while every local run (and every static code path through the
+        // discard gate) starts at >= 6.1. Without the sequence the runner-side
+        // os_log is invisible and the case is undiagnosable.
+        let rendered = recorder.renderedPTS.prefix(24)
+            .map { String(format: "%.3f", $0) }.joined(separator: ",")
         XCTAssertGreaterThanOrEqual(first, 6.1 - 0.05,
-            "first displayed frame \(first)s fell back toward the landing \(landing)s — discard-until-target did not run")
+            "first displayed frame \(first)s fell back toward the landing \(landing)s — discard-until-target did not run; rendered=[\(rendered)]")
         XCTAssertLessThanOrEqual(first, 6.1 + 0.34,
-            "first displayed frame \(first)s overshot the target 6.1s — discard threw away too much")
+            "first displayed frame \(first)s overshot the target 6.1s — discard threw away too much; rendered=[\(rendered)]")
     }
 
     /// Regression guard for the no-seek path: arm/discard state must be inert
