@@ -77,8 +77,19 @@ final class VideoJitterBuffer: @unchecked Sendable {
     ///
     /// Never below what the buffer needs to reach the playing threshold, or playback
     /// would never start.
+    /// 慢网自适应预读深度(压缩包,内存开销 = 码率×深度/8——24Mbps×20s≈60MB,
+    /// 远小于解码帧预算):nil = 旧行为(被 maxDuration 2s cap)。速度不足码率
+    /// 时 NativeBackend 设为 6-20s——demux 把后续内容预读到本地,播放期间
+    /// 不再因网络断供反复进缓冲(2026-11-18 用户反馈「频繁闪缓冲」的治本项)。
+    var adaptiveReadAhead: Double? = nil
+
     var readAheadSeconds: Double {
         lock.lock(); defer { lock.unlock() }
+        if let adaptive = adaptiveReadAhead {
+            // 慢网模式:预读深度直接取自适应值,不受解码帧预算约束
+            //(demux 队列持压缩包,与 jitter 的解码帧内存预算是两笔账)。
+            return max(adaptive, resumeDurationLocked + 2.0 / max(framesPerSecondHint, 1))
+        }
         guard frameBytesHint > 0 else { return maxDuration }
         let byBudget = Double(budgetFramesLocked) / framesPerSecondHint * Self.readAheadBudgetFill
         let floor = resumeDurationLocked + 2.0 / framesPerSecondHint
@@ -118,8 +129,13 @@ final class VideoJitterBuffer: @unchecked Sendable {
     /// async dispatch.
     var onStateChange: ((State) -> Void)?
 
-    let minDuration: Double = 0.5     // 低于此值 → buffering
-    let resumeDuration: Double = 1.0  // 达到此值 → playing
+    /// 低于此值 → buffering。2026-11-18 起 NativeBackend 按「下载速度/码率」
+    /// 比值动态调整(速度不足时提前进缓冲、攒够再放,见 updateBufferPolicy);
+    /// 默认值维持低延迟旧行为。
+    var minDuration: Double = 0.5
+    /// 达到此值 → playing。慢网下动态调大(如 4s)——恢复后连续播放更久,
+    /// 缓冲转圈频率从每秒一次降到每十几秒一次。
+    var resumeDuration: Double = 1.0
     // 2026-09-02 曾试降到 0.6s 换更快首帧,但 115 CDN 单次请求耗时观测到
     // 5~9.5s 的抖动(Cloud115StreamReader.swift 头部注释详述),0.6s 的缓冲
     // margin 扛不住,反而更频繁触发二次卡顿——已撤销回 1.0。
