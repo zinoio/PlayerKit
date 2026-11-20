@@ -55,4 +55,45 @@ final class AudioDeviceDomainTests: XCTestCase {
                                outputRateOverride: 48000))
         XCTAssertEqual(decoder.outputSampleRate, 48000, "outputSampleRate 应取设备域覆写值")
     }
+
+    /// PlayerKit#76 覆盖面:32k/44.1k/96k 三种内容率在 override 48000 下
+    /// 全部归一到设备域。判据:同一 fixture 解码两次,设备域样本数 ÷ 内容域
+    /// 样本数 ≈ 48000/contentRate(时长守恒,比率 ±15%)。
+    func testAllContentRatesNormalizeToDeviceRate() throws {
+        let fixtures: [(file: String, contentRate: Int32)] = [
+            ("aac32000_2s", 32000),
+            ("aac44100_2s", 44100),
+            ("aac96000_2s", 96000),
+        ]
+        for (file, contentRate) in fixtures {
+            let url = Bundle.module.url(forResource: file, withExtension: "aac", subdirectory: "Fixtures")!
+
+            func decodeCount(override: Int32?) throws -> Int {
+                let demuxer = FFmpegDemuxer()
+                try demuxer.open(reader: InMemoryReader(data: try Data(contentsOf: url)))
+                let stream = try XCTUnwrap(demuxer.audioStream)
+                let decoder = try XCTUnwrap(
+                    FFmpegAudioDecoder(stream: stream, sampleRate: contentRate, channels: 2,
+                                       outputRateOverride: override))
+                var samples = 0
+                while let r = demuxer.readPacket() {
+                    if r.streamIndex == demuxer.audioStreamIndex, let pcm = decoder.decode(packet: r.packet) {
+                        samples += pcm.sampleCount
+                    }
+                    var p: UnsafeMutablePointer<AVPacket>? = r.packet
+                    av_packet_free(&p)
+                }
+                return samples
+            }
+
+            let contentSamples = Double(try decodeCount(override: nil))
+            let deviceSamples = Double(try decodeCount(override: 48000))
+            XCTAssertGreaterThan(contentSamples, Double(contentRate) * 1.5,
+                                 "\(file): 内容域样本数下限,实际 \(contentSamples)")
+            let ratio = deviceSamples / max(1, contentSamples)
+            let expectedRatio = 48000.0 / Double(contentRate)
+            XCTAssertEqual(ratio, expectedRatio, accuracy: expectedRatio * 0.15,
+                           "\(file): 设备域/内容域比率应 ≈ \(expectedRatio),实际 \(ratio)")
+        }
+    }
 }
