@@ -85,15 +85,17 @@ final class VideoJitterBuffer: @unchecked Sendable {
 
     var readAheadSeconds: Double {
         lock.lock(); defer { lock.unlock() }
+        let frameDur = 1.0 / max(framesPerSecondHint, 1)
+        let floor = resumeDurationLocked + 2.0 * frameDur
+        // demux 预读是「读到哪解码到哪」,不是压缩包缓存:深度绝不能超过
+        // jitter 容量,否则超出的部分被 append 拒收 → PTS 空洞 → 跳帧。
+        let capacitySecs = capacitySecondsLocked
         if let adaptive = adaptiveReadAhead {
-            // 慢网模式:预读深度直接取自适应值,不受解码帧预算约束
-            //(demux 队列持压缩包,与 jitter 的解码帧内存预算是两笔账)。
-            return max(adaptive, resumeDurationLocked + 2.0 / max(framesPerSecondHint, 1))
+            return max(min(floor, capacitySecs), min(adaptive, capacitySecs))
         }
-        guard frameBytesHint > 0 else { return maxDuration }
+        guard frameBytesHint > 0 else { return min(maxDuration, capacitySecs) }
         let byBudget = Double(budgetFramesLocked) / framesPerSecondHint * Self.readAheadBudgetFill
-        let floor = resumeDurationLocked + 2.0 / framesPerSecondHint
-        return min(maxDuration, max(byBudget, floor))
+        return min(min(maxDuration, capacitySecs), max(byBudget, floor))
     }
 
     /// Share of the byte-budget frames the read-ahead may fill; the rest absorbs the
@@ -111,6 +113,17 @@ final class VideoJitterBuffer: @unchecked Sendable {
         min(max(60, Int((framesPerSecondHint * maxDuration).rounded(.up))), budgetFramesLocked)
     }
 
+    /// 解码帧容量(秒):帧数硬上限扣掉在途余量。预读深度与水位阈值都必须
+    /// 落在其内——超出容量的预读会被 append 拒收并打出 PTS 空洞(显示跳帧),
+    /// 超出容量的水位则永远攒不满(慢网策略把 resume 抬到 4s 时,4K 内容
+    /// 容量只有 ~2.5s,只能靠 slowDecoderGrace 强开)。
+    /// 2026-11-19 真机:ra 4~11s / 容量 60 帧 → 拒收 50~200 帧/5s,
+    /// 显示间隔均值 41.7→191ms、fps 21.6→3.7(声音正常、渲染层健康)。
+    private var capacitySecondsLocked: Double {
+        Double(max(0, maxFrameCountLocked - Self.inFlightSlackFrames))
+            / max(framesPerSecondHint, 1)
+    }
+
     /// The playing/buffering thresholds are durations sized for ~2 s of buffer. When
     /// the byte budget shrinks the buffer below that, scale them with it - otherwise
     /// the buffer can never reach `resumeDuration` and playback falls into the old
@@ -118,8 +131,16 @@ final class VideoJitterBuffer: @unchecked Sendable {
     private var thresholdScaleLocked: Double {
         min(1.0, (Double(capacityFramesLocked) / framesPerSecondHint) / maxDuration)
     }
-    private var resumeDurationLocked: Double { resumeDuration * thresholdScaleLocked }
-    private var minDurationLocked: Double { minDuration * thresholdScaleLocked }
+    /// 高水位还受「容量 − 2 帧」约束:demux 只预读到 readAheadSeconds,而
+    /// readAhead 的下限 = 本值 + 2 帧,两者互相锁定才能保证容量内既攒得到
+    /// 水位、又不会溢出。
+    private var resumeDurationLocked: Double {
+        min(resumeDuration * thresholdScaleLocked,
+            max(0, capacitySecondsLocked - 2.0 / max(framesPerSecondHint, 1)))
+    }
+    private var minDurationLocked: Double {
+        min(minDuration * thresholdScaleLocked, resumeDurationLocked)
+    }
 
     /// Called synchronously when state transitions between .playing and
     /// .buffering. Fires on the demux thread (append) or main thread (pop),

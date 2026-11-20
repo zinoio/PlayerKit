@@ -299,4 +299,46 @@ final class VideoJitterBufferTests: XCTestCase {
         XCTAssertEqual(buf.state, .playing,
             "filling the read-ahead window (\(window) s) must reach the playing threshold, or playback never starts")
     }
+
+    // MARK: - Adaptive read-ahead vs capacity (2026-11-19 regression)
+    //
+    // `updateBufferPolicy` (2026-11-18) raises `adaptiveReadAhead` to 4–20 s on
+    // a low speed/bitrate ratio. The demux decodes inline — reading ahead means
+    // decoding ahead — so a window beyond the decoded-frame capacity makes
+    // append() refuse frames permanently, punching PTS holes that the display
+    // loop then skips while audio (independent clock) stays perfect. Device
+    // 2026-11-19: q pinned at the 60-frame cap, 50–200 frames refused per 5 s,
+    // show interval mean 41.7 → 191 ms, fps 21.6 → 3.7.
+    // The adaptive window must obey the same capacity bound as the normal path.
+
+    func testAdaptiveReadAheadNeverExceedsFrameCapacity() {
+        let buf = VideoJitterBuffer()
+        buf.configureFrameRate(24)
+        buf.adaptiveReadAhead = 20.0
+        let window = buf.readAheadSeconds
+        XCTAssertLessThan(window, 20.0, "the adaptive window must be clamped")
+        XCTAssertLessThanOrEqual(window * 24.0, Double(buf.maxFrameCount),
+            "a \(window) s window is more frames than the buffer holds (\(buf.maxFrameCount)): the overflow would be refused")
+    }
+
+    /// The slow tier raises resume to 4 s, but 4K content caps the buffer at
+    /// ~2.5 s of decoded frames. Filling the (clamped) read-ahead window must
+    /// still cross the resume threshold, or playback can never leave .buffering.
+    func testAdaptiveSlowTierResumeStaysReachable() {
+        let buf = VideoJitterBuffer()
+        buf.configureFrameRate(24)
+        buf.adaptiveReadAhead = 20.0
+        buf.minDuration = 2.0
+        buf.resumeDuration = 4.0
+        let window = buf.readAheadSeconds
+        var i = 0
+        while buf.state == .buffering && Double(i) / 24.0 <= window + 1e-6 {
+            buf.append(makeFrame(pts: Double(i) / 24.0))
+            i += 1
+        }
+        XCTAssertEqual(buf.state, .playing,
+            "the slow-tier resume depth must be clamped inside the read-ahead window")
+        XCTAssertEqual(buf.droppedIncomingCount, 0,
+            "filling the window must never overflow the frame cap")
+    }
 }
