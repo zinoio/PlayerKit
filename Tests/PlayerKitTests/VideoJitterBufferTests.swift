@@ -320,4 +320,46 @@ final class VideoJitterBufferTests: XCTestCase {
         XCTAssertLessThan(window * 120.0, Double(buf.maxFrameCount),
             "a \(window) s window leaves no room for the frames already in flight in the decoder")
     }
+
+    // MARK: - 缓冲宽限起点重置(79db8b1 潜伏缺陷:pop 回 .buffering 不重置
+    // bufferingStart,它只在 init/flush 赋值——播放 4s 后回缓冲,stalled 恒真,
+    // 下一帧 append 立即回 .playing,resume 水位迟滞从未生效)
+
+    func testReturningToBufferingResetsTheGraceWindow() {
+        var fakeNow: TimeInterval = 0
+        let buf = VideoJitterBuffer(now: { fakeNow })
+        buf.append(makeFrame(pts: 0.0))
+        buf.append(makeFrame(pts: 1.0))            // dur = 1.0 ≥ resume → playing
+        XCTAssertEqual(buf.state, .playing)
+
+        fakeNow += 5.0                              // 墙钟推过 slowDecoderGrace(4s)
+        buf.pop()                                   // 剩 1 帧,dur = 0 < min → buffering
+        XCTAssertEqual(buf.state, .buffering)
+
+        // 缺陷版:bufferingStart 仍是 0,stalled = 5−0 > 4 恒真,append 一帧立即
+        // 回 playing。修复版:pop 已把宽限起点重置为 5.0,水位(0.042s)未满必须
+        // 停在 buffering——迟滞真正生效。
+        buf.append(makeFrame(pts: 1.042))
+        XCTAssertEqual(buf.state, .buffering,
+            "回缓冲后宽限期必须重新计时;水位未满不得立即回 playing")
+    }
+
+    func testGraceWindowStillOpensPlaybackAfterReset() {
+        // 修复后的另一半:重置后的 4s 内攒不满水位,仍要有帧就开播——慢解
+        // 兜底语义不得因重置而丢失。
+        var fakeNow: TimeInterval = 0
+        let buf = VideoJitterBuffer(now: { fakeNow })
+        buf.append(makeFrame(pts: 0.0))
+        buf.append(makeFrame(pts: 1.0))
+        XCTAssertEqual(buf.state, .playing)
+
+        fakeNow += 5.0
+        buf.pop()
+        XCTAssertEqual(buf.state, .buffering)
+
+        fakeNow += 4.1                              // 9.1 − 5.0 > 4 → stalled 兜底
+        buf.append(makeFrame(pts: 1.042))
+        XCTAssertEqual(buf.state, .playing,
+            "slowDecoderGrace 到期且有帧,仍应兜底开播")
+    }
 }

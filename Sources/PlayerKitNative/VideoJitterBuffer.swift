@@ -41,8 +41,11 @@ final class VideoJitterBuffer: @unchecked Sendable {
     /// returns asynchronously) when `isFull` starts holding the demux loop back.
     private static let inFlightSlackFrames = 8
 
-    init(memoryBudgetBytes: Int = VideoJitterBuffer.defaultMemoryBudgetBytes) {
+    init(memoryBudgetBytes: Int = VideoJitterBuffer.defaultMemoryBudgetBytes,
+         now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
         self.memoryBudgetBytes = memoryBudgetBytes
+        self.now = now
+        self.bufferingStart = now()
     }
 
     private var bufferedBytesLocked = 0
@@ -205,7 +208,10 @@ final class VideoJitterBuffer: @unchecked Sendable {
     /// 进入 .buffering 的时刻(systemUptime)。解码/读取极慢(如 4K SW 软解
     /// 仅 1-5fps,或 115 网络慢)时 1.0s 缓冲要等几十秒,期间纯黑屏;超过
     /// slowDecoderGrace 后只要有帧就开播 —— 慢但可见,用户不会误以为卡死。
-    private var bufferingStart = ProcessInfo.processInfo.systemUptime
+    /// 计时源经 init 的 `now` 注入(生产 = systemUptime,测试可注假墙钟)。
+    private var bufferingStart: TimeInterval
+    /// 与 bufferingStart 同源的墙钟(见 init `now`)。
+    private let now: () -> TimeInterval
     /// 慢速降级宽限期:进入 buffering 后超过该时长仍未攒满 resumeDuration
     /// 且有帧,直接开播。正常网络/硬解在 1-3s 内就能满足 1.0s 门槛,不受影响。
     private let slowDecoderGrace: TimeInterval = 4.0
@@ -268,7 +274,7 @@ final class VideoJitterBuffer: @unchecked Sendable {
 
         let dur = frames.count >= 2 ? frames.last!.pts - frames.first!.pts : 0
         if _state == .buffering, !frames.isEmpty {
-            let stalled = ProcessInfo.processInfo.systemUptime - bufferingStart > slowDecoderGrace
+            let stalled = now() - bufferingStart > slowDecoderGrace
             if dur >= resumeDurationLocked || eofReached || stalled {
                 _state = .playing
                 newState = .playing
@@ -301,6 +307,12 @@ final class VideoJitterBuffer: @unchecked Sendable {
         // 播到剩 <0.5s 又卡进 buffering 黑屏。
         if _state == .playing, !eofReached, dur < minDurationLocked {
             _state = .buffering
+            // 宽限起点必须跟着重置:bufferingStart 语义是「进入 .buffering 的
+            // 时刻」,而播放中回缓冲走不到 flush()。不重置的话,开播 4s 后
+            // (systemUptime − init 时刻 > slowDecoderGrace)stalled 恒真,
+            // 下一帧 append 立即转回 .playing——resume 水位迟滞从未生效,
+            // 表现为水位贴地飞行、缓冲状态每秒闪烁(79db8b1,2026-08-26 起)。
+            bufferingStart = now()
             newState = .buffering
         }
         lock.unlock()
@@ -342,6 +354,6 @@ final class VideoJitterBuffer: @unchecked Sendable {
         droppedIncomingFrames = 0
         _state = .buffering
         eofReached = false
-        bufferingStart = ProcessInfo.processInfo.systemUptime
+        bufferingStart = now()
     }
 }
