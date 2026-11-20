@@ -45,7 +45,16 @@ final class FFmpegAudioDecoder {
     private var failedPackets = 0
     private var failedReceives = 0
 
-    init?(stream: UnsafeMutablePointer<AVStream>, sampleRate: Int32 = 44100, channels: Int32 = 2) {
+    /// - Parameters:
+    ///   - sampleRate: 内容率的兜底值(codecpar 携带 SFI 索引而非 Hz 时的 fallback)。
+    ///   - outputRateOverride: 输出设备原生采样率(PlayerKit#76)。nil/0 时输出率
+    ///     取内容率(现状)。设置后 swr 在解码器内完成 内容率→设备率 的重采样:
+    ///     内容率≠设备率(如 AAC 44.1k @ 48k 设备)时,AudioQueue 内部转换线程
+    ///     会让时钟的内容域记账与设备实际消费错位——实测音频时钟慢 10%,
+    ///     视频 paced 出匀速拖帧(fps 25→22.5)。解码器 ctx 仍用内容率(解码
+    ///     需要流的真实率),只有 swr 输出率与 outputSampleRate 变为设备率。
+    init?(stream: UnsafeMutablePointer<AVStream>, sampleRate: Int32 = 44100, channels: Int32 = 2,
+          outputRateOverride: Int32? = nil) {
         let codecpar = stream.pointee.codecpar.pointee
 
         // Resolve these early — required before any `return nil` (Swift DI rule).
@@ -64,7 +73,7 @@ final class FFmpegAudioDecoder {
         // downmix entirely, losing the centre channel on stereo speakers → barely audible voice.
         let inCh  = codecpar.ch_layout.nb_channels > 0 ? codecpar.ch_layout.nb_channels : 2
         let outCh = channels > 0 ? channels : 2
-        self.outputSampleRate = effectiveSR
+        self.outputSampleRate = (outputRateOverride ?? 0) > 0 ? outputRateOverride! : effectiveSR
         self.outputChannels   = outCh
         self.inputChannels    = inCh
 

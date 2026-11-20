@@ -1611,7 +1611,8 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
         refreshAltAudioStreams(demuxer)
 
         if let as_ = demuxer.audioStream,
-           let dec = FFmpegAudioDecoder(stream: as_, sampleRate: 44100, channels: 2) {
+           let dec = FFmpegAudioDecoder(stream: as_, sampleRate: 44100, channels: 2,
+                                         outputRateOverride: AudioDeviceSampleRate.preferred()) {
             audioDecoder = dec
             let out = AudioUnitOutput(clock: audioClock, delaySecs: audioDelay)
             audioUnitOutput = out
@@ -4211,7 +4212,8 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
 
         audioUnitOutput?.stop()
         audioDecodeQueue.sync { audioDecoder?.flush() }
-        let newDecoder = FFmpegAudioDecoder(stream: stream, sampleRate: 44100, channels: 2)
+        let newDecoder = FFmpegAudioDecoder(stream: stream, sampleRate: 44100, channels: 2,
+                                            outputRateOverride: AudioDeviceSampleRate.preferred())
         audioDecoder = newDecoder
         discardAudioUntilPts = nil
         let cached = altAudioCache.take(stream: newStream, from: posSecs)
@@ -4342,7 +4344,8 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
             discardAudioUntilPts = nil
         }
         if let stream = demuxer.audioStream {
-            audioDecoder = FFmpegAudioDecoder(stream: stream, sampleRate: 44100, channels: 2)
+            audioDecoder = FFmpegAudioDecoder(stream: stream, sampleRate: 44100, channels: 2,
+                                              outputRateOverride: AudioDeviceSampleRate.preferred())
         }
         // Flush the video pipeline INSIDE demuxLock, same as performDemuxerSeek:
         // the demux loop is blocked here, so no post-landing frame can slip in
