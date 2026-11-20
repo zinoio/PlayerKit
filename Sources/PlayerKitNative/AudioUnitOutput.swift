@@ -58,6 +58,16 @@ public final class AudioUnitOutput: AudioOutputBackend {
     nonisolated(unsafe) static var setVolumeParamImpl: (AudioQueueRef, Float) -> OSStatus = {
         AudioQueueSetParameter($0, kAudioQueueParam_Volume, $1)
     }
+    /// GetCurrentTime seam(#72 主时钟插值缓存):生产用真实现,测试包装计数,
+    /// 断言 freshWindow 内的重复读取不重复进设备查询。Reset in test tearDown.
+    nonisolated(unsafe) static var getCurrentTimeImpl: (AudioQueueRef) -> (sampleTime: Double, valid: Bool) = { queue in
+        var ts = AudioTimeStamp()
+        let rc = AudioQueueGetCurrentTime(queue, nil, &ts, nil)
+        return (ts.mSampleTime, rc == noErr && ts.mFlags.contains(.sampleTimeValid))
+    }
+    /// #72 测试 seam:freshWindow 覆盖(默认 0.1s)。生产永不安值;测试放大/
+    /// 缩小窗口以确定性地断言「窗内零查询 / 超窗一次查询」。Reset in tearDown.
+    nonisolated(unsafe) static var clockFreshWindowForTesting: TimeInterval?
 
     /// Serial queue that owns every AudioQueue control call (Pause/Start).
     ///
@@ -384,6 +394,8 @@ public final class AudioUnitOutput: AudioOutputBackend {
         leadAnchorTaken = 0
         lastCallbackWall = 0
         contentFifo.removeAll(); playedContentEndPTS = .nan
+        // #72:队列引用已作废(新队列是新时间轴),锚点必须失效
+        clockCache.invalidate()
         lock.unlock()
         // Seek/stop/track-switch all land here: drop the held-back frames so
         // stale pre-seek audio can't play from the new position, and zero the
@@ -426,6 +438,16 @@ public final class AudioUnitOutput: AudioOutputBackend {
         controlQueue.async { [weak self] in
             guard let self, let q = self.currentQueueLocked() else { return }
             _ = Self.pauseImpl(q)
+            // #72:暂停落地后把锚点钉到真实冻结点——否则暂停显示位置冻结在
+            // flag 翻转前的锚点,最多滞后一个 freshWindow。control 路径一次
+            // 查询,不进热路径。
+            let r = Self.getCurrentTimeImpl(q)
+            self.lock.lock()
+            if r.valid {
+                self.clockCache.commit(sample: r.sampleTime,
+                                       now: ProcessInfo.processInfo.systemUptime)
+            }
+            self.lock.unlock()
         }
     }
 
@@ -438,6 +460,9 @@ public final class AudioUnitOutput: AudioOutputBackend {
         // A deliberate pause is not a starvation: re-anchor the callback clock
         // so the first enqueue after a resume cannot trigger a rebuild.
         if lastCallbackWall > 0 { lastCallbackWall = ProcessInfo.processInfo.systemUptime }
+        // #72:resume 后锚点失效——AudioQueueStart 是异步下发的,落地前真实
+        // 查询返回的仍是暂停冻结值(与旧语义一致),落地后自然前进。
+        clockCache.invalidate()
         lock.unlock()
         guard queue != nil else {
             // 音频队列尚不存在时被要求恢复:start() 未跑或队列已 dispose。
@@ -803,6 +828,9 @@ public final class AudioUnitOutput: AudioOutputBackend {
             _deviceBaseSample = st
         }
         _playbackRate = clamped
+        // #72:基准刚按真实 sampleTime 重锚,锚点同步失效,下一读回真值,
+        // 保证 base 与缓存锚点取自同一次时间轴状态。
+        clockCache.invalidate()
         let targetContent = _delayTargetContent
         let effective = _playbackRate
         lock.unlock()
@@ -832,24 +860,47 @@ public final class AudioUnitOutput: AudioOutputBackend {
     /// 基准时刻的设备 sampleTime(队列时间轴)。倍速切换时与 _deviceBaseContent
     /// 一起重锚,保证内容时间 = base + (sample - baseSample)/sr × rate。
     private var _deviceBaseSample: Double = 0
+    /// #72 主时钟插值缓存:sampleTime 锚点 + 单调墙钟外推,热路径零 XPC。
+    /// 锚点在 disposeUnderLock/resume/setPlaybackRate 失效。Guarded by lock。
+    private var clockCache = InterpolatedDeviceClock(
+        freshWindow: AudioUnitOutput.clockFreshWindowForTesting ?? 0.10)
 
     /// 设备播放位置(内容秒)。nil = 队列不可用/取不到有效采样时间。
-    /// AudioQueue API 在锁外调用(与 enqueue 路径的锁纪律一致)。
+    /// #72:freshWindow(0.1s ⇒ ≥10Hz 真查询)内走锚点外推,热路径零 XPC/
+    /// 锁等待;暂停期锚点冻结;查询失败在 grace 内兜底外推。AudioQueue API
+    /// 在锁外调用(与 enqueue 路径的锁纪律一致)。
     var devicePlaybackTime: Double? {
+        let now = ProcessInfo.processInfo.systemUptime
         lock.lock()
         let queue = audioQueue
         let base = _deviceBaseContent
         let baseSample = _deviceBaseSample
         let sr = clock.sampleRate
         let rate = _playbackRate
+        let pausedNow = paused
+        let action = clockCache.plan(paused: pausedNow, now: now, sampleRate: Double(max(1, sr)))
         lock.unlock()
         guard let queue, sr > 0 else { return nil }
-        var ts = AudioTimeStamp()
-        guard AudioQueueGetCurrentTime(queue, nil, &ts, nil) == noErr,
-              ts.mFlags.contains(.sampleTimeValid) else { return nil }
+        let sample: Double?
+        switch action {
+        case .extrapolate(let s), .frozen(let s):
+            sample = s
+        case .query:
+            let result = Self.getCurrentTimeImpl(queue)
+            lock.lock()
+            if result.valid {
+                clockCache.commit(sample: result.sampleTime, now: now)
+                sample = result.sampleTime
+            } else {
+                // 瞬时 XPC 抖动:grace 内按锚点外推,不把失败注入视频时钟
+                sample = clockCache.fallbackAfterFailedQuery(now: now, sampleRate: Double(max(1, sr)))
+            }
+            lock.unlock()
+        }
+        guard let s = sample else { return nil }
         // sampleTime 是输出(墙钟)样本;内容时间与 AudioClock.advance 同口径,
         // 需要乘播放倍速(2x 时 1 秒输出 = 2 秒内容),否则倍速播放位置只走 1x。
-        return base + max(0, Double(ts.mSampleTime) - baseSample) / Double(sr) * Double(rate)
+        return base + max(0, s - baseSample) / Double(sr) * Double(rate)
     }
 
     /// 短临界区读当前音量(start() 不持锁运行,不能裸读)。
