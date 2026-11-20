@@ -254,6 +254,16 @@ final class FFmpegDemuxer: @unchecked Sendable {
             && (cp.profile == AV_PROFILE_HEVC_MAIN_10 || cp.profile == AV_PROFILE_HEVC_REXT)
         let isHEVC10Bit = isHEVC && (cp.bits_per_raw_sample == 10 || isHEVC10BitByProfile)
 
+        // P7 转换态(设计 2026-11-16 D6):一期只对 MKV/WebM 的 BlockAdditions
+        // 路径开启(ffmpeg 逐帧供给已实测完整);ISO/M2TS 待 V1b 实测后再开。
+        // 原始 profile/compat 保持不变,只填独立转换态副本。
+        // 码流级改写由 NativeBackend 在系统路径分叉处构造 DoviP7PacketRewriter
+        // 完成(mp4 length-prefix 域:剥 unspec63 EL、转换替换 unspec62 RPU)。
+        let containerName = formatCtx?.pointee.iformat?.pointee.name
+            .map { String(cString: $0) } ?? ""
+        let p7Convertible = containerName.contains("matroska") || containerName.contains("webm")
+        let convertedCompat: UInt8? = (isDolbyVision && doviProfile == 7 && p7Convertible) ? 1 : nil
+
         return VideoStreamAttributes(
             width: Int(cp.width),
             height: Int(cp.height),
@@ -264,6 +274,7 @@ final class FFmpegDemuxer: @unchecked Sendable {
             isDolbyVision: isDolbyVision,
             doviProfile: doviProfile,
             blSignalCompatibilityId: doviBLSignalCompatibilityId,
+            doviConvertedCompatId: convertedCompat,
             hasHDR10Plus: hasHDR10Plus,
             isHEVC10Bit: isHEVC10Bit
         )

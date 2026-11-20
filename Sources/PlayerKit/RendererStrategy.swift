@@ -35,6 +35,12 @@ public struct VideoStreamAttributes: Sendable {
     /// 1/2/4 as backward compatible.
     public var blSignalCompatibilityId: UInt8
 
+    /// P7 转换态(设计 2026-11-16 D6/Q5):非 nil = 数据管线已把 P7 RPU 转换为
+    /// 该 compat id(一期固定 1),路由按 P8.1 看待。**原始 profile/compat 字段
+    /// 保持不变**——识别、徽标、`[dovi-open]` 日志、语料 manifest 仍见源身份。
+    /// nil = 未转换(原始身份)。
+    public var doviConvertedCompatId: UInt8?
+
     /// True when the stream carries HDR10+ ST 2094-40 dynamic metadata.
     /// Stream-level hint; per-frame bezier data arrives via `FrameMetadata.hdr10Plus`.
     public var hasHDR10Plus: Bool
@@ -56,6 +62,7 @@ public struct VideoStreamAttributes: Sendable {
                 isDolbyVision: Bool = false,
                 doviProfile: UInt8 = 0,
                 blSignalCompatibilityId: UInt8 = 0,
+                doviConvertedCompatId: UInt8? = nil,
                 hasHDR10Plus: Bool = false,
                 isHEVC10Bit: Bool = false) {
         self.width = width
@@ -67,6 +74,7 @@ public struct VideoStreamAttributes: Sendable {
         self.isDolbyVision = isDolbyVision
         self.doviProfile = doviProfile
         self.blSignalCompatibilityId = blSignalCompatibilityId
+        self.doviConvertedCompatId = doviConvertedCompatId
         self.hasHDR10Plus = hasHDR10Plus
         self.isHEVC10Bit = isHEVC10Bit
     }
@@ -274,6 +282,12 @@ public func decideRendererStrategy(
 
     // 1. Dolby Vision
     if stream.isDolbyVision {
+        // P7 转换态(设计 D6/Q5):数据管线已把 RPU 转成 compat 1 → 路由按
+        // P8.1 看待。原始 profile/compat 保留(识别/徽标/日志);免费 guard
+        // 仍在所有 DV 分支之前(D3 不动)。
+        let convertedP7 = stream.doviProfile == 7 ? stream.doviConvertedCompatId : nil
+        let effectiveProfile: UInt8 = convertedP7 == nil ? stream.doviProfile : 8
+        let effectiveCompat: UInt8 = convertedP7 ?? stream.blSignalCompatibilityId
         // Free tier: fall back to HDR10 base layer.
         // Profile 8 carries a full HDR10 base layer — plays correctly as HDR10.
         // Profile 5 has no HDR10 compat layer but degrades to hdr10Static
@@ -308,10 +322,11 @@ public func decideRendererStrategy(
            systemDolbyVision.isAvailable,
            edrCapable,
            SystemDVPolicy.isEligible(profile: stream.doviProfile,
-                                     compatId: stream.blSignalCompatibilityId) {
+                                     compatId: stream.blSignalCompatibilityId,
+                                     convertedP7CompatId: convertedP7) {
             return .doviSystem
         }
-        switch stream.doviProfile {
+        switch effectiveProfile {
         case 5:
             return edrCapable ? .doviProfile5 : .degradedHDR10
         case 8:
@@ -319,7 +334,7 @@ public func decideRendererStrategy(
             // HDR10 (P8.1): plays correctly as HDR10 when DV is unavailable —
             // tonemapCompat records that for diagnostics (see case doc; no
             // renderer consumes it today). == 2 is an SDR base layer, == 4 HLG.
-            let compat = stream.blSignalCompatibilityId == 1
+            let compat = effectiveCompat == 1
             return edrCapable ? .doviProfile8(tonemapCompat: compat) : .degradedHDR10
         case 7:
             // Profile 7 (BL+EL dual-layer) — software dual-layer decode is out

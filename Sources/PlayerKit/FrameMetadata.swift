@@ -23,6 +23,11 @@ public struct FrameMetadata: Sendable, Equatable {
     /// geometric approximation chain (`DolbyVisionColorSignal`).
     public var doviReshape: DoviReshapingCurve?
 
+    /// P7→P8.1 转换态(设计 2026-11-16 §4.2/D7):非 nil = 该帧已按 compat 1
+    /// 转换,消费方优先使用;原始 `dovi` / `doviReshape` 保持不变(身份隔离,
+    /// 徽标/日志/语料 manifest 仍见 P7 源身份)。
+    public var p7Converted: DoviRpuConverter.ConvertedFrame?
+
     /// HDR10+ ST 2094-40 dynamic metadata (per-frame bezier curve).
     /// Present only for HDR10+ streams decoded via FFmpeg SW.
     public var hdr10Plus: HDR10PlusFrameMetadata?
@@ -41,12 +46,14 @@ public struct FrameMetadata: Sendable, Equatable {
                 hdr10Plus: HDR10PlusFrameMetadata?,
                 masteringDisplay: MasteringDisplayMetadata?,
                 contentLightLevel: ContentLightLevelMetadata?,
-                doviReshape: DoviReshapingCurve? = nil) {
+                doviReshape: DoviReshapingCurve? = nil,
+                p7Converted: DoviRpuConverter.ConvertedFrame? = nil) {
         self.dovi = dovi
         self.hdr10Plus = hdr10Plus
         self.masteringDisplay = masteringDisplay
         self.contentLightLevel = contentLightLevel
         self.doviReshape = doviReshape
+        self.p7Converted = p7Converted
     }
 }
 

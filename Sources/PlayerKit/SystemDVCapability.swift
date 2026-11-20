@@ -48,12 +48,29 @@ public enum SystemDVPolicy {
     /// Whether a DV stream (profile, P8 compat id) is eligible for the system
     /// path at all — independent of display/preference conditions, which the
     /// strategy layer checks separately.
-    public static func isEligible(profile: UInt8, compatId: UInt8) -> Bool {
+    ///
+    /// - Parameter convertedP7CompatId: 非 nil = 该 P7 已被数据管线转换为该
+    ///   compat id(一期固定 1,设计 D6)。只有转换态 P7 才允许进系统路径;
+    ///   未转换 P7 维持 `degradedHDR10`(D7)。
+    public static func isEligible(profile: UInt8, compatId: UInt8,
+                                  convertedP7CompatId: UInt8? = nil) -> Bool {
+        if profile == 7 {
+            return convertedP7CompatId.map { eligibleP8CompatIds.contains($0) } ?? false
+        }
         switch profile {
         case 5:  return true
         case 8:  return eligibleP8CompatIds.contains(compatId)
         default: return false
         }
+    }
+
+    /// P7 转换态 open 后的逐帧 RPU 校验窗口:开头 N 帧全无有效 RPU → 判路由
+    /// 失误,回 `degradedHDR10`(设计 §4.3)。单帧畸形只降级该帧,不 reopen。
+    public static let rpuValidationFrames = 8
+
+    public static func shouldFallbackAfterRpuValidation(validFrames: Int,
+                                                        checkedFrames: Int) -> Bool {
+        checkedFrames >= rpuValidationFrames && validFrames == 0
     }
 }
 
