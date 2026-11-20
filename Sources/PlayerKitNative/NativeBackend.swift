@@ -3405,9 +3405,10 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
                     self.lastBytesLogged = self.totalBytesRead
                     self.lastThroughputTime = now
                 }
-                // 缓冲策略自适应(2026-11-18 用户反馈「频繁闪缓冲」治本):
-                // 按下载速度/片源码率比值动态调 jitter 水位与 demux 预读深度
-                updateBufferPolicy(cacheSpeed: self.state.cacheSpeed)
+                // 注意:cacheSpeed 是 demux 的消费速度(预读节流把它压到约等于
+                // 播放码率),不是网速——别拿它去调 jitter 水位。2026-11-18 的缓冲
+                // 策略自适应因此把稳态播放误判成慢网/中档,2026-11-20 撤销
+                // (见 BufferingStabilityTests)。
             } else if !hasBaseline {
                 throughputLock.withLock {
                     self.lastBytesLogged = self.totalBytesRead
@@ -4495,40 +4496,6 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
             }
             break
         }
-    }
-
-    /// 缓冲策略自适应(2026-11-18 用户反馈「频繁闪缓冲」治本):按「下载速度
-    /// / 片源码率」比值分档调 jitter 水位与 demux 预读深度——慢网下提前进
-    /// 缓冲、攒够 4s 再放、demux 预读 6-20s 压缩包(播放期间不再反复断供);
-    /// 快网维持默认低延迟水位。诊断窗口(5s)每轮发布 cacheSpeed 时调用。
-    private func updateBufferPolicy(cacheSpeed: Int64) {
-        let bitrateBps = state.videoInfo?.bitrate ?? 0
-        guard bitrateBps > 0, cacheSpeed > 0 else {
-            jitterBuffer.adaptiveReadAhead = nil
-            jitterBuffer.minDuration = 0.5
-            jitterBuffer.resumeDuration = 1.0
-            return
-        }
-        // 富余倍数:下载 B/s×8 = bits/s,除以片源码率
-        let ratio = Double(cacheSpeed) * 8 / Double(bitrateBps)
-        switch ratio {
-        case ..<1.2:
-            // 明显不足:提前进缓冲(2s)、攒 4s 放、demux 预读 6/r 但 ≤20s
-            jitterBuffer.minDuration = 2.0
-            jitterBuffer.resumeDuration = 4.0
-            jitterBuffer.adaptiveReadAhead = min(20.0, max(6.0, 6.0 / max(ratio, 0.05)))
-        case 1.2..<2.0:
-            // 刚够:中等水位
-            jitterBuffer.minDuration = 1.0
-            jitterBuffer.resumeDuration = 2.0
-            jitterBuffer.adaptiveReadAhead = 4.0
-        default:
-            // 充足:默认低延迟水位
-            jitterBuffer.adaptiveReadAhead = nil
-            jitterBuffer.minDuration = 0.5
-            jitterBuffer.resumeDuration = 1.0
-        }
-        logger.info("[buffer-policy] ratio=\(String(format: "%.2f", ratio)) min=\(self.jitterBuffer.minDuration) resume=\(self.jitterBuffer.resumeDuration) readAhead=\(self.jitterBuffer.adaptiveReadAhead.map { String(format: "%.0f", $0) } ?? "default")")
     }
 
     private func recreateAudioOutput() {

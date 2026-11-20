@@ -77,12 +77,6 @@ final class VideoJitterBuffer: @unchecked Sendable {
     ///
     /// Never below what the buffer needs to reach the playing threshold, or playback
     /// would never start.
-    /// 慢网自适应预读深度(压缩包,内存开销 = 码率×深度/8——24Mbps×20s≈60MB,
-    /// 远小于解码帧预算):nil = 旧行为(被 maxDuration 2s cap)。速度不足码率
-    /// 时 NativeBackend 设为 6-20s——demux 把后续内容预读到本地,播放期间
-    /// 不再因网络断供反复进缓冲(2026-11-18 用户反馈「频繁闪缓冲」的治本项)。
-    var adaptiveReadAhead: Double? = nil
-
     var readAheadSeconds: Double {
         lock.lock(); defer { lock.unlock() }
         let frameDur = 1.0 / max(framesPerSecondHint, 1)
@@ -90,9 +84,6 @@ final class VideoJitterBuffer: @unchecked Sendable {
         // demux 预读是「读到哪解码到哪」,不是压缩包缓存:深度绝不能超过
         // jitter 容量,否则超出的部分被 append 拒收 → PTS 空洞 → 跳帧。
         let capacitySecs = capacitySecondsLocked
-        if let adaptive = adaptiveReadAhead {
-            return max(min(floor, capacitySecs), min(adaptive, capacitySecs))
-        }
         guard frameBytesHint > 0 else { return min(maxDuration, capacitySecs) }
         let byBudget = Double(budgetFramesLocked) / framesPerSecondHint * Self.readAheadBudgetFill
         return min(min(maxDuration, capacitySecs), max(byBudget, floor))
@@ -115,10 +106,9 @@ final class VideoJitterBuffer: @unchecked Sendable {
 
     /// 解码帧容量(秒):帧数硬上限扣掉在途余量。预读深度与水位阈值都必须
     /// 落在其内——超出容量的预读会被 append 拒收并打出 PTS 空洞(显示跳帧),
-    /// 超出容量的水位则永远攒不满(慢网策略把 resume 抬到 4s 时,4K 内容
-    /// 容量只有 ~2.5s,只能靠 slowDecoderGrace 强开)。
-    /// 2026-11-19 真机:ra 4~11s / 容量 60 帧 → 拒收 50~200 帧/5s,
-    /// 显示间隔均值 41.7→191ms、fps 21.6→3.7(声音正常、渲染层健康)。
+    /// 超出容量的水位则永远攒不满(只能靠 slowDecoderGrace 强开)。
+    /// 2026-11-19 真机(已撤销的自适应预读 4~11s / 容量 60 帧):拒收 50~200
+    /// 帧/5s,显示间隔均值 41.7→191ms、fps 21.6→3.7(声音正常、渲染层健康)。
     private var capacitySecondsLocked: Double {
         Double(max(0, maxFrameCountLocked - Self.inFlightSlackFrames))
             / max(framesPerSecondHint, 1)
@@ -150,13 +140,13 @@ final class VideoJitterBuffer: @unchecked Sendable {
     /// async dispatch.
     var onStateChange: ((State) -> Void)?
 
-    /// 低于此值 → buffering。2026-11-18 起 NativeBackend 按「下载速度/码率」
-    /// 比值动态调整(速度不足时提前进缓冲、攒够再放,见 updateBufferPolicy);
-    /// 默认值维持低延迟旧行为。
-    var minDuration: Double = 0.5
-    /// 达到此值 → playing。慢网下动态调大(如 4s)——恢复后连续播放更久,
-    /// 缓冲转圈频率从每秒一次降到每十几秒一次。
-    var resumeDuration: Double = 1.0
+    // 水位是 `let`:不要在播放期间按下载速度之类的信号运行时调整。2026-11-18 的
+    // 缓冲策略自适应(097d2e1)这样做过——信号测的是 demux 消费速度而非网速,稳态
+    // 被判成慢网/中档(慢网档 min 2.0s),而 60 帧容量下稳态水位约 (60−8)/fps 秒,
+    // 与之只差 0–3 帧:24fps 刚好多 2 帧,≥25fps 即 playing↔buffering 抖动
+    // (fps 掉 27–34%),2026-11-20 撤销。
+    let minDuration: Double = 0.5     // 低于此值 → buffering
+    let resumeDuration: Double = 1.0  // 达到此值 → playing
     // 2026-09-02 曾试降到 0.6s 换更快首帧,但 115 CDN 单次请求耗时观测到
     // 5~9.5s 的抖动(Cloud115StreamReader.swift 头部注释详述),0.6s 的缓冲
     // margin 扛不住,反而更频繁触发二次卡顿——已撤销回 1.0。
