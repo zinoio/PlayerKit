@@ -3187,16 +3187,24 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
     /// (zyno#127);PCM = audioClock.audioTime。软件/系统两条路径共用同一口径:
     /// 这里**不做**任何输出延迟加减(#357 保持单一约定,修复后两路一起受益)。
     private nonisolated func currentMasterAudioTime() -> Double {
-        // 业内语义:优先设备播放位置(AudioQueueGetCurrentTime)。暂停时设备
-        // 位置不变、恢复后继续,积压 PCM 不会把时钟推过暂停点。
-        // DV 系统路径不走这里:它有层 timebase 自己校准,设备时钟会干扰
-        // SystemDV 的回退判定(CI testFallbackOnInjectedFailure)。
-        if !systemDVActive, let device = audioUnitOutput?.devicePlaybackTime {
-            return device + audioClock.fullDelay
-        }
-        if _injectedAudioOutput != nil && injectedClockActive,
+        // 消费样本时钟(回调累计的真实播放进度)是主时钟。
+        // 2026-11-21 实锤:AudioQueueGetCurrentTime(devicePlaybackTime)返回的是
+        // **队列尾部**(已入队未播出)而非播放头——实测 dev 超前 cons 1.95 秒
+        // (随音频预读深度变化,最高观测 5.75s),视频按"未来"对齐,真机感知
+        // 画面超前 2~3 秒。切回 cons 后音画同步,暂停恢复(#66 场景)亦正常。
+        // 倍速:advance(rate:) 已把输出样本折算成内容时间,倍速下依然正确。
+        // 注入输出(PRO DSP/透传)自带设备时间线,语义是真实播放位置,保持最优先。
+        if _injectedAudioOutput != nil, injectedClockActive,
            let pt = _injectedAudioOutput?.playbackTime, pt.isFinite, pt >= 0 {
             return pt + audioClock.fullDelay
+        }
+        if !systemDVActive, audioClock.hasConsumedOutput {
+            return audioClock.audioTime
+        }
+        // 兜底:音频尚未产出(首播前)时的设备时钟;cons 有值即不再使用。
+        // DV 系统路径不走设备时钟:它有层 timebase 自己校准。
+        if !systemDVActive, let device = audioUnitOutput?.devicePlaybackTime {
+            return device + audioClock.fullDelay
         }
         return audioClock.audioTime
     }
