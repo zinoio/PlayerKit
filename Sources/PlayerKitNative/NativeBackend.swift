@@ -339,6 +339,14 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
         isPassthroughActive || isInjectedPCMActive
     }
     private let jitterBuffer = VideoJitterBuffer()
+    // —— 缓冲状态副作用(design 2026-11-21 方案 B;onStateChange 在 demux/显示
+    //    线程触发,跨线程访问走 nonisolated(unsafe) + 叶子锁惯例)——
+    /// 最近一次下发给 UI 的 isBuffering;nil = 本会话尚未下发。只在变化时通知。
+    private nonisolated(unsafe) var reportedUIBuffering: Bool?
+    /// 用户主动暂停(最高优先级):jitter 放行不得据此恢复音频。
+    private nonisolated(unsafe) var userPausedForPolicy = false
+    /// 护 reportedUIBuffering 的叶子锁(不与 displayLoopLock 混用)。
+    private let bufferingStateLock = NSLock()
     /// P2: ticked from the display thread; internally lock-guarded (see SyncController).
     nonisolated(unsafe) private let syncController = SyncController()
     // Set after play() or seek(); cleared by displayNextFrame on first frame.
@@ -444,11 +452,6 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
     /// fire and advance audioClock past 0 — without this, seek-to-0 freezes because
     /// primer debt keeps audioClock at 0 while video PTS advances past the 60ms threshold.
     private nonisolated(unsafe) var audioClockReady: Bool = false
-    /// pause() 记下的播放位置(内容秒)。resume() 据此 seek 回暂停位置,
-    /// 让音视频都从暂停那一帧重新解码 —— 只保留缓冲/冻结时钟不够:音频
-    /// 解码/输出侧会积压暂停后的 PCM(实测 +1.7s),重建时被计入时钟会把
-    /// 画面拉去追赶。主线程生命周期路径读写。
-    private var pausedClockPosition: Double?
     // demuxCancelled is written under demuxStateLock (never demuxLock — see there) and
     // read from DispatchQueue.global().
     // Bool reads/writes are atomic on ARM64 in practice; nonisolated(unsafe) makes
@@ -1631,8 +1634,9 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
             codedSize: CGSize(width: codedVideoWidth, height: codedVideoHeight),
             sampleAspectRatio: demuxer.sampleAspectRatio)
 
+        // 新会话从头开始(缓冲 UI 上报/用户暂停标记),再接线回调。
+        resetBufferingState()
         wireJitterBuffer()
-
         // 音频队列必须先于 demux/display 启动建好并暂停。否则 demux 线程把
         // jitterBuffer 翻到 .playing(onStateChange → resume())时,音频队列
         // 尚未创建(start() 未跑)或本次 pause() 晚于那次 resume() 而覆盖了
@@ -1692,29 +1696,60 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
 
     private func wireJitterBuffer() {
         jitterBuffer.onStateChange = { [weak self] newState in
-            guard let self = self else { return }
+            guard let self = self, !self.systemDVActive else { return }
             switch newState {
             case .buffering:
-                self.audioUnitOutput?.pause()
-                self._injectedAudioOutput?.pause()
-                DispatchQueue.main.async { [weak self] in
-                    guard let self = self else { return }
-                    self.state.isBuffering = true
-                    // Drop the tick-gap baseline so the refill-triggered resume
-                    // isn't misreported as a main-thread stall by the gap
-                    // diagnostic in displayNextFrame().
-                    self.lastTickWallTime = nil
-                    self.notifyStateChange()
-                }
+                // 真断粮(实际无帧可显示连续 ≥0.12s 防抖,VideoJitterBuffer 判定)
+                // → 暂停音频 + 显示缓冲卡。
+                self.setAudioPaused(true)
+                self.requestUIBuffering(true)
             case .playing:
-                self.audioUnitOutput?.resume()
-                self._injectedAudioOutput?.resume()
-                DispatchQueue.main.async { [weak self] in
-                    guard let self = self else { return }
-                    self.state.isBuffering = false
-                    self.notifyStateChange()
-                }
+                // 高水位/EOF/宽限放行 → 恢复音频 + 清缓冲卡。
+                // 用户暂停时 setAudioPaused(false) 拒绝执行(方案 B 仲裁:
+                // jitter 永远不能顶掉用户暂停)。
+                self.setAudioPaused(false)
+                self.requestUIBuffering(false)
             }
+        }
+    }
+
+    // MARK: - 缓冲状态副作用(方案 B:单一拥有者)
+
+    /// 会话开始/结束:UI 上报值与用户暂停标记清零。
+    private nonisolated func resetBufferingState() {
+        bufferingStateLock.withLock {
+            reportedUIBuffering = nil
+        }
+        userPausedForPolicy = false
+    }
+
+    /// 音频停走的唯一仲裁入口。恢复侧在用户主动暂停期间拒绝执行 —— 用户
+    /// 暂停后即使 jitter 放行,也不能把用户的暂停顶掉。
+    nonisolated func setAudioPaused(_ paused: Bool) {
+        if paused {
+            audioUnitOutput?.pause()
+            _injectedAudioOutput?.pause()
+        } else {
+            guard !userPausedForPolicy else { return }
+            audioUnitOutput?.resume()
+            _injectedAudioOutput?.resume()
+        }
+    }
+
+    /// 缓冲指示下发:只在值变化时 dispatch 到 main 写 state 并通知。
+    /// 置 true 时按既有语义清掉 tick-gap 基线,避免恢复瞬间被误报为主线程卡顿。
+    private nonisolated func requestUIBuffering(_ buffering: Bool) {
+        let changed = bufferingStateLock.withLock { () -> Bool in
+            guard reportedUIBuffering != buffering else { return false }
+            reportedUIBuffering = buffering
+            return true
+        }
+        guard changed else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.state.isBuffering = buffering
+            if buffering { self.lastTickWallTime = nil }
+            self.notifyStateChange()
         }
     }
 
@@ -2686,6 +2721,10 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
         guard renderGate.try() else { return }
         defer { renderGate.unlock() }
 
+        // 方案 B:实际断粮检查在所有 early return 之前每 tick 执行;转缓冲的
+        // 音频/UI 副作用由 onStateChange 统一执行。
+        jitterBuffer.pollStarvation()
+
         let now = CACurrentMediaTime()
         let bufferPlaying = jitterBuffer.state == .playing
 
@@ -3518,7 +3557,7 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
     }
 
     public func pause() {
-        pausedClockPosition = max(0, currentMasterAudioTime())
+        userPausedForPolicy = true
         logger.info("pause")
         displayLink?.invalidate(); displayLink = nil
         displayLoopLock.withLock { displayLoopStopped = true }
@@ -3563,6 +3602,7 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
             return
         }
         logger.info("resume")
+        userPausedForPolicy = false
         // Re-activate the AudioSession.  After a background/PiP transition iOS may
         // deactivate the session, which silently prevents AudioQueue callbacks
         // from firing — the audio clock freezes and A/V sync stalls.
@@ -3575,12 +3615,11 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
         // jitterBuffer 后恢复瞬间没有新帧可显示(主画面闪过 PiP 的最后内容)、
         // 音频时钟归零重校准产生咔哒。只有真正 pause 过(循环已取消)才需要
         // 走完整的重建路径。
-        let resumingContinuous = demuxStateLock.withLock { demuxLoopRunning && !demuxCancelled }
-        // 用户主动暂停的恢复(业内方案):队列全程只用 AudioQueuePause /
-        // AudioQueueStart,不 flush、不重建、不 seek。主时钟改取设备播放
-        // 位置(AudioUnitOutput.devicePlaybackTime)——暂停期间设备位置不变,
+        // 用户主动暂停的恢复(业内方案,#66):队列全程只用 AudioQueuePause /
+        // AudioQueueStart,不 flush、不重建、不 seek。主时钟取设备播放位置
+        // (AudioUnitOutput.devicePlaybackTime)——暂停期间设备位置不变,
         // 恢复后从同一点继续,队列里积压的 PCM 不会把位置推过暂停段。
-        pausedClockPosition = nil
+        let resumingContinuous = demuxStateLock.withLock { demuxLoopRunning && !demuxCancelled }
         // Continuous path (pipeline never stopped, e.g. PiP): resume audio output
         // regardless of jitter buffer state.
         // If the player was paused while the jitter buffer was in .buffering state,
@@ -3928,6 +3967,9 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
         demuxLock.unlock()
         jitterBuffer.flush()
         syncController.reset()
+        // 会话结束:缓冲 UI 上报/用户暂停标记清零(防上一会话的缓冲卡/暂停
+        // 标记泄漏进新会话)。
+        resetBufferingState()
         displayLoopLock.withLock {
             lastBypassPopTime = 0
             forceClockCalibration = false
