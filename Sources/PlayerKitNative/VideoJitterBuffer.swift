@@ -117,8 +117,8 @@ final class VideoJitterBuffer: @unchecked Sendable {
             / max(framesPerSecondHint, 1)
     }
 
-    /// The playing/buffering thresholds are durations sized for ~2 s of buffer. When
-    /// the byte budget shrinks the buffer below that, scale them with it - otherwise
+    /// The resume threshold is a duration sized for ~2 s of buffer. When
+    /// the byte budget shrinks the buffer below that, scale it — otherwise
     /// the buffer can never reach `resumeDuration` and playback falls into the old
     /// "start, show one frame, freeze for 4 s" loop (see the 120 fps note below).
     private var thresholdScaleLocked: Double {
@@ -130,9 +130,6 @@ final class VideoJitterBuffer: @unchecked Sendable {
     private var resumeDurationLocked: Double {
         min(resumeDuration * thresholdScaleLocked,
             max(0, capacitySecondsLocked - 2.0 / max(framesPerSecondHint, 1)))
-    }
-    private var minDurationLocked: Double {
-        min(minDuration * thresholdScaleLocked, resumeDurationLocked)
     }
 
     /// Called synchronously when state transitions between .playing and
@@ -147,12 +144,19 @@ final class VideoJitterBuffer: @unchecked Sendable {
     // 缓冲策略自适应(097d2e1)这样做过——信号测的是 demux 消费速度而非网速,稳态
     // 被判成慢网/中档(慢网档 min 2.0s),而 60 帧容量下稳态水位约 (60−8)/fps 秒,
     // 与之只差 0–3 帧:24fps 刚好多 2 帧,≥25fps 即 playing↔buffering 抖动
-    // (fps 掉 27–34%),2026-11-20 撤销。
-    let minDuration: Double = 0.5     // 低于此值 → buffering
-    let resumeDuration: Double = 1.0  // 达到此值 → playing
+    // (fps 掉 27–34%),2026-11-20 撤销。方案 B 后低水位不再是状态迁移信号。
+    // 放行水位 1.5s(2026-11-21 探针轮 F/G 定案):4K VBR 高码率场景(~8Mbps 段)
+    // 遇通道到达率缺口(实测 ~6Mbps ≈ 0.8×)时,0.86s 的开放水位每 ~4.5s 必然
+    // 触底断粮;容量(iOS 512MB 预算 ≈ 41 帧 ≈ 1.64s @25fps)允许更深的吸收。
+    // 水位加深到 1.5s:补缓冲攒满一次能吃掉 ~1.5s 供给缺口,CDN 突发(实测
+    // 13.8Mbps)多数时候填得回来,断粮周期拉长一倍且大多不再触底。G 轮对照:
+    // 同设备同网络,通道跟上时 45s+ 零断粮、25fps 间隔均匀——管线无回归,差距
+    // 全在缓冲深度对缺口的吸收能力。
     // 2026-09-02 曾试降到 0.6s 换更快首帧,但 115 CDN 单次请求耗时观测到
     // 5~9.5s 的抖动(Cloud115StreamReader.swift 头部注释详述),0.6s 的缓冲
-    // margin 扛不住,反而更频繁触发二次卡顿——已撤销回 1.0。
+    // margin 扛不住,反而更频繁触发二次卡顿——已撤销回 1.0,今日再加深到 1.5。
+    // 代价:起播首开慢 ~0.6s(slowDecoderGrace 4s 兜底供给极慢的场景)。
+    let resumeDuration: Double = 1.5  // 达到此值 → playing
     let maxDuration: Double = 2.0     // demux 背压阈值（不丢帧，只是限速）
     /// 帧数硬上限，本是"限制内存占用的最后防线"——正常应由上面 maxDuration 的时长背压
     /// 先生效，这个上限极少真正绑定。但它是按固定帧数写的，原为 60（注释"≈2.5s at 24fps"）:
@@ -198,6 +202,21 @@ final class VideoJitterBuffer: @unchecked Sendable {
     /// drains (see the back-pressure there) — the counter makes that visible
     /// instead of letting the buffer silently reshape under pressure.
     private var droppedIncomingFrames = 0
+    /// 缓冲宽限(恒定):真断粮回缓冲后,水位攒不到也至少等满该时长再靠
+    /// 已到帧放行——给网络/解码真正的攒缓冲窗口。2026-11-21 真机裁定撤销
+    /// 「强开后降级 0.5s」闩:供给不足时 0.5s 只攒出 1-2 帧,开门即空、
+    /// 0.5-1.5s 微循环;老「播 0.5s 卡 4s」的病根是水位抖动回缓冲(方案 B
+    /// 已删),不是 4s 本身。
+    private let slowDecoderGrace: TimeInterval = 4.0
+    /// 实际断粮防抖(方案 B):播放中队列为空的连续时长达到 starvationDebounce
+    /// 才真正回缓冲。低水位(minDuration)只是预警,不再触发状态迁移——2026-11-21
+    /// 真机实锤:低水位驱动的 catchUp 每分钟 pause/resume 音频 94 次。
+    private var starvingSince: TimeInterval?
+    private let starvationDebounce: TimeInterval = 0.12
+    /// 清除 starvingSince 所需的恢复深度(帧)。涓流供给(一次一帧)不得重置
+    /// 防抖——2026-11-21 真机:每帧清一次导致防抖永远凑不满,音频超前画面
+    /// 1.2s、画面冻住且无缓冲卡。3 帧 ≈ 0.12s@25fps 的恢复脉冲。
+    private let starvationRecoveryFrames = 3
     private let lock = NSLock()
     private var _state: State = .buffering
     /// 视频流已读到 EOF(demux 线程 markEOF 置位)。此后不再要求攒满
@@ -212,9 +231,6 @@ final class VideoJitterBuffer: @unchecked Sendable {
     private var bufferingStart: TimeInterval
     /// 与 bufferingStart 同源的墙钟(见 init `now`)。
     private let now: () -> TimeInterval
-    /// 慢速降级宽限期:进入 buffering 后超过该时长仍未攒满 resumeDuration
-    /// 且有帧,直接开播。正常网络/硬解在 1-3s 内就能满足 1.0s 门槛,不受影响。
-    private let slowDecoderGrace: TimeInterval = 4.0
 
     var state: State {
         lock.lock(); defer { lock.unlock() }
@@ -262,6 +278,14 @@ final class VideoJitterBuffer: @unchecked Sendable {
             return
         }
 
+        let wallNow = now()
+        // 防抖窗口内帧重新到达:只有恢复到足够深度才清除真空计时——涓流
+        // 单帧不清(pops 又会立刻打空,防抖被无限重置);已在 .buffering 时
+        // starvingSince 本为 nil,此分支不生效。
+        if _state == .playing, frames.count >= starvationRecoveryFrames {
+            starvingSince = nil
+        }
+
         // Insert in PTS-sorted order so pop() always returns the next display frame.
         // VTVideoDecoder returns B-frames in decode order (not display order); without
         // sorting, jitterBuffer PTS values are scrambled, causing backwards progress
@@ -274,7 +298,7 @@ final class VideoJitterBuffer: @unchecked Sendable {
 
         let dur = frames.count >= 2 ? frames.last!.pts - frames.first!.pts : 0
         if _state == .buffering, !frames.isEmpty {
-            let stalled = now() - bufferingStart > slowDecoderGrace
+            let stalled = wallNow - bufferingStart > slowDecoderGrace
             if dur >= resumeDurationLocked || eofReached || stalled {
                 _state = .playing
                 newState = .playing
@@ -303,17 +327,15 @@ final class VideoJitterBuffer: @unchecked Sendable {
         popped = frames.removeFirst()
         bufferedBytesLocked -= popped?.byteSize ?? 0
         let dur = frames.count >= 2 ? frames.last!.pts - frames.first!.pts : 0
-        // EOF 后不再因剩余不足回 .buffering —— 末尾帧要放完,而不是
-        // 播到剩 <0.5s 又卡进 buffering 黑屏。
-        if _state == .playing, !eofReached, dur < minDurationLocked {
-            _state = .buffering
-            // 宽限起点必须跟着重置:bufferingStart 语义是「进入 .buffering 的
-            // 时刻」,而播放中回缓冲走不到 flush()。不重置的话,开播 4s 后
-            // (systemUptime − init 时刻 > slowDecoderGrace)stalled 恒真,
-            // 下一帧 append 立即转回 .playing——resume 水位迟滞从未生效,
-            // 表现为水位贴地飞行、缓冲状态每秒闪烁(79db8b1,2026-08-26 起)。
-            bufferingStart = now()
-            newState = .buffering
+        // 方案 B:低水位(minDuration)只是预警,不再在这里回缓冲——真正无帧
+        // 可显示经 pollStarvation 防抖后才是 buffering(2026-11-21 真机:低水位
+        // 驱动的音频 pause/resume 每分钟 94 次)。EOF 后排空同样保持 playing,
+        // 末尾帧放完是正常结束。防抖计时从队列变空的时刻起算(spec §4.2),
+        // 而不是第一次 poll 的时刻。
+        if _state == .playing, !eofReached, frames.isEmpty, starvingSince == nil {
+            // 只在「非空 → 空」的起点锚定一次;涓流下后续 pop 打空不得重启
+            // 计时(否则防抖永远凑不满),只有恢复深度 append 才清除。
+            starvingSince = now()
         }
         lock.unlock()
 
@@ -321,6 +343,35 @@ final class VideoJitterBuffer: @unchecked Sendable {
             onStateChange?(s)
         }
         return popped
+    }
+
+    /// 实际断粮检查(方案 B):每个显示 tick 调用。播放中队列为空且非 EOF
+    /// 连续达到防抖时长才真正回缓冲;防抖窗口内帧重新到达则静默清除,不产生
+    /// 任何音频/UI 副作用。转缓冲时重置 bufferingStart(#75 语义,原 pop 低水位
+    /// 路径迁来的迟滞起点)。
+    func pollStarvation() {
+        var newState: State?
+        lock.lock()
+        if _state == .playing, !eofReached {
+            if frames.count >= starvationRecoveryFrames {
+                // 深度恢复:防抖计时作废,继续正常播放。
+                starvingSince = nil
+            } else if let since = starvingSince, now() - since >= starvationDebounce {
+                // 防抖到期:真断粮。转移条件不再要求「队列此刻为空」——
+                // 涓流下队列常驻 1 帧,空判据会让真断粮永远漏判。
+                starvingSince = nil
+                _state = .buffering
+                bufferingStart = now()
+                newState = .buffering
+            }
+        } else {
+            starvingSince = nil
+        }
+        lock.unlock()
+
+        if let s = newState {
+            onStateChange?(s)
+        }
     }
 
     /// 视频流是否已读到 EOF(demux 线程 markEOF 置位,flush 复位)。
@@ -336,6 +387,7 @@ final class VideoJitterBuffer: @unchecked Sendable {
         var newState: State?
         lock.lock()
         eofReached = true
+        starvingSince = nil
         if _state == .buffering, !frames.isEmpty {
             _state = .playing
             newState = .playing
@@ -355,5 +407,6 @@ final class VideoJitterBuffer: @unchecked Sendable {
         _state = .buffering
         eofReached = false
         bufferingStart = now()
+        starvingSince = nil
     }
 }
