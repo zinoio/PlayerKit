@@ -603,6 +603,14 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
     /// Guarded by displayLoopLock.
     private nonisolated(unsafe) var forceClockCalibration = false
 
+    /// #608:音频输出设备已降级(连续 Start 失败越过阈值)。显示循环据此
+    /// 跳过音频主导的 freeze-ahead 守卫、改走「按源帧 PTS 间隔」的旁路
+    /// pacing——设备死亡时音频时钟冻结,守卫会把超前帧无限冻结(真机:
+    /// 缓冲 117s 饱满、fps 0.7、UI 永远「正在缓冲」)。恢复边沿置回并
+    /// 强制重校准 audioClock 到当前画面 PTS。
+    /// Guarded by displayLoopLock.
+    private nonisolated(unsafe) var audioDeviceDemoted = false
+
     /// Playback rate snapshot for the nonisolated display loop (zyno#99):
     /// setRate() runs on the main actor, displayNextFrame() must not touch
     /// `state` directly. Written before it's read (setRate assigns both).
@@ -1618,6 +1626,10 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
                                          outputRateOverride: AudioDeviceSampleRate.preferred()) {
             audioDecoder = dec
             let out = AudioUnitOutput(clock: audioClock, delaySecs: audioDelay)
+            // #608:设备死亡降级/恢复边沿。实现见 handleAudioDeviceDemoted /
+            // handleAudioDeviceRecovered(线程:controlQueue 或回调线程)。
+            out.onDeviceDemoted = { [weak self] in self?.handleAudioDeviceDemoted() }
+            out.onDeviceRecovered = { [weak self] in self?.handleAudioDeviceRecovered() }
             audioUnitOutput = out
             isPassthroughActive = false
             isInjectedPCMActive = false
@@ -1678,6 +1690,7 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
         displayLoopLock.withLock {
             needsClockCalibration = true
             audioClockReady = false
+            audioDeviceDemoted = false   // #608:新会话重置降级(新 AudioUnitOutput 健康计数全新)
         }
 
         state.isPlaying = true
@@ -2947,7 +2960,10 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
         // starts at −|d| and would only cross 0 after |d| seconds had played,
         // leaving the display free-running (unsynced) through the entire
         // negative window instead of holding the picture there.
-        if !clockReady, audioClock.hasConsumedOutput {
+        // #608:降级期不得据此翻回 clockReady——audioClock 在设备死亡前的
+        // 消费值仍 >0,翻回会让 freeze-ahead 用冻结的音频时间永久扣帧。
+        if !clockReady, !displayLoopLock.withLock({ audioDeviceDemoted }),
+           audioClock.hasConsumedOutput {
             displayLoopLock.withLock { audioClockReady = true }
         }
         // 注入 PCM 后端(DSP):AudioClock 永不消费,就绪判据换成注入后端
@@ -3207,6 +3223,48 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
             return device + audioClock.fullDelay
         }
         return audioClock.audioTime
+    }
+
+    // MARK: - #608 音频设备降级 / 恢复
+
+    /// 音频输出设备连续 Start 失败越过阈值(死亡判定):把主时钟从音频
+    /// 主导切到「按源帧 PTS 间隔」的旁路 pacing,画面照常 1x 续播。
+    ///
+    /// 真机事故(2026-11-23):LG UltraFine DP 音频起播 10s 后
+    /// `kAudioDevicePropertiesIOStoppedAbnormally` 停机,AudioQueueStart 恒
+    /// 被 HAL 拒绝 → 音频回调断绝 → audioClock 冻结 → freeze-ahead 守卫把
+    /// 所有超前帧无限冻结(缓冲 117s 饱满、fps 0.7、UI 永远「正在缓冲」)。
+    /// 调用线程:AudioUnitOutput 的 controlQueue / 解码线程,不假设主线程。
+    private nonisolated func handleAudioDeviceDemoted() {
+        let changed = displayLoopLock.withLock { () -> Bool in
+            guard !audioDeviceDemoted else { return false }
+            audioDeviceDemoted = true
+            audioClockReady = false   // 旁路 pacing:按源帧 PTS 间隔 1x 弹帧
+            needsClockCalibration = false
+            forceClockCalibration = false
+            return true
+        }
+        if changed {
+            logger.error("[#608] 音频输出设备不可用 → 降级续播:画面按源帧率节奏推进,音频静音,定时探测设备恢复")
+        }
+    }
+
+    /// 降级期真实回调到达(设备 IO 复活):回切音频主导。audioClock 在降级
+    /// 期间冻结,距画面已数十秒~数分钟,超过 maxCalibrationGap——强制重
+    /// 校准到当前队首帧(force),恢复音频主导的 freeze-ahead/pacing。
+    /// 调用线程:AudioQueue 回调线程。
+    private nonisolated func handleAudioDeviceRecovered() {
+        let changed = displayLoopLock.withLock { () -> Bool in
+            guard audioDeviceDemoted else { return false }
+            audioDeviceDemoted = false
+            audioClockReady = false        // 待真实消费(hasConsumedOutput)后置回
+            needsClockCalibration = true
+            forceClockCalibration = true   // 跨降级期的 stale 时钟必须强制校准
+            return true
+        }
+        if changed {
+            logger.warning("[#608] 音频输出设备恢复 → 回切音频主导时钟(强制重校准)")
+        }
     }
 
     /// 系统路径的显示 tick:
@@ -3543,6 +3601,8 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
             state.currentSubtitleImage = img
             state.currentSubtitleImageRect = u.subtitleImageRect ?? .zero
         }
+        // #608:降级状态随显示更新上报(app 可据此显示「音频输出设备不可用」)。
+        state.audioOutputDegraded = displayLoopLock.withLock { audioDeviceDemoted }
 
         if u.notify { notifyStateChange() }
     }
