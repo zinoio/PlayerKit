@@ -69,6 +69,40 @@ public final class AudioUnitOutput: AudioOutputBackend {
     /// 缩小窗口以确定性地断言「窗内零查询 / 超窗一次查询」。Reset in tearDown.
     nonisolated(unsafe) static var clockFreshWindowForTesting: TimeInterval?
 
+    // MARK: - #608 音频设备死亡降级
+
+    /// 设备健康(降级/探测节流/恢复边沿,纯逻辑见 AudioDeviceHealth)。
+    let deviceHealth = AudioDeviceHealth()
+    var deviceHealthForTesting: AudioDeviceHealth { deviceHealth }
+    /// 降级边沿(连续 Start 失败越过阈值):backend 安装,切视频时钟续播。
+    /// 在 controlQueue / 调用线程上触发,实现方自行切线程。
+    nonisolated(unsafe) var onDeviceDemoted: (() -> Void)?
+    /// 恢复边沿(降级期真实回调到达 = 设备 IO 复活):backend 重校准时钟。
+    nonisolated(unsafe) var onDeviceRecovered: (() -> Void)?
+
+    /// 记一次 Start 失败并在越过阈值时报降级边沿。
+    private func recordStartFailure() {
+        if deviceHealth.recordStartFailure(now: ProcessInfo.processInfo.systemUptime) {
+            logger.error("[#608] 音频输出设备连续 Start 失败 → 降级:画面按源帧率续播,音频静音,定时探测恢复")
+            onDeviceDemoted?()
+        }
+    }
+
+    /// #608:音频时钟停转看门狗(见 AudioStallWatchdog)。由显示循环每 tick
+    /// 调用;true = 判定设备停转,调用方执行降级。失败计数会被半死设备的
+    /// 孤立回调干扰,该判据只看时钟是否真实推进,两者互补。
+    func noteDisplayTickForStall(now: TimeInterval) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        // 合法静止(未跑/用户暂停/尚无消费)不做判定。
+        guard running, !paused, clock.hasConsumedOutput else {
+            stallWatchdog.reset()
+            return false
+        }
+        return stallWatchdog.note(now: now, audioTime: clock.audioTime)
+    }
+
+    private var stallWatchdog = AudioStallWatchdog()
+
     /// Serial queue that owns every AudioQueue control call (Pause/Start).
     ///
     /// These calls dispatch_sync into AudioToolbox's internal server context —
@@ -346,7 +380,15 @@ public final class AudioUnitOutput: AudioOutputBackend {
             }
         }
 
-        AudioQueueStart(queue, nil)
+        // #608:Start 失败不再静默——连续失败越过阈值触发降级(设备死亡
+        // 时每次重建都是一次 HAL 喂锤,必须在源头记账)。
+        let startRC = Self.startImpl(queue)
+        if startRC != noErr {
+            logger.error("AudioQueueStart(start) FAILED: \(startRC)")
+            recordStartFailure()
+        } else {
+            deviceHealth.recordStartSuccess()
+        }
 
         // Swap in the new queue atomically.  Any in-flight enqueue() that was
         // waiting on the lock will see the new queue, not the disposed one.
@@ -473,9 +515,15 @@ public final class AudioUnitOutput: AudioOutputBackend {
         }
         controlQueue.async { [weak self] in
             guard let self, let q = self.currentQueueLocked() else { return }
+            // #608:降级期零打扰——设备已死,再 Start 只是给 HAL 喂锤
+            // (每次重建失败还会拉长 soft-blacklist 式停机)。
+            guard !self.deviceHealth.isDemoted else { return }
             let rc = Self.startImpl(q)
             if rc != noErr {
                 logger.error("AudioQueueStart(resume) FAILED: \(rc)")
+                self.recordStartFailure()
+            } else {
+                self.deviceHealth.recordStartSuccess()
             }
         }
     }
@@ -497,6 +545,16 @@ public final class AudioUnitOutput: AudioOutputBackend {
     /// several seconds.
     private func rebuildQueueIfStarved() {
         let now = ProcessInfo.processInfo.systemUptime
+        // #608:降级期把「重建」退化为按 probeInterval 节流的探测。探测走
+        // 与 starve 重建相同的 start() 路径:新队列天然冲刷陈旧缓冲,
+        // Start 成功且真实回调到达即由回调路径标记恢复(见 _callbackConsumed)。
+        if deviceHealth.isDemoted {
+            guard deviceHealth.shouldProbe(now: now) else { return }
+            deviceHealth.recordProbedAt(now: now)
+            logger.info("[#608] 降级探测:重建音频队列试探设备恢复")
+            start(sampleRate: clock.sampleRate, channels: _channels)
+            return
+        }
         lock.lock()
         let gap = lastCallbackWall > 0 ? now - lastCallbackWall : 0
         let starved = running && !paused && lastCallbackWall > 0
@@ -646,6 +704,10 @@ public final class AudioUnitOutput: AudioOutputBackend {
     }
 
     private func enqueueDirect(_ frame: PCMFrame, contentPts: Double) {
+        // #608:降级期丢弃入队——设备不会播放它们;入队只会触发必然失败的
+        // Start(喂锤)并让时钟/缓冲记账撒谎(hasPendingOutput 永真会挡死
+        // EOF 自由跑)。探测重建由 rebuildQueueIfStarved 节流负责。
+        guard !deviceHealth.isDemoted else { return }
         // Hold the lock across allocate+copy+enqueue so the dispose path can't
         // tear down the queue between the guard and the AudioQueue calls.
         // disposeUnderLock() also takes this lock, so it waits for any in-flight
@@ -721,6 +783,9 @@ public final class AudioUnitOutput: AudioOutputBackend {
                 let rc = Self.startImpl(q)
                 if rc != noErr {
                     logger.error("AudioQueueStart(enqueue) FAILED: \(rc)")
+                    self.recordStartFailure()
+                } else {
+                    self.deviceHealth.recordStartSuccess()
                 }
             }
         }
@@ -728,6 +793,13 @@ public final class AudioUnitOutput: AudioOutputBackend {
 
     /// Called from the AudioQueue callback — do not call directly.
     func _callbackConsumed(byteCount: Int, queue: AudioQueueRef?) {
+        // #608:任何真实回调都证明设备 IO 活着——这是半死态(Start 成功但
+        // 不出声)下唯一可信的存活信号。降级期到达即报恢复边沿,backend
+        // 据此把主时钟回切音频主导。
+        if deviceHealth.recordDeviceAlive(now: ProcessInfo.processInfo.systemUptime) {
+            logger.warning("[#608] 音频输出设备恢复(真实回调到达)→ 回切音频主导时钟")
+            onDeviceRecovered?()
+        }
         // [diag] The queue's own sample timebase, read OUTSIDE our lock: holding
         // the lock across an AudioQueue call can deadlock against the enqueue
         // path (which holds the lock across AudioQueueEnqueueBuffer). Note it
