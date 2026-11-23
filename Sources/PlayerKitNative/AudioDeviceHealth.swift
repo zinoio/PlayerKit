@@ -9,29 +9,33 @@ import Foundation
 /// UI 永远「正在缓冲」,而 demux/网络数据面完全健康,用户无从归因。
 ///
 /// 判定语义:
-/// - **连续 Start 失败 ≥ demoteThreshold → 降级**:降级期 enqueue 丢帧、
-///   resume 不再 Start(零打扰);starvation-rebuild 退化为按
-///   `probeInterval` 节流的探测(start 重建队列,天然冲刷陈旧缓冲)。
+/// - **失败计数按滑动窗口**:`failureWindow`(120s)内的 Start 失败累计
+///   ≥ `demoteThreshold`(4)→ 降级。真机第二轮:半死设备会偶发回一个
+///   孤立回调再彻底停转,严格「连续」计数被孤立回调清零,10s 间隔的失败
+///   永远凑不满(实测 5 次失败无一次降级)——窗口计数对孤立回跳免疫。
 /// - **Start 成功不证明设备活着**(半死态:队列能 start 但 HAL 不出声,
-///   实测 `afplay` 退出码 0 而无声),故 Start 成功**不复位**计数。
-/// - **真实 AudioQueue 回调 = 设备 IO 活着的唯一铁证**:复位计数;
-///   若此前已降级,则构成一次性**恢复边沿**(调用方据此重校准时钟回切)。
+///   实测 `afplay` 退出码 0 而无声),故 Start 成功不计入。
+/// - **真实 AudioQueue 回调 = 设备 IO 活着的唯一铁证**:降级中来回调构成
+///   一次性**恢复边沿**,并清空失败窗口;未降级时回调不清零(见上)。
+/// - 降级期的时钟停转判据由 AudioStallWatchdog(独立)承担。
 ///
 /// 线程安全:内部锁;调用方传 `now`(systemUptime)便于确定性测试。
 final class AudioDeviceHealth: @unchecked Sendable {
     private let lock = NSLock()
 
-    /// 连续多少条 Start 失败判定设备死亡。真机形态是每 10s 一条失败
-    /// (enqueue/resume 各一路),4 条约 40s 内收敛,不至于把一次瞬态
-    /// 失败误判成死亡。
+    /// 窗口内多少条 Start 失败判定设备死亡。
     var demoteThreshold = 4
+
+    /// 失败计数滑动窗口(秒)。真机失败间隔约 10s(解码/保活路径各一路),
+    /// 120s 容纳十余次仍不误伤一次瞬态失败。
+    var failureWindow: TimeInterval = 120
 
     /// 降级期探测节流(秒):到点才允许一次 start 重建探测。
     /// 5 分钟——风控/HAL 都不该被更密的探测打扰;demand 保底供数期间
     /// 视频按源帧率照常播。
     var probeInterval: TimeInterval = 300
 
-    private var consecutiveFailures = 0
+    private var failureTimes: [TimeInterval] = []
     private var lastProbeAt = Date.distantPast.timeIntervalSinceReferenceDate
     private(set) var isDemoted = false
     private(set) var demotionCount = 0
@@ -41,25 +45,28 @@ final class AudioDeviceHealth: @unchecked Sendable {
     func recordStartFailure(now: TimeInterval) -> Bool {
         lock.lock(); defer { lock.unlock() }
         guard !isDemoted else { return false }
-        consecutiveFailures += 1
-        guard consecutiveFailures >= demoteThreshold else { return false }
+        failureTimes.append(now)
+        failureTimes.removeAll { now - $0 > failureWindow }
+        guard failureTimes.count >= demoteThreshold else { return false }
         isDemoted = true
         demotionCount += 1
+        failureTimes.removeAll()
         lastProbeAt = Date.distantPast.timeIntervalSinceReferenceDate   // 首探立即放行
         return true
     }
 
-    /// Start 返回 noErr 时调用:**不复位**失败计数(半死态 Start 也能
+    /// Start 返回 noErr 时调用:**不**清零失败窗口(半死态 Start 也能
     /// 成功,见文件头)。
     func recordStartSuccess() {}
 
     /// 真实回调到达:设备 IO 活着。返回 true = 恢复边沿(降级→正常)。
+    /// 未降级时不清零失败窗口(孤立回跳不得延迟降级判定)。
     @discardableResult
     func recordDeviceAlive(now: TimeInterval) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        consecutiveFailures = 0
         guard isDemoted else { return false }
         isDemoted = false
+        failureTimes.removeAll()
         return true
     }
 

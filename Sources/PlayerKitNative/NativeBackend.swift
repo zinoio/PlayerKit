@@ -2864,6 +2864,15 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
         let serial = seekLock.withLock { seekSerial }
         let playbackRate = displayLoopLock.withLock { displayRate }
 
+        // #608:设备停转看门狗——半死设备(偶发孤立回调后停转)会让音频
+        // 主时钟冻结;失败计数会被孤立回跳干扰,这里直接编码真机语义:
+        // 播放中音频时钟 3s 内几乎不推进 ⇒ 降级(本 tick 起即走旁路 pacing)。
+        if !displayLoopLock.withLock({ audioDeviceDemoted }),
+           let out = audioUnitOutput,
+           out.noteDisplayTickForStall(now: now) {
+            handleAudioDeviceDemoted()
+        }
+
         // --- Freeze-ahead / Skip-behind (commercial player A/V sync) ---
         // After the first post-seek frame has been displayed, guard against large
         // desync without changing playback speed.  Video ahead of audio: freeze

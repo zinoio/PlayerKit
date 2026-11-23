@@ -88,6 +88,21 @@ public final class AudioUnitOutput: AudioOutputBackend {
         }
     }
 
+    /// #608:音频时钟停转看门狗(见 AudioStallWatchdog)。由显示循环每 tick
+    /// 调用;true = 判定设备停转,调用方执行降级。失败计数会被半死设备的
+    /// 孤立回调干扰,该判据只看时钟是否真实推进,两者互补。
+    func noteDisplayTickForStall(now: TimeInterval) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        // 合法静止(未跑/用户暂停/尚无消费)不做判定。
+        guard running, !paused, clock.hasConsumedOutput else {
+            stallWatchdog.reset()
+            return false
+        }
+        return stallWatchdog.note(now: now, audioTime: clock.audioTime)
+    }
+
+    private var stallWatchdog = AudioStallWatchdog()
+
     /// Serial queue that owns every AudioQueue control call (Pause/Start).
     ///
     /// These calls dispatch_sync into AudioToolbox's internal server context —
