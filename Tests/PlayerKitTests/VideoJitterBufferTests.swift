@@ -47,26 +47,178 @@ final class VideoJitterBufferTests: XCTestCase {
         XCTAssertEqual(buf.state, .playing)
     }
 
-    func testTransitionsToBufferingWhenBelowMinDuration() {
-        let buf = VideoJitterBuffer()
-        // 先进入 playing 状态。转态在 append 内同步发生,onStateChange 必须在
-        // append 之前就位——事后设置不会再收到已发生过的转态。
-        let exp1 = expectation(description: "playing")
-        buf.onStateChange = { _ in exp1.fulfill() }
+    // MARK: - 实际断粮驱动(方案 B:低水位只是预警,真正无帧才 rebuffer)
+
+    func testLowDurationWithFramesDoesNotRebuffer() {
+        var fakeNow: TimeInterval = 0
+        let buf = VideoJitterBuffer(now: { fakeNow })
+        var bufferingCallbacks = 0
+        buf.onStateChange = { state in
+            if state == .buffering { bufferingCallbacks += 1 }
+        }
         buf.append(makeFrame(pts: 0.0))
-        buf.append(makeFrame(pts: 2.0))
-        wait(for: [exp1], timeout: 1.0)
+        buf.append(makeFrame(pts: 2.0))            // dur 2.0 ≥ resume(1.5)→ playing
         XCTAssertEqual(buf.state, .playing)
 
-        // 弹出帧直到 duration < minDuration(0.5)
-        var bufferingExp: XCTestExpectation?
+        buf.pop()                                   // 剩 1 帧,dur = 0:低水位预警
+        fakeNow += 5.0
+        buf.pollStarvation()                        // 有帧可显示:不得回缓冲
+        XCTAssertEqual(buf.state, .playing)
+        XCTAssertEqual(bufferingCallbacks, 0,
+            "低水位但有帧时不得回缓冲,更不得触发任何 buffering 回调")
+    }
+
+    func testStarvationRequiresDebounce() {
+        var fakeNow: TimeInterval = 0
+        let buf = VideoJitterBuffer(now: { fakeNow })
+        var bufferingCallbacks = 0
         buf.onStateChange = { state in
-            if state == .buffering { bufferingExp?.fulfill() }
+            if state == .buffering { bufferingCallbacks += 1 }
         }
-        bufferingExp = expectation(description: "buffering")
-        buf.pop()  // 弹出 pts=0.0，剩余 duration=0 → 进入 buffering
-        wait(for: [bufferingExp!], timeout: 1.0)
+        buf.append(makeFrame(pts: 0.0))
+        buf.append(makeFrame(pts: 2.0))            // dur 2.0 ≥ resume(1.5)→ playing
+        XCTAssertEqual(buf.state, .playing)
+
+        buf.pop(); buf.pop()                        // 真空
+        fakeNow = 0.11
+        buf.pollStarvation()                        // 防抖窗口内:仍 playing
+        XCTAssertEqual(buf.state, .playing)
+        XCTAssertEqual(bufferingCallbacks, 0)
+
+        fakeNow = 0.13                              // 连续真空 ≥ 0.12s
+        buf.pollStarvation()
         XCTAssertEqual(buf.state, .buffering)
+        XCTAssertEqual(bufferingCallbacks, 1, "真断粮只应触发一次 buffering 回调")
+    }
+
+    func testAppendWithinStarvationDebounceAvoidsBuffering() {
+        var fakeNow: TimeInterval = 0
+        let buf = VideoJitterBuffer(now: { fakeNow })
+        var bufferingCallbacks = 0
+        buf.onStateChange = { state in
+            if state == .buffering { bufferingCallbacks += 1 }
+        }
+        buf.append(makeFrame(pts: 0.0))
+        buf.append(makeFrame(pts: 2.0))            // dur 2.0 ≥ resume(1.5)→ playing
+        XCTAssertEqual(buf.state, .playing)
+
+        buf.pop(); buf.pop()                        // 真空,防抖开始
+        fakeNow = 0.05
+        buf.append(makeFrame(pts: 1.042))           // 单帧涓流不足以恢复
+        buf.append(makeFrame(pts: 1.084))
+        buf.append(makeFrame(pts: 1.126))           // 恢复深度(3 帧)才清防抖
+        fakeNow = 0.10
+        buf.pollStarvation()
+        XCTAssertEqual(buf.state, .playing)
+        XCTAssertEqual(bufferingCallbacks, 0,
+            "防抖窗口内恢复到足够深度不得 rebuffer")
+    }
+
+    func testTrickleAppendDoesNotResetStarvationDebounce() {
+        // 2026-11-21 真机实锤:供给一次一帧(~18fps)时,append 每次都清掉
+        // starvingSince,pop 又立刻打空——防抖永远凑不满,音频超前画面 1.2s、
+        // 画面冻住且无缓冲卡。单帧涓流不得重置防抖计时。
+        var fakeNow: TimeInterval = 0
+        let buf = VideoJitterBuffer(now: { fakeNow })
+        var bufferingCallbacks = 0
+        buf.onStateChange = { state in
+            if state == .buffering { bufferingCallbacks += 1 }
+        }
+        buf.append(makeFrame(pts: 0.0))
+        buf.append(makeFrame(pts: 2.0))            // dur 2.0 ≥ resume(1.5)→ playing
+        XCTAssertEqual(buf.state, .playing)
+
+        buf.pop(); buf.pop()                        // 真空,防抖 t=0
+        fakeNow = 0.05
+        buf.append(makeFrame(pts: 1.042))           // 涓流一帧:count=1 < 恢复深度
+        buf.pop()                                   // 立刻被显示打空(同 tick)
+        fakeNow = 0.13
+        buf.pollStarvation()
+        XCTAssertEqual(buf.state, .buffering,
+            "涓流单帧不得重置防抖;真断粮必须按时进入缓冲")
+        XCTAssertEqual(bufferingCallbacks, 1)
+    }
+
+    func testStarvationClearsOnlyAfterRecoveryDepth() {
+        var fakeNow: TimeInterval = 0
+        let buf = VideoJitterBuffer(now: { fakeNow })
+        var bufferingCallbacks = 0
+        buf.onStateChange = { state in
+            if state == .buffering { bufferingCallbacks += 1 }
+        }
+        buf.append(makeFrame(pts: 0.0))
+        buf.append(makeFrame(pts: 2.0))            // dur 2.0 ≥ resume(1.5)→ playing
+        XCTAssertEqual(buf.state, .playing)
+
+        buf.pop(); buf.pop()                        // 真空,防抖 t=0
+        fakeNow = 0.05
+        buf.append(makeFrame(pts: 1.042))           // 1 帧:不清
+        fakeNow = 0.20
+        buf.pollStarvation()
+        XCTAssertEqual(buf.state, .buffering)
+        XCTAssertEqual(bufferingCallbacks, 1)
+
+        // 已在 .buffering:即使补 1 帧,也要攒到 resume 水位/宽限才放行。
+        fakeNow = 0.30
+        buf.append(makeFrame(pts: 1.084))
+        XCTAssertEqual(buf.state, .buffering)
+    }
+
+    func testStarvedBufferRecoversOnlyAtResumeDuration() {
+        var fakeNow: TimeInterval = 0
+        let buf = VideoJitterBuffer(now: { fakeNow })
+        buf.append(makeFrame(pts: 0.0))
+        buf.append(makeFrame(pts: 2.0))             // 2.0 ≥ resume(1.5)→ 放行
+
+        buf.pop(); buf.pop()
+        fakeNow = 0.13
+        buf.pollStarvation()                        // 真断粮 → buffering
+        XCTAssertEqual(buf.state, .buffering)
+
+        buf.append(makeFrame(pts: 1.042))           // span 0:远低于 resume
+        XCTAssertEqual(buf.state, .buffering)
+        buf.append(makeFrame(pts: 2.5))             // span 2.5−1.042=1.458s:仍低于 resume(1.5)
+        XCTAssertEqual(buf.state, .buffering)
+        buf.append(makeFrame(pts: 3.542))           // span 2.5s ≥ resume → 放行
+        XCTAssertEqual(buf.state, .playing)
+    }
+
+    /// 放行水位加深 1.0s → 1.5s(2026-11-21 探针轮 F/G 定案):4K VBR 高码率
+    /// 场景遇通道到达率缺口(~0.8×)时,0.86s 的开放水位每 4.5s 必然触底;
+    /// 容量允许 1.64s,水位加深到 1.5s 让缓冲吸收 CDN 突发间隙,周期拉长一倍。
+    func testResumeWatermarkRequiresOneAndAHalfSeconds() {
+        var fakeNow: TimeInterval = 0
+        let buf = VideoJitterBuffer(now: { fakeNow })
+        buf.append(makeFrame(pts: 0.0))
+        buf.append(makeFrame(pts: 2.0))             // dur 2.0 ≥ resume(1.5)→ playing
+        XCTAssertEqual(buf.state, .playing)
+
+        buf.pop(); buf.pop()
+        fakeNow = 0.13
+        buf.pollStarvation()                        // 真断粮 → buffering
+        XCTAssertEqual(buf.state, .buffering)
+
+        buf.append(makeFrame(pts: 1.0))             // 队尾基准(二进制精确值)
+        buf.append(makeFrame(pts: 2.25))            // 1.25s:旧水位(1.0s)在此已放行,新水位不得放行
+        XCTAssertEqual(buf.state, .buffering,
+            "1.25s 不足以放行——水位加深到 1.5s 抗供给缺口")
+        buf.append(makeFrame(pts: 2.5))             // 1.5s(2.5−1.0 精确)≥ 新水位 → 放行
+        XCTAssertEqual(buf.state, .playing)
+    }
+
+    func testEOFEmptyBufferDoesNotRebuffer() {
+        var fakeNow: TimeInterval = 0
+        let buf = VideoJitterBuffer(now: { fakeNow })
+        buf.append(makeFrame(pts: 0.0))
+        buf.append(makeFrame(pts: 1.0))
+        buf.markEOF()
+        XCTAssertEqual(buf.state, .playing)
+
+        buf.pop(); buf.pop()                        // 末尾帧放完,队列空
+        fakeNow = 1.0
+        buf.pollStarvation()
+        XCTAssertEqual(buf.state, .playing,
+            "EOF 后排空是正常结束,不得回缓冲")
     }
 
     func testPeekAtIndex() {
@@ -115,9 +267,8 @@ final class VideoJitterBufferTests: XCTestCase {
     // MARK: - 高帧率回归(120fps 冻结 bug)
     //
     // 根因:旧的 maxFrameCount 是固定 60(注释"≈2.5s at 24fps"),对 120fps 内容只等于
-    // 0.5s 时长——同时低于开播门槛 resumeDuration(1.0s)和防抖门槛 minDuration(0.5s)。
-    // 缓冲区永远攒不到能开播的量,只能靠 4 秒慢速兜底硬开;一旦弹出一帧,剩余时长立刻又
-    // 跌破 minDuration,马上打回缓冲——形成"开播→弹一帧→冻结 4 秒"的循环,肉眼看是卡死。
+    // 0.5s 时长——同时低于开播门槛 resumeDuration(1.0s)。缓冲区永远攒不到能开播的量,
+    // 只能靠 4 秒慢速兜底硬开;开出来又立即耗尽,肉眼看是卡死。
     // 实测片源(4K HDR 120fps HEVC)60 秒内仅推进一次,与此机制吻合。
 
     func testUnconfiguredFrameRateCannotReachResumeDurationAt120fps() {
@@ -151,8 +302,7 @@ final class VideoJitterBufferTests: XCTestCase {
     }
 
     func testConfiguredFrameRateSurvivesOnePopWithoutImmediatelyRebuffering() {
-        // 修复的第二层:光能开播不够——原 bug 是"开播后弹一帧立刻又跌破 minDuration"的
-        // 反复横跳。验证弹出一帧后剩余时长仍 >= minDuration,不会立刻打回缓冲。
+        // 修复的第二层:光能开播不够——弹出一帧后剩余时长仍应远高于开播门槛,继续播放。
         let buf = VideoJitterBuffer()
         buf.configureFrameRate(120)
         for i in 0..<200 {
@@ -162,7 +312,7 @@ final class VideoJitterBufferTests: XCTestCase {
         XCTAssertEqual(buf.state, .playing)
         buf.pop()
         XCTAssertEqual(buf.state, .playing,
-                       "120fps 下弹出一帧不应该让剩余时长跌破 minDuration、立刻打回缓冲")
+                       "120fps 下弹出一帧不应该回缓冲")
     }
 
     func testLowFrameRateCapIsUnchanged() {
@@ -195,7 +345,7 @@ final class VideoJitterBufferTests: XCTestCase {
 
     private func makeBigFrame(pts: Double) -> VideoJitterBuffer.Frame {
         var pixelBuffer: CVPixelBuffer?
-        CVPixelBufferCreate(nil, 1280, 720, kCVPixelFormatType_32BGRA, nil, &pixelBuffer)   // ~3.7 MB
+        CVPixelBufferCreate(nil, 1280, 720, kCVPixelFormatType_32BGRA, nil, &pixelBuffer)
         return VideoJitterBuffer.Frame(pixelBuffer: pixelBuffer!, pts: pts, metadata: FrameMetadata())
     }
 
@@ -298,5 +448,111 @@ final class VideoJitterBufferTests: XCTestCase {
         }
         XCTAssertEqual(buf.state, .playing,
             "filling the read-ahead window (\(window) s) must reach the playing threshold, or playback never starts")
+    }
+
+    // MARK: - Read-ahead vs in-flight slack at high frame rates (2026-11-19)
+    //
+    // The demux decodes inline — reading ahead means decoding ahead — and the
+    // decoder still has a few frames in flight when the throttle trips. A window
+    // that exactly fills the frame cap therefore overflows it: append() refuses
+    // the overflow for good and punches PTS holes that the display loop skips
+    // while audio (independent clock) stays perfect (device 2026-11-19: q pinned
+    // at the 60-frame cap, 50–200 frames refused per 5 s, show interval mean
+    // 41.7 → 191 ms, fps 21.6 → 3.7). At 120 fps the flat 2 s window IS the whole
+    // 240-frame cap, so the window must stop short of it.
+
+    func testReadAheadLeavesInFlightSlackBelowTheFrameCap() {
+        let buf = VideoJitterBuffer()
+        buf.configureFrameRate(120)
+        let window = buf.readAheadSeconds
+        XCTAssertLessThan(window, buf.maxDuration,
+            "the flat \(buf.maxDuration) s window is the entire \(buf.maxFrameCount)-frame cap at 120 fps")
+        XCTAssertLessThan(window * 120.0, Double(buf.maxFrameCount),
+            "a \(window) s window leaves no room for the frames already in flight in the decoder")
+    }
+
+    // MARK: - 缓冲宽限起点(#75 语义保留:真断粮转缓冲时必须重置 bufferingStart,
+    // 否则播放 4s 后 stalled 恒真,resume 水位迟滞从未生效。方案 B 中「回缓冲」
+    // 事件从 pop 低水位迁到 pollStarvation 真空防抖,重置语义随之迁移。)
+
+    func testReturningToBufferingResetsTheGraceWindow() {
+        var fakeNow: TimeInterval = 0
+        let buf = VideoJitterBuffer(now: { fakeNow })
+        buf.append(makeFrame(pts: 0.0))
+        buf.append(makeFrame(pts: 2.0))            // dur 2.0 ≥ resume(1.5)→ playing
+        XCTAssertEqual(buf.state, .playing)
+
+        fakeNow = 5.0
+        buf.pop(); buf.pop()                        // 真空
+        fakeNow = 5.13
+        buf.pollStarvation()                        // 真断粮 → buffering,宽限起点 5.13
+        XCTAssertEqual(buf.state, .buffering)
+
+        // 缺陷版:bufferingStart 仍是旧时刻,stalled = 5.13−旧 > 4 恒真,append 一帧立即
+        // 回 playing。修复版:转缓冲已把宽限起点重置为 5.13,水位(0s)未满必须
+        // 停在 buffering——迟滞真正生效。
+        buf.append(makeFrame(pts: 1.042))
+        XCTAssertEqual(buf.state, .buffering,
+            "回缓冲后宽限期必须重新计时;水位未满不得立即回 playing")
+    }
+
+    func testGraceWindowStillOpensPlaybackAfterReset() {
+        // 修复后的另一半:重置后的 4s 内攒不满水位,仍要有帧就开播——慢解
+        // 兜底语义不得因重置而丢失。
+        var fakeNow: TimeInterval = 0
+        let buf = VideoJitterBuffer(now: { fakeNow })
+        buf.append(makeFrame(pts: 0.0))
+        buf.append(makeFrame(pts: 2.0))            // dur 2.0 ≥ resume(1.5)→ playing
+        XCTAssertEqual(buf.state, .playing)
+
+        fakeNow = 5.0
+        buf.pop(); buf.pop()
+        fakeNow = 5.13
+        buf.pollStarvation()
+        XCTAssertEqual(buf.state, .buffering)
+
+        fakeNow = 9.3                               // 9.3 − 5.13 > 4 → stalled 兜底
+        buf.append(makeFrame(pts: 1.042))
+        XCTAssertEqual(buf.state, .playing,
+            "slowDecoderGrace 到期且有帧,仍应兜底开播")
+    }
+
+    // MARK: - 缓冲宽限恒定 4s(2026-11-21 真机裁定:降级 0.5s 闩在供给不足时
+    // 反作用——缓冲刚开始攒就被强开,dur=0/q=1,形成 0.5-1.5s 微循环。恒定
+    // 4s 让涓流真正攒到水位或宽限再开门,播段长、循环少。)
+
+    func testGraceIsAlwaysFullFourSeconds() {
+        var fakeNow: TimeInterval = 0
+        let buf = VideoJitterBuffer(now: { fakeNow })
+        buf.append(makeFrame(pts: 0.0))
+        buf.append(makeFrame(pts: 2.0))            // dur 2.0 ≥ resume(1.5)→ playing
+        XCTAssertEqual(buf.state, .playing)
+
+        // 第一次真断粮:3s 不放行,4s 放行。
+        fakeNow = 5.0
+        buf.pop(); buf.pop()
+        fakeNow = 5.13
+        buf.pollStarvation()
+        XCTAssertEqual(buf.state, .buffering)
+        fakeNow = 8.1
+        buf.append(makeFrame(pts: 1.042))
+        XCTAssertEqual(buf.state, .buffering, "3s < 4s:不得提前放行")
+        fakeNow = 9.2
+        buf.append(makeFrame(pts: 1.084))
+        XCTAssertEqual(buf.state, .playing, "4s 宽限到期且有帧:放行")
+
+        // 第二次真断粮:宽限不降级,同样要等满 4s(供给不足时提前开门
+        // 只会开出 q=1 的空缓冲,立即再断粮)。
+        fakeNow = 10.0
+        buf.pop(); buf.pop()
+        fakeNow = 10.13
+        buf.pollStarvation()
+        XCTAssertEqual(buf.state, .buffering)
+        fakeNow = 13.0
+        buf.append(makeFrame(pts: 1.126))
+        XCTAssertEqual(buf.state, .buffering, "宽限恒定 4s:2.9s 不得放行")
+        fakeNow = 14.2
+        buf.append(makeFrame(pts: 1.168))
+        XCTAssertEqual(buf.state, .playing)
     }
 }

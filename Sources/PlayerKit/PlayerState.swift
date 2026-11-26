@@ -9,6 +9,13 @@ public struct PlayerState: @unchecked Sendable {
     public var isPlaying:   Bool     = false
     /// Whether the player is currently buffering.
     public var isBuffering: Bool     = false
+    /// PlayerKit#608: audio output device is dead (consecutive AudioQueueStart
+    /// failures past threshold — e.g. `kAudioDevicePropertyIOStoppedAbnormally`
+    /// on a DisplayPort audio sink). Playback degrades: video continues paced
+    /// by source frame PTS, audio is muted; the backend probes the device
+    /// periodically and re-engages audio sync when real callbacks resume.
+    /// Host apps may surface a subtle notice ("音频输出设备不可用") from this.
+    public var audioOutputDegraded: Bool = false
     /// zyno#360: an audio-track switch is in progress (the backend is
     /// reconfiguring decoders/output; the picture may be stalled). Drives the
     /// player's "switching audio track" loading overlay.

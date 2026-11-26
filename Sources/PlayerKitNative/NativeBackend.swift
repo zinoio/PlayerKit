@@ -341,6 +341,14 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
         isPassthroughActive || isInjectedPCMActive
     }
     private let jitterBuffer = VideoJitterBuffer()
+    // —— 缓冲状态副作用(design 2026-11-21 方案 B;onStateChange 在 demux/显示
+    //    线程触发,跨线程访问走 nonisolated(unsafe) + 叶子锁惯例)——
+    /// 最近一次下发给 UI 的 isBuffering;nil = 本会话尚未下发。只在变化时通知。
+    private nonisolated(unsafe) var reportedUIBuffering: Bool?
+    /// 用户主动暂停(最高优先级):jitter 放行不得据此恢复音频。
+    private nonisolated(unsafe) var userPausedForPolicy = false
+    /// 护 reportedUIBuffering 的叶子锁(不与 displayLoopLock 混用)。
+    private let bufferingStateLock = NSLock()
     /// P2: ticked from the display thread; internally lock-guarded (see SyncController).
     nonisolated(unsafe) private let syncController = SyncController()
     // Set after play() or seek(); cleared by displayNextFrame on first frame.
@@ -446,11 +454,6 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
     /// fire and advance audioClock past 0 — without this, seek-to-0 freezes because
     /// primer debt keeps audioClock at 0 while video PTS advances past the 60ms threshold.
     private nonisolated(unsafe) var audioClockReady: Bool = false
-    /// pause() 记下的播放位置(内容秒)。resume() 据此 seek 回暂停位置,
-    /// 让音视频都从暂停那一帧重新解码 —— 只保留缓冲/冻结时钟不够:音频
-    /// 解码/输出侧会积压暂停后的 PCM(实测 +1.7s),重建时被计入时钟会把
-    /// 画面拉去追赶。主线程生命周期路径读写。
-    private var pausedClockPosition: Double?
     // demuxCancelled is written under demuxStateLock (never demuxLock — see there) and
     // read from DispatchQueue.global().
     // Bool reads/writes are atomic on ARM64 in practice; nonisolated(unsafe) makes
@@ -601,6 +604,14 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
     /// 的掩盖保护。
     /// Guarded by displayLoopLock.
     private nonisolated(unsafe) var forceClockCalibration = false
+
+    /// #608:音频输出设备已降级(连续 Start 失败越过阈值)。显示循环据此
+    /// 跳过音频主导的 freeze-ahead 守卫、改走「按源帧 PTS 间隔」的旁路
+    /// pacing——设备死亡时音频时钟冻结,守卫会把超前帧无限冻结(真机:
+    /// 缓冲 117s 饱满、fps 0.7、UI 永远「正在缓冲」)。恢复边沿置回并
+    /// 强制重校准 audioClock 到当前画面 PTS。
+    /// Guarded by displayLoopLock.
+    private nonisolated(unsafe) var audioDeviceDemoted = false
 
     /// Playback rate snapshot for the nonisolated display loop (zyno#99):
     /// setRate() runs on the main actor, displayNextFrame() must not touch
@@ -1642,9 +1653,14 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
         refreshAltAudioStreams(demuxer)
 
         if let as_ = demuxer.audioStream,
-           let dec = FFmpegAudioDecoder(stream: as_, sampleRate: 44100, channels: 2) {
+           let dec = FFmpegAudioDecoder(stream: as_, sampleRate: 44100, channels: 2,
+                                         outputRateOverride: AudioDeviceSampleRate.preferred()) {
             audioDecoder = dec
             let out = AudioUnitOutput(clock: audioClock, delaySecs: audioDelay)
+            // #608:设备死亡降级/恢复边沿。实现见 handleAudioDeviceDemoted /
+            // handleAudioDeviceRecovered(线程:controlQueue 或回调线程)。
+            out.onDeviceDemoted = { [weak self] in self?.handleAudioDeviceDemoted() }
+            out.onDeviceRecovered = { [weak self] in self?.handleAudioDeviceRecovered() }
             audioUnitOutput = out
             isPassthroughActive = false
             isInjectedPCMActive = false
@@ -1661,8 +1677,9 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
             codedSize: CGSize(width: codedVideoWidth, height: codedVideoHeight),
             sampleAspectRatio: demuxer.sampleAspectRatio)
 
+        // 新会话从头开始(缓冲 UI 上报/用户暂停标记),再接线回调。
+        resetBufferingState()
         wireJitterBuffer()
-
         // 音频队列必须先于 demux/display 启动建好并暂停。否则 demux 线程把
         // jitterBuffer 翻到 .playing(onStateChange → resume())时,音频队列
         // 尚未创建(start() 未跑)或本次 pause() 晚于那次 resume() 而覆盖了
@@ -1704,6 +1721,7 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
         displayLoopLock.withLock {
             needsClockCalibration = true
             audioClockReady = false
+            audioDeviceDemoted = false   // #608:新会话重置降级(新 AudioUnitOutput 健康计数全新)
         }
 
         state.isPlaying = true
@@ -1722,29 +1740,60 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
 
     private func wireJitterBuffer() {
         jitterBuffer.onStateChange = { [weak self] newState in
-            guard let self = self else { return }
+            guard let self = self, !self.systemDVActive else { return }
             switch newState {
             case .buffering:
-                self.audioUnitOutput?.pause()
-                self._injectedAudioOutput?.pause()
-                DispatchQueue.main.async { [weak self] in
-                    guard let self = self else { return }
-                    self.state.isBuffering = true
-                    // Drop the tick-gap baseline so the refill-triggered resume
-                    // isn't misreported as a main-thread stall by the gap
-                    // diagnostic in displayNextFrame().
-                    self.lastTickWallTime = nil
-                    self.notifyStateChange()
-                }
+                // 真断粮(实际无帧可显示连续 ≥0.12s 防抖,VideoJitterBuffer 判定)
+                // → 暂停音频 + 显示缓冲卡。
+                self.setAudioPaused(true)
+                self.requestUIBuffering(true)
             case .playing:
-                self.audioUnitOutput?.resume()
-                self._injectedAudioOutput?.resume()
-                DispatchQueue.main.async { [weak self] in
-                    guard let self = self else { return }
-                    self.state.isBuffering = false
-                    self.notifyStateChange()
-                }
+                // 高水位/EOF/宽限放行 → 恢复音频 + 清缓冲卡。
+                // 用户暂停时 setAudioPaused(false) 拒绝执行(方案 B 仲裁:
+                // jitter 永远不能顶掉用户暂停)。
+                self.setAudioPaused(false)
+                self.requestUIBuffering(false)
             }
+        }
+    }
+
+    // MARK: - 缓冲状态副作用(方案 B:单一拥有者)
+
+    /// 会话开始/结束:UI 上报值与用户暂停标记清零。
+    private nonisolated func resetBufferingState() {
+        bufferingStateLock.withLock {
+            reportedUIBuffering = nil
+        }
+        userPausedForPolicy = false
+    }
+
+    /// 音频停走的唯一仲裁入口。恢复侧在用户主动暂停期间拒绝执行 —— 用户
+    /// 暂停后即使 jitter 放行,也不能把用户的暂停顶掉。
+    nonisolated func setAudioPaused(_ paused: Bool) {
+        if paused {
+            audioUnitOutput?.pause()
+            _injectedAudioOutput?.pause()
+        } else {
+            guard !userPausedForPolicy else { return }
+            audioUnitOutput?.resume()
+            _injectedAudioOutput?.resume()
+        }
+    }
+
+    /// 缓冲指示下发:只在值变化时 dispatch 到 main 写 state 并通知。
+    /// 置 true 时按既有语义清掉 tick-gap 基线,避免恢复瞬间被误报为主线程卡顿。
+    private nonisolated func requestUIBuffering(_ buffering: Bool) {
+        let changed = bufferingStateLock.withLock { () -> Bool in
+            guard reportedUIBuffering != buffering else { return false }
+            reportedUIBuffering = buffering
+            return true
+        }
+        guard changed else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.state.isBuffering = buffering
+            if buffering { self.lastTickWallTime = nil }
+            self.notifyStateChange()
         }
     }
 
@@ -1995,6 +2044,14 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
                     if result.didSwitchClip, rawPTS.isFinite {
                         ptsValidator.forceRebase(to: rawPTS)
                         pts = rawPTS
+                        // 跨 clip 接缝:重建字幕解码器/渲染器。MultiClipDemuxer
+                        // switchTo 已按缓存重挂字幕流(新 clip 的 discard 布局
+                        // 恢复),但解码器仍持有已 close 的旧 clip AVStream 指针。
+                        // 本处处于 demuxLock(dLock)持有中,与 selectSubtitle
+                        // 同锁环境,直接重建安全。
+                        if let trackId = state.selectedSubtitleTrackId {
+                            recreateSubtitleRenderers(demuxer: demuxer, trackId: trackId)
+                        }
                     } else {
                         pts = ptsValidator.validate(rawPTS)
                         // [diag] count rewritten PTS (blind clock / anomaly path)
@@ -2716,6 +2773,10 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
         guard renderGate.try() else { return }
         defer { renderGate.unlock() }
 
+        // 方案 B:实际断粮检查在所有 early return 之前每 tick 执行;转缓冲的
+        // 音频/UI 副作用由 onStateChange 统一执行。
+        jitterBuffer.pollStarvation()
+
         let now = CACurrentMediaTime()
         let bufferPlaying = jitterBuffer.state == .playing
 
@@ -2842,6 +2903,15 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
         let serial = seekLock.withLock { seekSerial }
         let playbackRate = displayLoopLock.withLock { displayRate }
 
+        // #608:设备停转看门狗——半死设备(偶发孤立回调后停转)会让音频
+        // 主时钟冻结;失败计数会被孤立回跳干扰,这里直接编码真机语义:
+        // 播放中音频时钟 3s 内几乎不推进 ⇒ 降级(本 tick 起即走旁路 pacing)。
+        if !displayLoopLock.withLock({ audioDeviceDemoted }),
+           let out = audioUnitOutput,
+           out.noteDisplayTickForStall(now: now) {
+            handleAudioDeviceDemoted()
+        }
+
         // --- Freeze-ahead / Skip-behind (commercial player A/V sync) ---
         // After the first post-seek frame has been displayed, guard against large
         // desync without changing playback speed.  Video ahead of audio: freeze
@@ -2938,7 +3008,10 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
         // starts at −|d| and would only cross 0 after |d| seconds had played,
         // leaving the display free-running (unsynced) through the entire
         // negative window instead of holding the picture there.
-        if !clockReady, audioClock.hasConsumedOutput {
+        // #608:降级期不得据此翻回 clockReady——audioClock 在设备死亡前的
+        // 消费值仍 >0,翻回会让 freeze-ahead 用冻结的音频时间永久扣帧。
+        if !clockReady, !displayLoopLock.withLock({ audioDeviceDemoted }),
+           audioClock.hasConsumedOutput {
             displayLoopLock.withLock { audioClockReady = true }
         }
         // 注入 PCM 后端(DSP):AudioClock 永不消费,就绪判据换成注入后端
@@ -3178,11 +3251,68 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
     /// (zyno#127);PCM = audioClock.audioTime。软件/系统两条路径共用同一口径:
     /// 这里**不做**任何输出延迟加减(#357 保持单一约定,修复后两路一起受益)。
     private nonisolated func currentMasterAudioTime() -> Double {
-        if _injectedAudioOutput != nil && injectedClockActive,
+        // 消费样本时钟(回调累计的真实播放进度)是主时钟。
+        // 2026-11-21 实锤:AudioQueueGetCurrentTime(devicePlaybackTime)返回的是
+        // **队列尾部**(已入队未播出)而非播放头——实测 dev 超前 cons 1.95 秒
+        // (随音频预读深度变化,最高观测 5.75s),视频按"未来"对齐,真机感知
+        // 画面超前 2~3 秒。切回 cons 后音画同步,暂停恢复(#66 场景)亦正常。
+        // 倍速:advance(rate:) 已把输出样本折算成内容时间,倍速下依然正确。
+        // 注入输出(PRO DSP/透传)自带设备时间线,语义是真实播放位置,保持最优先。
+        if _injectedAudioOutput != nil, injectedClockActive,
            let pt = _injectedAudioOutput?.playbackTime, pt.isFinite, pt >= 0 {
             return pt + audioClock.fullDelay
         }
+        if !systemDVActive, audioClock.hasConsumedOutput {
+            return audioClock.audioTime
+        }
+        // 兜底:音频尚未产出(首播前)时的设备时钟;cons 有值即不再使用。
+        // DV 系统路径不走设备时钟:它有层 timebase 自己校准。
+        if !systemDVActive, let device = audioUnitOutput?.devicePlaybackTime {
+            return device + audioClock.fullDelay
+        }
         return audioClock.audioTime
+    }
+
+    // MARK: - #608 音频设备降级 / 恢复
+
+    /// 音频输出设备连续 Start 失败越过阈值(死亡判定):把主时钟从音频
+    /// 主导切到「按源帧 PTS 间隔」的旁路 pacing,画面照常 1x 续播。
+    ///
+    /// 真机事故(2026-11-23):LG UltraFine DP 音频起播 10s 后
+    /// `kAudioDevicePropertiesIOStoppedAbnormally` 停机,AudioQueueStart 恒
+    /// 被 HAL 拒绝 → 音频回调断绝 → audioClock 冻结 → freeze-ahead 守卫把
+    /// 所有超前帧无限冻结(缓冲 117s 饱满、fps 0.7、UI 永远「正在缓冲」)。
+    /// 调用线程:AudioUnitOutput 的 controlQueue / 解码线程,不假设主线程。
+    private nonisolated func handleAudioDeviceDemoted() {
+        let changed = displayLoopLock.withLock { () -> Bool in
+            guard !audioDeviceDemoted else { return false }
+            audioDeviceDemoted = true
+            audioClockReady = false   // 旁路 pacing:按源帧 PTS 间隔 1x 弹帧
+            needsClockCalibration = false
+            forceClockCalibration = false
+            return true
+        }
+        if changed {
+            logger.error("[#608] 音频输出设备不可用 → 降级续播:画面按源帧率节奏推进,音频静音,定时探测设备恢复")
+        }
+    }
+
+    /// 降级期真实回调到达(设备 IO 复活):回切音频主导。audioClock 在降级
+    /// 期间冻结,距画面已数十秒~数分钟,超过 maxCalibrationGap——强制重
+    /// 校准到当前队首帧(force),恢复音频主导的 freeze-ahead/pacing。
+    /// 调用线程:AudioQueue 回调线程。
+    private nonisolated func handleAudioDeviceRecovered() {
+        let changed = displayLoopLock.withLock { () -> Bool in
+            guard audioDeviceDemoted else { return false }
+            audioDeviceDemoted = false
+            audioClockReady = false        // 待真实消费(hasConsumedOutput)后置回
+            needsClockCalibration = true
+            forceClockCalibration = true   // 跨降级期的 stale 时钟必须强制校准
+            return true
+        }
+        if changed {
+            logger.warning("[#608] 音频输出设备恢复 → 回切音频主导时钟(强制重校准)")
+        }
     }
 
     /// 系统路径的显示 tick:
@@ -3298,8 +3428,15 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
         systemDVP7Rewriter = nil
         systemDVActive = false
         systemDVStarted = false
-        activeVideoPipeline = .decodedFrames
+        // currentMasterAudioTime 必须在 pipeline 写入之前完成:它新增的
+        // devicePlaybackTime 分支会调 AudioQueueGetCurrentTime,在无真实音频
+        // 设备的环境(CI runner)上这个调用可能慢到百毫秒级——夹在
+        // 「activeVideoPipeline = .decodedFrames」与「onSystemDVFallback?()」
+        // 之间时,轮询 pipeline 的观察者(测试的 waitUntil、UI 层同理)会在
+        // 窗口里观察到"已回退但回调未触发"(CI testFallbackOnInjectedFailure
+        // 实测 count1=0 而稍后的 count2=1)。管线切换与回调相邻,窗口消失。
         let pos = max(0, currentMasterAudioTime())
+        activeVideoPipeline = .decodedFrames
         onSystemDVFallback?()
         Task { @MainActor [weak self] in
             self?.rebuildSoftwareDVChain(currentPosition: pos)
@@ -3423,6 +3560,10 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
                     self.lastBytesLogged = self.totalBytesRead
                     self.lastThroughputTime = now
                 }
+                // 注意:cacheSpeed 是 demux 的消费速度(预读节流把它压到约等于
+                // 播放码率),不是网速——别拿它去调 jitter 水位。2026-11-18 的缓冲
+                // 策略自适应因此把稳态播放误判成慢网/中档,2026-11-20 撤销
+                // (见 BufferingStabilityTests)。
             } else if !hasBaseline {
                 throughputLock.withLock {
                     self.lastBytesLogged = self.totalBytesRead
@@ -3509,6 +3650,8 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
             state.currentSubtitleImage = img
             state.currentSubtitleImageRect = u.subtitleImageRect ?? .zero
         }
+        // #608:降级状态随显示更新上报(app 可据此显示「音频输出设备不可用」)。
+        state.audioOutputDegraded = displayLoopLock.withLock { audioDeviceDemoted }
 
         if u.notify { notifyStateChange() }
     }
@@ -3531,7 +3674,7 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
     }
 
     public func pause() {
-        pausedClockPosition = max(0, currentMasterAudioTime())
+        userPausedForPolicy = true
         logger.info("pause")
         displayLink?.invalidate(); displayLink = nil
         displayLoopLock.withLock { displayLoopStopped = true }
@@ -3576,6 +3719,7 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
             return
         }
         logger.info("resume")
+        userPausedForPolicy = false
         // Re-activate the AudioSession.  After a background/PiP transition iOS may
         // deactivate the session, which silently prevents AudioQueue callbacks
         // from firing — the audio clock freezes and A/V sync stalls.
@@ -3588,38 +3732,11 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
         // jitterBuffer 后恢复瞬间没有新帧可显示(主画面闪过 PiP 的最后内容)、
         // 音频时钟归零重校准产生咔哒。只有真正 pause 过(循环已取消)才需要
         // 走完整的重建路径。
+        // 用户主动暂停的恢复(业内方案,#66):队列全程只用 AudioQueuePause /
+        // AudioQueueStart,不 flush、不重建、不 seek。主时钟取设备播放位置
+        // (AudioUnitOutput.devicePlaybackTime)——暂停期间设备位置不变,
+        // 恢复后从同一点继续,队列里积压的 PCM 不会把位置推过暂停段。
         let resumingContinuous = demuxStateLock.withLock { demuxLoopRunning && !demuxCancelled }
-        // 用户主动暂停:恢复时对暂停位置做一次 seek,让音视频都从暂停那一帧
-        // 重新解码。只保留 jitter/冻结时钟不够 —— 音频解码/输出侧会积压暂停
-        // 后的 PCM(真机实测恢复瞬间音频时钟 +1.7s),重建时被计入主时钟,
-        // sync 就会把画面拉去追赶,表现为"恢复画面比暂停画面靠后"。
-        // 代价:恢复多一次 seek/填充(0.1-0.5s),换来完全对齐。
-        if !resumingContinuous, let paused = pausedClockPosition {
-            pausedClockPosition = nil
-            logger.info("resume: realign to paused position \(String(format: "%.3f", paused), privacy: .public)s")
-            startDemuxLoop()
-            startDisplayLink()
-            state.isPlaying = true
-            notifyStateChange()
-            _seek(to: Duration.seconds(paused), synchronousDemuxerSeek: false,
-                  keepDisplayedFrame: true)
-            return
-        }
-        if !resumingContinuous {
-            // 用户主动暂停(pause() 已停 demux、音频时钟冻结在暂停位置):
-            // 只丢弃音频输出侧暂停前排队的 PCM,保留 jitter 缓冲与时钟位置
-            // —— 恢复从暂停的那一帧继续。
-            //
-            // 旧实现还 flush jitter + audioClock.reset(0) + 强校准到首帧。
-            // 但 demux 循环可能正卡在在途网络读里,暂停期间又读进一段,
-            // demuxer 位置已经超前;flush 掉旧帧后从超前位置起播,真机现象
-            // 就是"恢复画面比暂停画面往前走了 2-6 秒"(2026-11-15)。
-            audioUnitOutput?.flush()
-            _injectedAudioOutput?.flush()
-            let resumeSR = audioDecoder?.outputSampleRate ?? 44100
-            let resumeCh = audioDecoder?.outputChannels ?? 2
-            audioUnitOutput?.start(sampleRate: resumeSR, channels: resumeCh)
-        }
         // Continuous path (pipeline never stopped, e.g. PiP): resume audio output
         // regardless of jitter buffer state.
         // If the player was paused while the jitter buffer was in .buffering state,
@@ -3968,6 +4085,9 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
         demuxLock.unlock()
         jitterBuffer.flush()
         syncController.reset()
+        // 会话结束:缓冲 UI 上报/用户暂停标记清零(防上一会话的缓冲卡/暂停
+        // 标记泄漏进新会话)。
+        resetBufferingState()
         displayLoopLock.withLock {
             lastBypassPopTime = 0
             forceClockCalibration = false
@@ -4252,7 +4372,8 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
 
         audioUnitOutput?.stop()
         audioDecodeQueue.sync { audioDecoder?.flush() }
-        let newDecoder = FFmpegAudioDecoder(stream: stream, sampleRate: 44100, channels: 2)
+        let newDecoder = FFmpegAudioDecoder(stream: stream, sampleRate: 44100, channels: 2,
+                                            outputRateOverride: AudioDeviceSampleRate.preferred())
         audioDecoder = newDecoder
         discardAudioUntilPts = nil
         let cached = altAudioCache.take(stream: newStream, from: posSecs)
@@ -4383,7 +4504,8 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
             discardAudioUntilPts = nil
         }
         if let stream = demuxer.audioStream {
-            audioDecoder = FFmpegAudioDecoder(stream: stream, sampleRate: 44100, channels: 2)
+            audioDecoder = FFmpegAudioDecoder(stream: stream, sampleRate: 44100, channels: 2,
+                                              outputRateOverride: AudioDeviceSampleRate.preferred())
         }
         // Flush the video pipeline INSIDE demuxLock, same as performDemuxerSeek:
         // the demux loop is blocked here, so no post-landing frame can slip in
@@ -4497,37 +4619,45 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
             notifyStateChange()
         }
 
+        recreateSubtitleRenderers(demuxer: demuxer, trackId: trackId)
+
+        // No seek here: seeking would flush the video pipeline and cause 2-5s
+        // re-buffering on network streams, which users misread as "subtitle failed
+        // to load." The demux loop is already 2s ahead of playback; future subtitle
+        // packets for the newly selected stream are processed naturally. The
+        // currently-active cue (whose packet was already read) may not appear until
+        // the next subtitle event — an acceptable trade-off vs. visible re-buffering.
+    }
+
+    /// 字幕解码器/渲染器重建(PGS/DVD→位图解码器,ASS→渲染器)。两个调用点:
+    /// selectSubtitle(用户切轨)与 demux 循环的跨 clip 接缝——接缝处旧解码器
+    /// 持有已 close 的上一个 clip 的 AVStream 指针,必须重建(2026-11-14
+    /// 复联4 ISO 原盘切字幕跨接缝 PGS 静默消失的根因)。调用方须持 demuxLock。
+    private func recreateSubtitleRenderers(demuxer: any PacketDemuxing, trackId: Int?) {
         subtitleDecoder = nil
         assRenderer = nil
-        if let resolvedTrackId = trackId {
-            let nb = Int(demuxer.formatContext?.pointee.nb_streams ?? 0)
-            for i in 0..<nb {
-                guard let s = demuxer.formatContext?.pointee.streams[i],
-                      Int(s.pointee.index) == resolvedTrackId else { continue }
-                let codecId = s.pointee.codecpar.pointee.codec_id
-                if codecId == AV_CODEC_ID_HDMV_PGS_SUBTITLE || codecId == AV_CODEC_ID_DVD_SUBTITLE {
-                    subtitleDecoder = FFmpegSubtitleDecoder(
-                        stream: s,
-                        videoSize: CGSize(width: codedVideoWidth, height: codedVideoHeight)
-                    )
-                    logger.notice("[sub] PGS/DVD decoder created: \(self.subtitleDecoder != nil ? "OK" : "FAILED")")
-                } else if codecId == AV_CODEC_ID_ASS || codecId == AV_CODEC_ID_SSA {
-                    let r = Self.makeASSRenderer(
-                        stream: s,
-                        videoSize: CGSize(width: codedVideoWidth, height: codedVideoHeight),
-                        fontFamily: subtitleFontFamily
-                    )
-                    assRenderer = r
-                    logger.notice("[sub] ASS renderer \(r != nil ? "created" : "unavailable (no extradata)")")
-                }
-                break
+        guard let resolvedTrackId = trackId else { return }
+        let nb = Int(demuxer.formatContext?.pointee.nb_streams ?? 0)
+        for i in 0..<nb {
+            guard let s = demuxer.formatContext?.pointee.streams[i],
+                  Int(s.pointee.index) == resolvedTrackId else { continue }
+            let codecId = s.pointee.codecpar.pointee.codec_id
+            if codecId == AV_CODEC_ID_HDMV_PGS_SUBTITLE || codecId == AV_CODEC_ID_DVD_SUBTITLE {
+                subtitleDecoder = FFmpegSubtitleDecoder(
+                    stream: s,
+                    videoSize: CGSize(width: codedVideoWidth, height: codedVideoHeight)
+                )
+                logger.notice("[sub] PGS/DVD decoder recreated: \(self.subtitleDecoder != nil ? "OK" : "FAILED")")
+            } else if codecId == AV_CODEC_ID_ASS || codecId == AV_CODEC_ID_SSA {
+                let r = Self.makeASSRenderer(
+                    stream: s,
+                    videoSize: CGSize(width: codedVideoWidth, height: codedVideoHeight),
+                    fontFamily: subtitleFontFamily
+                )
+                assRenderer = r
+                logger.notice("[sub] ASS renderer \(r != nil ? "created" : "unavailable (no extradata)")")
             }
-            // No seek here: seeking would flush the video pipeline and cause 2-5s
-            // re-buffering on network streams, which users misread as "subtitle failed
-            // to load." The demux loop is already 2s ahead of playback; future subtitle
-            // packets for the newly selected stream are processed naturally. The
-            // currently-active cue (whose packet was already read) may not appear until
-            // the next subtitle event — an acceptable trade-off vs. visible re-buffering.
+            break
         }
     }
 

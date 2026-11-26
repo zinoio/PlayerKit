@@ -58,6 +58,50 @@ public final class AudioUnitOutput: AudioOutputBackend {
     nonisolated(unsafe) static var setVolumeParamImpl: (AudioQueueRef, Float) -> OSStatus = {
         AudioQueueSetParameter($0, kAudioQueueParam_Volume, $1)
     }
+    /// GetCurrentTime seam(#72 主时钟插值缓存):生产用真实现,测试包装计数,
+    /// 断言 freshWindow 内的重复读取不重复进设备查询。Reset in test tearDown.
+    nonisolated(unsafe) static var getCurrentTimeImpl: (AudioQueueRef) -> (sampleTime: Double, valid: Bool) = { queue in
+        var ts = AudioTimeStamp()
+        let rc = AudioQueueGetCurrentTime(queue, nil, &ts, nil)
+        return (ts.mSampleTime, rc == noErr && ts.mFlags.contains(.sampleTimeValid))
+    }
+    /// #72 测试 seam:freshWindow 覆盖(默认 0.1s)。生产永不安值;测试放大/
+    /// 缩小窗口以确定性地断言「窗内零查询 / 超窗一次查询」。Reset in tearDown.
+    nonisolated(unsafe) static var clockFreshWindowForTesting: TimeInterval?
+
+    // MARK: - #608 音频设备死亡降级
+
+    /// 设备健康(降级/探测节流/恢复边沿,纯逻辑见 AudioDeviceHealth)。
+    let deviceHealth = AudioDeviceHealth()
+    var deviceHealthForTesting: AudioDeviceHealth { deviceHealth }
+    /// 降级边沿(连续 Start 失败越过阈值):backend 安装,切视频时钟续播。
+    /// 在 controlQueue / 调用线程上触发,实现方自行切线程。
+    nonisolated(unsafe) var onDeviceDemoted: (() -> Void)?
+    /// 恢复边沿(降级期真实回调到达 = 设备 IO 复活):backend 重校准时钟。
+    nonisolated(unsafe) var onDeviceRecovered: (() -> Void)?
+
+    /// 记一次 Start 失败并在越过阈值时报降级边沿。
+    private func recordStartFailure() {
+        if deviceHealth.recordStartFailure(now: ProcessInfo.processInfo.systemUptime) {
+            logger.error("[#608] 音频输出设备连续 Start 失败 → 降级:画面按源帧率续播,音频静音,定时探测恢复")
+            onDeviceDemoted?()
+        }
+    }
+
+    /// #608:音频时钟停转看门狗(见 AudioStallWatchdog)。由显示循环每 tick
+    /// 调用;true = 判定设备停转,调用方执行降级。失败计数会被半死设备的
+    /// 孤立回调干扰,该判据只看时钟是否真实推进,两者互补。
+    func noteDisplayTickForStall(now: TimeInterval) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        // 合法静止(未跑/用户暂停/尚无消费)不做判定。
+        guard running, !paused, clock.hasConsumedOutput else {
+            stallWatchdog.reset()
+            return false
+        }
+        return stallWatchdog.note(now: now, audioTime: clock.audioTime)
+    }
+
+    private var stallWatchdog = AudioStallWatchdog()
 
     /// Serial queue that owns every AudioQueue control call (Pause/Start).
     ///
@@ -336,7 +380,15 @@ public final class AudioUnitOutput: AudioOutputBackend {
             }
         }
 
-        AudioQueueStart(queue, nil)
+        // #608:Start 失败不再静默——连续失败越过阈值触发降级(设备死亡
+        // 时每次重建都是一次 HAL 喂锤,必须在源头记账)。
+        let startRC = Self.startImpl(queue)
+        if startRC != noErr {
+            logger.error("AudioQueueStart(start) FAILED: \(startRC)")
+            recordStartFailure()
+        } else {
+            deviceHealth.recordStartSuccess()
+        }
 
         // Swap in the new queue atomically.  Any in-flight enqueue() that was
         // waiting on the lock will see the new queue, not the disposed one.
@@ -344,6 +396,10 @@ public final class AudioUnitOutput: AudioOutputBackend {
         audioQueue = queue
         running = true
         paused = false
+        // 新队列的 sampleTime 从 0 起算,内容基准取当前时钟位置(seek 时
+        // 调用方已先 audioClock.reset(to: target),这里正好对上)。
+        _deviceBaseContent = clock.audioTime
+        _deviceBaseSample = 0
         enqueuedFrames = 0
         bufferedFrameCount = 0
         pendingPrimerCallbacks = primerCount
@@ -380,6 +436,8 @@ public final class AudioUnitOutput: AudioOutputBackend {
         leadAnchorTaken = 0
         lastCallbackWall = 0
         contentFifo.removeAll(); playedContentEndPTS = .nan
+        // #72:队列引用已作废(新队列是新时间轴),锚点必须失效
+        clockCache.invalidate()
         lock.unlock()
         // Seek/stop/track-switch all land here: drop the held-back frames so
         // stale pre-seek audio can't play from the new position, and zero the
@@ -422,6 +480,16 @@ public final class AudioUnitOutput: AudioOutputBackend {
         controlQueue.async { [weak self] in
             guard let self, let q = self.currentQueueLocked() else { return }
             _ = Self.pauseImpl(q)
+            // #72:暂停落地后把锚点钉到真实冻结点——否则暂停显示位置冻结在
+            // flag 翻转前的锚点,最多滞后一个 freshWindow。control 路径一次
+            // 查询,不进热路径。
+            let r = Self.getCurrentTimeImpl(q)
+            self.lock.lock()
+            if r.valid {
+                self.clockCache.commit(sample: r.sampleTime,
+                                       now: ProcessInfo.processInfo.systemUptime)
+            }
+            self.lock.unlock()
         }
     }
 
@@ -434,6 +502,9 @@ public final class AudioUnitOutput: AudioOutputBackend {
         // A deliberate pause is not a starvation: re-anchor the callback clock
         // so the first enqueue after a resume cannot trigger a rebuild.
         if lastCallbackWall > 0 { lastCallbackWall = ProcessInfo.processInfo.systemUptime }
+        // #72:resume 后锚点失效——AudioQueueStart 是异步下发的,落地前真实
+        // 查询返回的仍是暂停冻结值(与旧语义一致),落地后自然前进。
+        clockCache.invalidate()
         lock.unlock()
         guard queue != nil else {
             // 音频队列尚不存在时被要求恢复:start() 未跑或队列已 dispose。
@@ -444,9 +515,15 @@ public final class AudioUnitOutput: AudioOutputBackend {
         }
         controlQueue.async { [weak self] in
             guard let self, let q = self.currentQueueLocked() else { return }
+            // #608:降级期零打扰——设备已死,再 Start 只是给 HAL 喂锤
+            // (每次重建失败还会拉长 soft-blacklist 式停机)。
+            guard !self.deviceHealth.isDemoted else { return }
             let rc = Self.startImpl(q)
             if rc != noErr {
                 logger.error("AudioQueueStart(resume) FAILED: \(rc)")
+                self.recordStartFailure()
+            } else {
+                self.deviceHealth.recordStartSuccess()
             }
         }
     }
@@ -468,6 +545,16 @@ public final class AudioUnitOutput: AudioOutputBackend {
     /// several seconds.
     private func rebuildQueueIfStarved() {
         let now = ProcessInfo.processInfo.systemUptime
+        // #608:降级期把「重建」退化为按 probeInterval 节流的探测。探测走
+        // 与 starve 重建相同的 start() 路径:新队列天然冲刷陈旧缓冲,
+        // Start 成功且真实回调到达即由回调路径标记恢复(见 _callbackConsumed)。
+        if deviceHealth.isDemoted {
+            guard deviceHealth.shouldProbe(now: now) else { return }
+            deviceHealth.recordProbedAt(now: now)
+            logger.info("[#608] 降级探测:重建音频队列试探设备恢复")
+            start(sampleRate: clock.sampleRate, channels: _channels)
+            return
+        }
         lock.lock()
         let gap = lastCallbackWall > 0 ? now - lastCallbackWall : 0
         let starved = running && !paused && lastCallbackWall > 0
@@ -617,6 +704,10 @@ public final class AudioUnitOutput: AudioOutputBackend {
     }
 
     private func enqueueDirect(_ frame: PCMFrame, contentPts: Double) {
+        // #608:降级期丢弃入队——设备不会播放它们;入队只会触发必然失败的
+        // Start(喂锤)并让时钟/缓冲记账撒谎(hasPendingOutput 永真会挡死
+        // EOF 自由跑)。探测重建由 rebuildQueueIfStarved 节流负责。
+        guard !deviceHealth.isDemoted else { return }
         // Hold the lock across allocate+copy+enqueue so the dispose path can't
         // tear down the queue between the guard and the AudioQueue calls.
         // disposeUnderLock() also takes this lock, so it waits for any in-flight
@@ -692,6 +783,9 @@ public final class AudioUnitOutput: AudioOutputBackend {
                 let rc = Self.startImpl(q)
                 if rc != noErr {
                     logger.error("AudioQueueStart(enqueue) FAILED: \(rc)")
+                    self.recordStartFailure()
+                } else {
+                    self.deviceHealth.recordStartSuccess()
                 }
             }
         }
@@ -699,6 +793,13 @@ public final class AudioUnitOutput: AudioOutputBackend {
 
     /// Called from the AudioQueue callback — do not call directly.
     func _callbackConsumed(byteCount: Int, queue: AudioQueueRef?) {
+        // #608:任何真实回调都证明设备 IO 活着——这是半死态(Start 成功但
+        // 不出声)下唯一可信的存活信号。降级期到达即报恢复边沿,backend
+        // 据此把主时钟回切音频主导。
+        if deviceHealth.recordDeviceAlive(now: ProcessInfo.processInfo.systemUptime) {
+            logger.warning("[#608] 音频输出设备恢复(真实回调到达)→ 回切音频主导时钟")
+            onDeviceRecovered?()
+        }
         // [diag] The queue's own sample timebase, read OUTSIDE our lock: holding
         // the lock across an AudioQueue call can deadlock against the enqueue
         // path (which holds the lock across AudioQueueEnqueueBuffer). Note it
@@ -779,8 +880,29 @@ public final class AudioUnitOutput: AudioOutputBackend {
     private var _playbackRate: Double = 1.0
 
     public func setPlaybackRate(_ rate: Double) {
+        let clamped = max(0.25, min(4.0, rate.isFinite ? rate : 1.0))
+        // 倍速变更:设备时钟按"输出样本 × rate"换算内容秒,先把基准重锚到
+        // 当前内容位置与当前 sampleTime,避免整段历史按新 rate 重算导致跳变。
+        var sampleTime: Double?
         lock.lock()
-        _playbackRate = max(0.25, min(4.0, rate.isFinite ? rate : 1.0))
+        let queue = audioQueue
+        lock.unlock()
+        if let queue {
+            var ts = AudioTimeStamp()
+            if AudioQueueGetCurrentTime(queue, nil, &ts, nil) == noErr,
+               ts.mFlags.contains(.sampleTimeValid) {
+                sampleTime = ts.mSampleTime
+            }
+        }
+        lock.lock()
+        if let st = sampleTime {
+            _deviceBaseContent = clock.audioTime
+            _deviceBaseSample = st
+        }
+        _playbackRate = clamped
+        // #72:基准刚按真实 sampleTime 重锚,锚点同步失效,下一读回真值,
+        // 保证 base 与缓存锚点取自同一次时间轴状态。
+        clockCache.invalidate()
         let targetContent = _delayTargetContent
         let effective = _playbackRate
         lock.unlock()
@@ -799,6 +921,59 @@ public final class AudioUnitOutput: AudioOutputBackend {
     /// 只写 `state.volume`、没有任何消费者(UI 是空转的);这里经
     /// `kAudioQueueParam_Volume` 真正衰减 AudioQueue 输出,建队/重建时补挂。
     private var _volume: Float = 1.0
+
+    /// 设备时钟的内容基准:队列创建时对应的内容秒。设备播放位置 =
+    /// base + AudioQueueGetCurrentTime 的 sampleTime / sampleRate。
+    ///
+    /// AudioQueue 的 sampleTime 在 Pause 期间不变、Start 后继续,所以暂停/
+    /// 恢复天然连续,恢复时队列里积压的 PCM 也不会把时钟推过暂停点 ——
+    /// 这正是业内做法(时钟取设备位置,而不是累计消费样本)。Guarded by lock。
+    private var _deviceBaseContent: Double = 0
+    /// 基准时刻的设备 sampleTime(队列时间轴)。倍速切换时与 _deviceBaseContent
+    /// 一起重锚,保证内容时间 = base + (sample - baseSample)/sr × rate。
+    private var _deviceBaseSample: Double = 0
+    /// #72 主时钟插值缓存:sampleTime 锚点 + 单调墙钟外推,热路径零 XPC。
+    /// 锚点在 disposeUnderLock/resume/setPlaybackRate 失效。Guarded by lock。
+    private var clockCache = InterpolatedDeviceClock(
+        freshWindow: AudioUnitOutput.clockFreshWindowForTesting ?? 0.10)
+
+    /// 设备播放位置(内容秒)。nil = 队列不可用/取不到有效采样时间。
+    /// #72:freshWindow(0.1s ⇒ ≥10Hz 真查询)内走锚点外推,热路径零 XPC/
+    /// 锁等待;暂停期锚点冻结;查询失败在 grace 内兜底外推。AudioQueue API
+    /// 在锁外调用(与 enqueue 路径的锁纪律一致)。
+    var devicePlaybackTime: Double? {
+        let now = ProcessInfo.processInfo.systemUptime
+        lock.lock()
+        let queue = audioQueue
+        let base = _deviceBaseContent
+        let baseSample = _deviceBaseSample
+        let sr = clock.sampleRate
+        let rate = _playbackRate
+        let pausedNow = paused
+        let action = clockCache.plan(paused: pausedNow, now: now, sampleRate: Double(max(1, sr)))
+        lock.unlock()
+        guard let queue, sr > 0 else { return nil }
+        let sample: Double?
+        switch action {
+        case .extrapolate(let s), .frozen(let s):
+            sample = s
+        case .query:
+            let result = Self.getCurrentTimeImpl(queue)
+            lock.lock()
+            if result.valid {
+                clockCache.commit(sample: result.sampleTime, now: now)
+                sample = result.sampleTime
+            } else {
+                // 瞬时 XPC 抖动:grace 内按锚点外推,不把失败注入视频时钟
+                sample = clockCache.fallbackAfterFailedQuery(now: now, sampleRate: Double(max(1, sr)))
+            }
+            lock.unlock()
+        }
+        guard let s = sample else { return nil }
+        // sampleTime 是输出(墙钟)样本;内容时间与 AudioClock.advance 同口径,
+        // 需要乘播放倍速(2x 时 1 秒输出 = 2 秒内容),否则倍速播放位置只走 1x。
+        return base + max(0, s - baseSample) / Double(sr) * Double(rate)
+    }
 
     /// 短临界区读当前音量(start() 不持锁运行,不能裸读)。
     private func currentVolume() -> Float {
