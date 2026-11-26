@@ -67,6 +67,7 @@ final class HdrCorpusConformanceTests: XCTestCase {
         case .hlgOOTF:                   return "hlgOOTF"
         case .degradedHDR10:             return "degradedHDR10"
         case .doviSystem:                return "doviSystem"
+        case .doviRouteB:                return "doviRouteB"
         }
     }
 

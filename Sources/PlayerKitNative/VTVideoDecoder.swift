@@ -59,6 +59,12 @@ final class VTVideoDecoder {
     private let streamStartTime: Int64
     private let streamTimeBase: AVRational
 
+    /// Phase 2 route b: extract per-frame unspec62 RPU RBSP (converting P7→P8.1
+    /// when `isDoviProfile7` is true) and pair it by PTS with VT's reordered output.
+    private let extractDoviRpu: Bool
+    private let isDoviProfile7: Bool
+    private let rpuCache = DoviRpuPtsCache()
+
     // Per-NAL-type success/failure counts, split IDR vs non-IDR. Some BD
     // H.264 streams make VT fail the majority of non-IDR (P/B) NALs with
     // kVTVideoDecoderBadDataErr while every IDR decodes fine; keyframes are
@@ -122,11 +128,17 @@ final class VTVideoDecoder {
 
     /// - Parameter prefer10Bit: When true, requests 10-bit VT output for HDR renderers
     ///   (EDRRenderer). MetalRenderer passes false and uses fake-PQ 8-bit + CIToneCurve.
+    /// - Parameter extractDoviRpu: Phase 2 route b — extract per-frame unspec62 RPU
+    ///   RBSP and pair it by PTS with VT's display-order output.
     init?(stream: UnsafeMutablePointer<AVStream>, prefer10Bit: Bool = false,
-          colorParams: VideoColorParams = VideoColorParams()) {
+          colorParams: VideoColorParams = VideoColorParams(),
+          extractDoviRpu: Bool = false,
+          isDoviProfile7: Bool = false) {
         let cp = stream.pointee.codecpar.pointee
         self.streamStartTime = stream.pointee.start_time
         self.streamTimeBase  = stream.pointee.time_base
+        self.extractDoviRpu  = extractDoviRpu
+        self.isDoviProfile7  = isDoviProfile7
         // VideoToolbox decodes H.264, HEVC and (zyno#107) AV1. Without this
         // guard, every other codec (RealVideo rv40, VP8, old MPEG-4 profiles,
         // WMV...) falls through the `isH264 ? H.264 : HEVC` binary below and
@@ -288,6 +300,10 @@ final class VTVideoDecoder {
         // recover display-order PTS → ~1/3 of frames are mislabelled,
         // producing visible judder on B-frame-heavy BD content.
         let noPTS = Int64(bitPattern: 0x8000000000000000)
+        if extractDoviRpu, !isH264, !isAV1, packet.pointee.pts != noPTS,
+           let rpu = DoviRouteBRpuExtractor.extractFromLengthPrefixed(lpData, isProfile7: isDoviProfile7) {
+            rpuCache.store(pts: packet.pointee.pts, rpu: rpu)
+        }
         let timescale = Int32(max(streamTimeBase.den, 1))
         let ptsCMTime: CMTime = packet.pointee.pts != noPTS
             ? CMTime(value: CMTimeValue(packet.pointee.pts), timescale: timescale)
@@ -343,12 +359,18 @@ final class VTVideoDecoder {
             }
             framePTS = ptsSecs
         }
-        return DecodedVideoFrame(pixelBuffer: pb, metadata: FrameMetadata(), pts: framePTS)
+        let rpuData: Data? = (extractDoviRpu && outPTS.isValid)
+            ? rpuCache.take(pts: Int64(outPTS.value))
+            : nil
+        return DecodedVideoFrame(pixelBuffer: pb,
+                                 metadata: FrameMetadata(doviRpuData: rpuData),
+                                 pts: framePTS)
     }
 
     // MARK: - flush / deinit
 
     func flush() {
+        rpuCache.removeAll()
         if let session { VTDecompressionSessionFinishDelayedFrames(session) }
     }
 

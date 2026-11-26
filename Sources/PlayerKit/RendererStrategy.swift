@@ -171,13 +171,20 @@ public enum RendererStrategy: Sendable, Equatable {
     /// `videoPipeline == .compressedPassthrough` and must skip decoder +
     /// jitter buffer entirely for this case.
     case doviSystem
+    /// Phase 2 route b (iOS / tvOS native DV): VT 10-bit hardware decode of the
+    /// HDR10-compatible base layer + per-frame `DolbyVisionRPUData` &
+    /// `DolbyCompatibilityID` ("1") attachments on the decoded `CVPixelBuffer`
+    /// rendered by `ASBDLRenderer`. Eligible for P8.1 and converted P7 on
+    /// iOS/tvOS EDR displays when `dolbyVisionOutput == .system` and
+    /// `doviEnabled == true`.
+    case doviRouteB
 
     /// Which pipeline carries video to the renderer (design §5.1).
     public var videoPipeline: VideoPipeline {
         switch self {
         case .doviSystem:                        return .compressedPassthrough
         case .sdr8Bit, .sdr10Bit, .hdr10Static, .hdr10Plus, .doviProfile5,
-             .doviProfile8, .hlgOOTF, .degradedHDR10:
+             .doviProfile8, .hlgOOTF, .degradedHDR10, .doviRouteB:
             return .decodedFrames
         }
     }
@@ -186,7 +193,7 @@ public enum RendererStrategy: Sendable, Equatable {
     public var pixelFormat10Bit: Bool {
         switch self {
         case .sdr8Bit:       return false
-        case .sdr10Bit, .doviSystem: return true
+        case .sdr10Bit, .doviSystem, .doviRouteB: return true
         case .hdr10Static, .hdr10Plus, .doviProfile5, .doviProfile8, .hlgOOTF, .degradedHDR10:
             return true
         }
@@ -209,8 +216,8 @@ public enum RendererStrategy: Sendable, Equatable {
         case .hdr10Static, .hlgOOTF, .degradedHDR10:
             // HEVC HDR10 / HLG — FFmpeg VT hwaccel gives 10-bit IOSurface-backed output.
             return .ffmpegHW
-        case .sdr8Bit, .sdr10Bit:
-            // SDR HEVC/H.264 — VT direct is the fastest path.
+        case .sdr8Bit, .sdr10Bit, .doviRouteB:
+            // SDR HEVC/H.264 & route b (VT 10-bit HW + in-band RPU extraction & PTS pairing).
             return .vtHW
         }
     }
@@ -222,7 +229,8 @@ public enum RendererStrategy: Sendable, Equatable {
         switch self {
         case .sdr8Bit, .sdr10Bit:
             return .ciSDR
-        case .hdr10Static, .hdr10Plus, .doviProfile5, .doviProfile8, .hlgOOTF, .degradedHDR10, .doviSystem:
+        case .hdr10Static, .hdr10Plus, .doviProfile5, .doviProfile8, .hlgOOTF, .degradedHDR10,
+             .doviSystem, .doviRouteB:
             return display.supportsEDR ? .metalHDR : .ciEDRFallback
         }
     }
@@ -230,11 +238,11 @@ public enum RendererStrategy: Sendable, Equatable {
     /// Which tone-mapping algorithm to instantiate in EDRRenderer.
     public var toneMapAlgorithm: ToneMappingAlgorithmKind {
         switch self {
-        case .sdr8Bit, .sdr10Bit, .doviSystem:   return .passthroughSDR
-        case .hdr10Static, .degradedHDR10:      return .bt2390Static
-        case .hdr10Plus:                        return .hdr10PlusDynamic
-        case .doviProfile5, .doviProfile8:       return .bt2390DoViL1
-        case .hlgOOTF:                          return .hlgOOTF
+        case .sdr8Bit, .sdr10Bit, .doviSystem, .doviRouteB: return .passthroughSDR
+        case .hdr10Static, .degradedHDR10:                  return .bt2390Static
+        case .hdr10Plus:                                    return .hdr10PlusDynamic
+        case .doviProfile5, .doviProfile8:                  return .bt2390DoViL1
+        case .hlgOOTF:                                      return .hlgOOTF
         }
     }
 }
@@ -325,6 +333,17 @@ public func decideRendererStrategy(
                                      compatId: stream.blSignalCompatibilityId,
                                      convertedP7CompatId: convertedP7) {
             return .doviSystem
+        }
+        // 0b. Phase 2 route b (iOS / tvOS): VT 10-bit HW decode + per-frame
+        // RPU attachment on CVPixelBuffer. Only P8.1 and converted P7 qualify
+        // (P5 lacks HDR10 base layer and stays on software IPT).
+        if dolbyVisionOutput == .system,
+           systemDolbyVision.supportsRouteB,
+           edrCapable,
+           SystemDVPolicy.isRouteBEligible(profile: stream.doviProfile,
+                                           compatId: stream.blSignalCompatibilityId,
+                                           convertedP7CompatId: convertedP7) {
+            return .doviRouteB
         }
         switch effectiveProfile {
         case 5:

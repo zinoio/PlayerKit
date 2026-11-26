@@ -28,6 +28,12 @@ public struct FrameMetadata: Sendable, Equatable {
     /// 徽标/日志/语料 manifest 仍见 P7 源身份)。
     public var p7Converted: DoviRpuConverter.ConvertedFrame?
 
+    /// Phase 2 route b(iOS / tvOS):逐帧 P8.1 RPU RBSP(`0x19 ... 0x80`,含 EPB),
+    /// 由 `VTVideoDecoder` 从包内 unspec62 提取(P7 经 `DoviRpuP7ToP81` 转换)并按
+    /// PTS 与解码帧配对,供 `ASBDLRenderer` 挂载到 `CVPixelBuffer` 的
+    /// `DolbyVisionRPUData` 附件。非 route b 或该帧无有效 RPU 时为 `nil`。
+    public var doviRpuData: Data?
+
     /// HDR10+ ST 2094-40 dynamic metadata (per-frame bezier curve).
     /// Present only for HDR10+ streams decoded via FFmpeg SW.
     public var hdr10Plus: HDR10PlusFrameMetadata?
@@ -42,18 +48,20 @@ public struct FrameMetadata: Sendable, Equatable {
 
     public init() {}
 
-    public init(dovi: DolbyVisionFrameMetadata?,
-                hdr10Plus: HDR10PlusFrameMetadata?,
-                masteringDisplay: MasteringDisplayMetadata?,
-                contentLightLevel: ContentLightLevelMetadata?,
+    public init(dovi: DolbyVisionFrameMetadata? = nil,
+                hdr10Plus: HDR10PlusFrameMetadata? = nil,
+                masteringDisplay: MasteringDisplayMetadata? = nil,
+                contentLightLevel: ContentLightLevelMetadata? = nil,
                 doviReshape: DoviReshapingCurve? = nil,
-                p7Converted: DoviRpuConverter.ConvertedFrame? = nil) {
+                p7Converted: DoviRpuConverter.ConvertedFrame? = nil,
+                doviRpuData: Data? = nil) {
         self.dovi = dovi
         self.hdr10Plus = hdr10Plus
         self.masteringDisplay = masteringDisplay
         self.contentLightLevel = contentLightLevel
         self.doviReshape = doviReshape
         self.p7Converted = p7Converted
+        self.doviRpuData = doviRpuData
     }
 }
 
