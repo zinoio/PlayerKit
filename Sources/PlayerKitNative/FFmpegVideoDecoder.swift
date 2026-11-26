@@ -635,6 +635,23 @@ final class FFmpegVideoDecoder {
                 // RPU reshaping curve (P5 / P8 compat 0/4). nil when absent
                 // or malformed — renderer falls back to geometric IPT.
                 meta.doviReshape = FFmpegVideoDecoder.parseDoviReshapingCurve(m)
+                // P7 转换态(设计 2026-11-16 §4.2/D7):数据管线把 EL/RPU 转成
+                // compat 1,只写独立副本;原始 dovi/doviReshape 保持不动。
+                if cfg.profile == 7 {
+                    let header = UnsafeRawPointer(m)
+                        .assumingMemoryBound(to: AVDOVIRpuDataHeader.self).pointee
+                    let mapping = UnsafeRawPointer(m)
+                        .assumingMemoryBound(to: AVDOVIDataMapping.self).pointee
+                    let snapshot = DoviRpuConverter.P7Snapshot(
+                        dvProfile: cfg.profile,
+                        elPresent: true, // profile 7 规范恒有 EL 层
+                        blBitDepth: header.bl_bit_depth,
+                        elBitDepth: header.el_bit_depth,
+                        hasNLQ: mapping.nlq_method_idc != AV_DOVI_NLQ_NONE,
+                        hasReshape: meta.doviReshape != nil,
+                        dm: dovi)
+                    meta.p7Converted = DoviRpuConverter.convert(snapshot)
+                }
                 if decodedFrames <= 3 {
                     logger.info("DV frame L1: \(dovi.level1.map { "min=\($0.minPq) max=\($0.maxPq) avg=\($0.avgPq)" } ?? "nil") L2: \(dovi.level2.map { "slope=\($0.trimSlope) power=\($0.trimPower)" } ?? "nil") L3: \(dovi.level3.map { "max=\($0.maxPqOffset)" } ?? "nil") L6: \(dovi.level6.map { "maxLum=\($0.maxLuminance) cll=\($0.maxCll)" } ?? "nil") reshape: \(meta.doviReshape.map { "\($0.components.map { $0.pieces.count })" } ?? "nil")")
                 }

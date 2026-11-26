@@ -26,6 +26,10 @@ final class SystemDVSampleBuilder {
     private let formatDescription: CMVideoFormatDescription
     /// Stream time_base in seconds — packet dts/duration are stream units.
     private let timeBase: Double
+    /// P7 转换态逐包改写(设计 2026-11-16 D6):非 nil 时先把 packet 字节
+    /// 交给改写着(剥 unspec62 EL、注入转换后的 P8.1 RPU),再拷进样本。
+    /// 返回 nil = 该包原样透传(改写失败只降级该帧,不中断会话)。
+    private let p7PacketRewriter: ((Data) -> Data?)?
 
     /// - Parameters:
     ///   - stream: demuxer's video stream (for `hvcC` extradata + time_base).
@@ -37,10 +41,16 @@ final class SystemDVSampleBuilder {
     /// 均合成黑帧**(status=rendering/零错误/层就绪/PiP 有画面)——压缩直通
     /// 路线在 iOS 不可行,唯一 in-app 路线 = 解码帧+RPU 附件(route b,依赖
     /// VT HEVC 硬解修复为前置)。macOS/tvOS 不受影响。
+    /// - Parameter hvcCOverride: ISO/M2TS 无 extradata 时,由
+    ///   `HevcHvcCBuilder` 从带内参数集合成的 hvcC(设计 §4.4)。nil = 用容器
+    ///   extradata(MKV/MP4 自带)。
+    /// - Parameter p7PacketRewriter: P7 转换态逐包改写;nil = 原始透传。
     init?(stream: UnsafeMutablePointer<AVStream>, dovi: AVDOVIDecoderConfigurationRecord,
+          hvcCOverride: [UInt8]? = nil,
+          p7PacketRewriter: ((Data) -> Data?)? = nil,
           omitDVDeclaration: Bool = UserDefaults.standard.object(forKey: "dvSystemOmitDVDeclaration") as? Bool ?? false) {
         let cp = stream.pointee.codecpar.pointee
-        guard let hvcC = VTVideoDecoder.realExtradata(cp),
+        guard let hvcC = hvcCOverride ?? VTVideoDecoder.realExtradata(cp),
               let fd = SystemDVFormatDescription.make(
                   hvcC: hvcC, width: cp.width, height: cp.height, dovi: dovi,
                   omitDVDeclaration: omitDVDeclaration)
@@ -49,6 +59,7 @@ final class SystemDVSampleBuilder {
             return nil
         }
         self.formatDescription = fd
+        self.p7PacketRewriter = p7PacketRewriter
         let tb = stream.pointee.time_base
         self.timeBase = tb.den > 0 ? Double(tb.num) / Double(tb.den) : 0
     }
@@ -63,8 +74,19 @@ final class SystemDVSampleBuilder {
     func makeSample(packet: UnsafePointer<AVPacket>, pts: Double,
                     doNotDisplay: Bool) -> CMSampleBuffer? {
         let pkt = packet.pointee
-        let size = Int(pkt.size)
-        guard size > 0, let data = pkt.data else { return nil }
+        guard pkt.size > 0, let raw = pkt.data else { return nil }
+
+        // P7 转换态:先把字节交给改写着(剥 EL / 注入 P8.1 RPU);改写失败
+        // 返回 nil 时原样透传,该帧按无 RPU 帧处理(设计 D7)。
+        let payload: Data
+        if let rewriter = p7PacketRewriter {
+            let original = Data(bytes: raw, count: Int(pkt.size))
+            payload = rewriter(original) ?? original
+        } else {
+            payload = Data(bytes: raw, count: Int(pkt.size))
+        }
+        let size = payload.count
+        guard size > 0 else { return nil }
 
         // 1. Copy payload into a CMBlockBuffer (independent of the packet).
         var blockBuffer: CMBlockBuffer?
@@ -76,8 +98,10 @@ final class SystemDVSampleBuilder {
             logger.error("block buffer create failed: \(status)")
             return nil
         }
-        status = CMBlockBufferReplaceDataBytes(with: data, blockBuffer: bb,
-                                               offsetIntoDestination: 0, dataLength: size)
+        status = payload.withUnsafeBytes { rawBuf in
+            CMBlockBufferReplaceDataBytes(with: rawBuf.baseAddress!, blockBuffer: bb,
+                                          offsetIntoDestination: 0, dataLength: size)
+        }
         guard status == kCMBlockBufferNoErr else {
             logger.error("block buffer copy failed: \(status)")
             return nil

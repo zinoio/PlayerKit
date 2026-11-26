@@ -100,4 +100,25 @@ final class SystemDVFormatDescriptionTests: XCTestCase {
         XCTAssertTrue(atoms["hvcC"] != nil, "atoms 应含 hvcC")
         XCTAssertTrue(atoms["dvvC"] != nil, "atoms 应含 dvvC(profile 8 > 7)")
     }
+
+    func testConvertedP81RecordUsesDvvCWithoutMutatingOriginalP7() {
+        let orig = makeRecord(profile: 7, level: 6, rpu: 1, el: 1, bl: 1, compat: 6)
+        let conv = SystemDVFormatDescription.convertedP81Record(from: orig, compatId: 1)
+
+        // 原始 P7 记录保持不变(Q5 身份隔离)
+        XCTAssertEqual(orig.dv_profile, 7)
+        XCTAssertEqual(orig.el_present_flag, 1)
+        XCTAssertEqual(orig.dv_bl_signal_compatibility_id, 6)
+
+        // 转换态副本为 profile 8 / compat 1 / el=0 → dvvC
+        XCTAssertEqual(conv.dv_profile, 8)
+        XCTAssertEqual(conv.dv_level, 6)
+        XCTAssertEqual(conv.rpu_present_flag, 1)
+        XCTAssertEqual(conv.el_present_flag, 0)
+        XCTAssertEqual(conv.bl_present_flag, 1)
+        XCTAssertEqual(conv.dv_bl_signal_compatibility_id, 1)
+        let (boxType, payload) = SystemDVFormatDescription.configBox(conv)
+        XCTAssertEqual(boxType, "dvvC")
+        XCTAssertEqual(payload[4] >> 4, 1, "compat id = 1")
+    }
 }

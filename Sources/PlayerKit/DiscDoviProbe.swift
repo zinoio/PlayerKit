@@ -62,6 +62,32 @@ public enum DiscDoviProbe {
         return nil
     }
 
+    /// Reassembles the HEVC PID's PES stream from raw TS/M2TS bytes and
+    /// extracts the first VPS/SPS/PPS triplet for `HevcHvcCBuilder`
+    /// (V1b: ISO/M2TS P7 system path hvcC synthesis without extra I/O).
+    public static func extractHevcParameterSets(from data: Data) -> HevcHvcCBuilder.ParameterSets? {
+        let pkts = packets(in: data)
+        var pmtPids: [UInt16] = [0x0100]
+        for tsPacket in pkts where isPUSI(tsPacket) && packetPID(tsPacket) == 0x0000 {
+            if let pmtPid = parsePAT(packetPayload(tsPacket)), !pmtPids.contains(pmtPid) {
+                pmtPids.append(pmtPid)
+            }
+        }
+        var hevcPid: UInt16?
+        for pmtPid in pmtPids {
+            guard let pmtPacket = pkts.first(where: { isPUSI($0) && packetPID($0) == pmtPid }) else {
+                continue
+            }
+            if let (pid, _) = parsePMT(packetPayload(pmtPacket)) {
+                hevcPid = pid
+                break
+            }
+        }
+        guard let hevcPid else { return nil }
+        let stream = reassembleHevcPES(hevcPid: hevcPid, packets: pkts)
+        return HevcHvcCBuilder.extractParameterSets(from: stream)
+    }
+
     // MARK: - unspec62 NAL carrier (UHD Blu-ray P7)
 
     /// Reassembles the HEVC PID's PES payloads into an annexb byte stream
@@ -70,6 +96,10 @@ public enum DiscDoviProbe {
     /// (el_type 0x01) don't and are skipped.
     private static func extractDoviConfigFromNAL(hevcPid: UInt16,
                                                  packets: [Data]) -> DiscDoviConfig? {
+        return scanUnspec62(in: reassembleHevcPES(hevcPid: hevcPid, packets: packets))
+    }
+
+    private static func reassembleHevcPES(hevcPid: UInt16, packets: [Data]) -> Data {
         var stream = Data()
         var pesPayloadOffset: Int?
         for pkt in packets where packetPID(pkt) == hevcPid {
@@ -85,7 +115,7 @@ public enum DiscDoviProbe {
             stream.append(payload)
             if stream.count > 16 * 1024 * 1024 { break }  // defensive cap
         }
-        return scanUnspec62(in: stream)
+        return stream
     }
 
     /// Strips the PES header from a PUSI TS payload. Returns an empty

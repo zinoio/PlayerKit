@@ -126,6 +126,8 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
     private nonisolated(unsafe) var systemDVDisabledForSession = false
     private nonisolated(unsafe) var systemDVRenderer: SystemDVRenderer?
     private nonisolated(unsafe) var systemDVBuilder: SystemDVSampleBuilder?
+    /// P7 转换态逐包改写会话(剥 unspec63 EL + RPU 转换替换,D6);非转换态会话恒 nil。
+    private nonisolated(unsafe) var systemDVP7Rewriter: DoviP7PacketRewriter?
     /// demux 读到的首个系统路径样本 pts;timebase start 锚点(design §5.3)。
     private nonisolated(unsafe) var systemDVFirstSamplePts: Double = .nan
     private nonisolated(unsafe) var systemDVStarted = false
@@ -1247,15 +1249,30 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
             // Native DV 系统路径能力(design §5.4):仅 macOS 且 EDR 屏可用;
             // 非 ASBDLRenderer 渲染器视为不可用(系统路径复用其 displayLayer,
             // EDRRenderer/Metal 渲染器不可用);会话内已回退则不再尝试。
+            // DEBUG A/B(2026-11-16 P7 专项):无 EDR 显示器时强制系统路径资格,
+            // 用于验证 dvh1 管线(画面不代表 DV 画质)。UserDefaults
+            // `dvSystemForceEDR`,仅 DEBUG 生效;正式逻辑不受影响。
+            #if DEBUG
+            let forceSystemDV = ProcessInfo.processInfo.environment["DV_SYSTEM_FORCE_EDR"] == "1"
+                || UserDefaults.standard.bool(forKey: "dvSystemForceEDR")
+            let effectiveDisplay: DisplayCapability = forceSystemDV
+                ? DisplayCapability(supportsEDR: true,
+                                    targetPeakNits: max(displayCapability.targetPeakNits, 1000),
+                                    supports10Bit: displayCapability.supports10Bit,
+                                    supportsHLGOOTF: displayCapability.supportsHLGOOTF)
+                : displayCapability
+            #else
+            let effectiveDisplay = displayCapability
+            #endif
             var systemDV = SystemDVCapability.unavailable
             if dolbyVisionOutput == .system, !systemDVDisabledForSession,
                _renderer is ASBDLRenderer {
-                systemDV = SystemDVCapability.probe(display: displayCapability)
+                systemDV = SystemDVCapability.probe(display: effectiveDisplay)
             }
             let strat = decideRendererStrategy(
                 stream: attrs,
                 prefersTenBit: _renderer.prefersTenBit,
-                display: displayCapability,
+                display: effectiveDisplay,
                 doviEnabled: doviEnabled,
                 systemDolbyVision: systemDV,
                 dolbyVisionOutput: dolbyVisionOutput
@@ -1263,7 +1280,7 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
             // phase-3 spike(zinoio/zinora#390):开舞台账——每个资格条件逐项落日志,
             // 一眼定位"没走系统路径"是哪一环(此前只能从 [dovi-sys] 缺席反推)。
             let doviOpenPref = dolbyVisionOutput == .system ? "system" : "software"
-            let doviOpenLine = "[dovi-open] pref=\(doviOpenPref) doviEnabled=\(doviEnabled) sysDV=\(systemDV.isAvailable) EDR=\(displayCapability.supportsEDR) pro10bit=\(_renderer.prefersTenBit) disabled4Session=\(systemDVDisabledForSession) stream=P\(attrs.doviProfile)/c\(attrs.blSignalCompatibilityId) dv=\(attrs.isDolbyVision) -> \(String(describing: strat))"
+            let doviOpenLine = "[dovi-open] pref=\(doviOpenPref) doviEnabled=\(doviEnabled) sysDV=\(systemDV.isAvailable) EDR=\(effectiveDisplay.supportsEDR) pro10bit=\(_renderer.prefersTenBit) disabled4Session=\(systemDVDisabledForSession) stream=P\(attrs.doviProfile)/c\(attrs.blSignalCompatibilityId) dv=\(attrs.isDolbyVision) -> \(String(describing: strat))"
             logger.notice("\(doviOpenLine, privacy: .public)")
             renderConfigLock.withLock { self.rendererStrategy = strat }
 
@@ -1310,6 +1327,8 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
         if let vs = demuxer.videoStream {
             let sar = demuxer.sampleAspectRatio
             let isDoVi = demuxer.isDolbyVision
+            // P7 转换态标记(attrs 在上方策略决定块内,此处取不到;幂等纯函数)。
+            let convertedP7Compat = demuxer.videoStreamAttributes()?.doviConvertedCompatId
 
             // Native DV 系统路径分叉(design §5.1):不创建 videoDecoder,
             // 构造「packet → CMSampleBuffer → 层」的压缩直通链;失败则当场
@@ -1317,31 +1336,67 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
             if rendererStrategy?.videoPipeline == .compressedPassthrough {
                 // doviConfiguration 在 FFmpegDemuxer 上(MultiClip/其他实现 v1
                 // 不走系统路径,open 阶段即回软件——保守正确)。
+                // P7 转换态:MKV/WebM 走 mp4 length-prefix 域(容器自带 hvcC);
+                // MPEG-TS/M2TS 走 annexb→length-prefix 改写 + 合成 hvcC。
+                // 格式描述一律使用转换态 P8.1 dvvC 副本(原 doviConfiguration 不变,Q5)。
                 if let fd = demuxer as? FFmpegDemuxer,
-                   let dovi = fd.doviConfiguration,
-                   let builder = SystemDVSampleBuilder(stream: vs, dovi: dovi),
-                   let asbdl = _renderer as? ASBDLRenderer {
-                    let renderer = systemDVRendererFactory?(asbdl.displayLayer)
-                        ?? SystemDVRenderer(displayLayer: asbdl.displayLayer)
-                    renderer.onFailure = { [weak self] err in
-                        self?.fallbackToSoftwareDV(
-                            reason: "renderer failure: \(err.map { String(describing: $0) } ?? "layer failed")")
+                   let dovi = fd.doviConfiguration {
+                    let isMpegTS = fd.isMpegTSContainer
+                    let p7Rewriter: DoviP7PacketRewriter? = convertedP7Compat != nil
+                        ? DoviP7PacketRewriter(inputFormat: isMpegTS ? .annexB : .lengthPrefixed)
+                        : nil
+                    let effectiveDovi = convertedP7Compat.map {
+                        SystemDVFormatDescription.convertedP81Record(from: dovi, compatId: $0)
+                    } ?? dovi
+                    let hvcCOverride: [UInt8]? = (convertedP7Compat != nil && isMpegTS)
+                        ? fd.synthesizedHvcC()
+                        : nil
+                    if let builder = SystemDVSampleBuilder(
+                           stream: vs, dovi: effectiveDovi,
+                           hvcCOverride: hvcCOverride,
+                           p7PacketRewriter: p7Rewriter.map { pw in { data in pw.rewrite(data) } }),
+                       let asbdl = _renderer as? ASBDLRenderer {
+                        systemDVP7Rewriter = p7Rewriter
+                        let renderer = systemDVRendererFactory?(asbdl.displayLayer)
+                            ?? SystemDVRenderer(displayLayer: asbdl.displayLayer)
+                        renderer.onFailure = { [weak self] err in
+                            self?.fallbackToSoftwareDV(
+                                reason: "renderer failure: \(err.map { String(describing: $0) } ?? "layer failed")")
+                        }
+                        systemDVRenderer = renderer
+                        systemDVBuilder = builder
+                        systemDVActive = true
+                        systemDVStarted = false
+                        systemDVFirstSamplePts = .nan
+                        systemDVStartWall = 0
+                        activeVideoPipeline = .compressedPassthrough
+                        let cpW = Int(vs.pointee.codecpar.pointee.width)
+                        let cpH = Int(vs.pointee.codecpar.pointee.height)
+                        codedVideoWidth = cpW; codedVideoHeight = cpH
+                        videoWidth  = sar > 1.0 ? Int(Double(cpW) * sar) : cpW
+                        videoHeight = sar < 1.0 ? Int(Double(cpH) / sar) : cpH
+                        logger.info("[dovi-sys] system path active: profile=\(demuxer.doviProfile) convertedCompat=\(convertedP7Compat.map(String.init) ?? "none", privacy: .public) ts=\(isMpegTS) strategy=\(String(describing: self.rendererStrategy), privacy: .public)")
+                    } else {
+                        logger.info("[dovi-sys] 样本构造器初始化失败,open 阶段即回软件路径")
+                        systemDVP7Rewriter = nil
+                        systemDVActive = false
+                        activeVideoPipeline = .decodedFrames
+                        let softAttrs = demuxer.videoStreamAttributes()
+                            ?? VideoStreamAttributes(width: 0, height: 0, codecID: 0,
+                                                     colorMatrix: .bt709, transfer: .sdr, range: .limited)
+                        let softwareStrat = decideRendererStrategy(
+                            stream: softAttrs,
+                            prefersTenBit: _renderer.prefersTenBit,
+                            display: displayCapability,
+                            doviEnabled: doviEnabled,
+                            systemDolbyVision: .unavailable,
+                            dolbyVisionOutput: dolbyVisionOutput
+                        )
+                        renderConfigLock.withLock { self.rendererStrategy = softwareStrat }
                     }
-                    systemDVRenderer = renderer
-                    systemDVBuilder = builder
-                    systemDVActive = true
-                    systemDVStarted = false
-                    systemDVFirstSamplePts = .nan
-                    systemDVStartWall = 0
-                    activeVideoPipeline = .compressedPassthrough
-                    let cpW = Int(vs.pointee.codecpar.pointee.width)
-                    let cpH = Int(vs.pointee.codecpar.pointee.height)
-                    codedVideoWidth = cpW; codedVideoHeight = cpH
-                    videoWidth  = sar > 1.0 ? Int(Double(cpW) * sar) : cpW
-                    videoHeight = sar < 1.0 ? Int(Double(cpH) / sar) : cpH
-                    logger.info("[dovi-sys] system path active: profile=\(demuxer.doviProfile) strategy=\(String(describing: self.rendererStrategy), privacy: .public)")
                 } else {
                     logger.info("[dovi-sys] 样本构造器初始化失败,open 阶段即回软件路径")
+                    systemDVP7Rewriter = nil
                     systemDVActive = false
                     activeVideoPipeline = .decodedFrames
                     let softAttrs = demuxer.videoStreamAttributes()
@@ -1361,6 +1416,7 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
                 systemDVActive = false
                 systemDVRenderer = nil
                 systemDVBuilder = nil
+                systemDVP7Rewriter = nil
                 activeVideoPipeline = .decodedFrames
             }
 
@@ -2079,6 +2135,14 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
                             renderer.enqueue(sb)
                         }
                         dLock.unlock()
+                        // R2(RPU 校验窗口,设计 §4.3):开头 N 帧(常量 8)全无
+                        // 有效转换态 RPU → 路由失误,会话回 degradedHDR10。
+                        // fallbackToSoftwareDV 自带 once-guard;统计在 rewriter 内。
+                        if let pw = systemDVP7Rewriter, pw.shouldFallbackToSoftware() {
+                            let snap = pw.validationSnapshot()
+                            fallbackToSoftwareDV(
+                                reason: "P7 RPU validation: \(snap.checked) 帧全无有效 RPU")
+                        }
                         // 背压:层前瞻上限(Task 5 接口契约)。下方共享的音频参照
                         // throttle 对该路径同样生效(jitter 恒空 → readAhead=0)。
                         if renderer.bufferedSeconds >= renderer.maxLookaheadSeconds {
@@ -3386,6 +3450,7 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
         systemDVRenderer?.stop()
         systemDVRenderer = nil
         systemDVBuilder = nil
+        systemDVP7Rewriter = nil
         systemDVActive = false
         systemDVStarted = false
         // currentMasterAudioTime 必须在 pipeline 写入之前完成:它新增的
@@ -4021,6 +4086,7 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
         systemDVRenderer?.stop()
         systemDVRenderer = nil
         systemDVBuilder = nil
+        systemDVP7Rewriter = nil
         systemDVActive = false
         systemDVStarted = false
         systemDVDisabledForSession = false
