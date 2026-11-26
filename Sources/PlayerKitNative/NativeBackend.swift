@@ -1336,39 +1336,64 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
             if rendererStrategy?.videoPipeline == .compressedPassthrough {
                 // doviConfiguration 在 FFmpegDemuxer 上(MultiClip/其他实现 v1
                 // 不走系统路径,open 阶段即回软件——保守正确)。
-                // P7 转换态:流内 EL/RPU NAL 逐包改写(mp4 length-prefix 域,
-                // 设计 D6)。MKV/WebM 容器 extradata 自带 hvcC(2026-11-16
-                // V1a 实测),不重建;ISO/M2TS(annexb interleaved)V1b 未
-                // 实测,demuxer 侧未放行转换态,此处恒走容器 hvcC。
-                let p7Rewriter: DoviP7PacketRewriter? =
-                    convertedP7Compat != nil ? DoviP7PacketRewriter() : nil
+                // P7 转换态:MKV/WebM 走 mp4 length-prefix 域(容器自带 hvcC);
+                // MPEG-TS/M2TS 走 annexb→length-prefix 改写 + 合成 hvcC。
+                // 格式描述一律使用转换态 P8.1 dvvC 副本(原 doviConfiguration 不变,Q5)。
                 if let fd = demuxer as? FFmpegDemuxer,
-                   let dovi = fd.doviConfiguration,
-                   let builder = SystemDVSampleBuilder(
-                       stream: vs, dovi: dovi,
-                       hvcCOverride: nil,
-                       p7PacketRewriter: p7Rewriter.map { pw in { data in pw.rewrite(data) } }),
-                   let asbdl = _renderer as? ASBDLRenderer {
-                    systemDVP7Rewriter = p7Rewriter
-                    let renderer = systemDVRendererFactory?(asbdl.displayLayer)
-                        ?? SystemDVRenderer(displayLayer: asbdl.displayLayer)
-                    renderer.onFailure = { [weak self] err in
-                        self?.fallbackToSoftwareDV(
-                            reason: "renderer failure: \(err.map { String(describing: $0) } ?? "layer failed")")
+                   let dovi = fd.doviConfiguration {
+                    let isMpegTS = fd.isMpegTSContainer
+                    let p7Rewriter: DoviP7PacketRewriter? = convertedP7Compat != nil
+                        ? DoviP7PacketRewriter(inputFormat: isMpegTS ? .annexB : .lengthPrefixed)
+                        : nil
+                    let effectiveDovi = convertedP7Compat.map {
+                        SystemDVFormatDescription.convertedP81Record(from: dovi, compatId: $0)
+                    } ?? dovi
+                    let hvcCOverride: [UInt8]? = (convertedP7Compat != nil && isMpegTS)
+                        ? fd.synthesizedHvcC()
+                        : nil
+                    if let builder = SystemDVSampleBuilder(
+                           stream: vs, dovi: effectiveDovi,
+                           hvcCOverride: hvcCOverride,
+                           p7PacketRewriter: p7Rewriter.map { pw in { data in pw.rewrite(data) } }),
+                       let asbdl = _renderer as? ASBDLRenderer {
+                        systemDVP7Rewriter = p7Rewriter
+                        let renderer = systemDVRendererFactory?(asbdl.displayLayer)
+                            ?? SystemDVRenderer(displayLayer: asbdl.displayLayer)
+                        renderer.onFailure = { [weak self] err in
+                            self?.fallbackToSoftwareDV(
+                                reason: "renderer failure: \(err.map { String(describing: $0) } ?? "layer failed")")
+                        }
+                        systemDVRenderer = renderer
+                        systemDVBuilder = builder
+                        systemDVActive = true
+                        systemDVStarted = false
+                        systemDVFirstSamplePts = .nan
+                        systemDVStartWall = 0
+                        activeVideoPipeline = .compressedPassthrough
+                        let cpW = Int(vs.pointee.codecpar.pointee.width)
+                        let cpH = Int(vs.pointee.codecpar.pointee.height)
+                        codedVideoWidth = cpW; codedVideoHeight = cpH
+                        videoWidth  = sar > 1.0 ? Int(Double(cpW) * sar) : cpW
+                        videoHeight = sar < 1.0 ? Int(Double(cpH) / sar) : cpH
+                        logger.info("[dovi-sys] system path active: profile=\(demuxer.doviProfile) convertedCompat=\(convertedP7Compat.map(String.init) ?? "none", privacy: .public) ts=\(isMpegTS) strategy=\(String(describing: self.rendererStrategy), privacy: .public)")
+                    } else {
+                        logger.info("[dovi-sys] 样本构造器初始化失败,open 阶段即回软件路径")
+                        systemDVP7Rewriter = nil
+                        systemDVActive = false
+                        activeVideoPipeline = .decodedFrames
+                        let softAttrs = demuxer.videoStreamAttributes()
+                            ?? VideoStreamAttributes(width: 0, height: 0, codecID: 0,
+                                                     colorMatrix: .bt709, transfer: .sdr, range: .limited)
+                        let softwareStrat = decideRendererStrategy(
+                            stream: softAttrs,
+                            prefersTenBit: _renderer.prefersTenBit,
+                            display: displayCapability,
+                            doviEnabled: doviEnabled,
+                            systemDolbyVision: .unavailable,
+                            dolbyVisionOutput: dolbyVisionOutput
+                        )
+                        renderConfigLock.withLock { self.rendererStrategy = softwareStrat }
                     }
-                    systemDVRenderer = renderer
-                    systemDVBuilder = builder
-                    systemDVActive = true
-                    systemDVStarted = false
-                    systemDVFirstSamplePts = .nan
-                    systemDVStartWall = 0
-                    activeVideoPipeline = .compressedPassthrough
-                    let cpW = Int(vs.pointee.codecpar.pointee.width)
-                    let cpH = Int(vs.pointee.codecpar.pointee.height)
-                    codedVideoWidth = cpW; codedVideoHeight = cpH
-                    videoWidth  = sar > 1.0 ? Int(Double(cpW) * sar) : cpW
-                    videoHeight = sar < 1.0 ? Int(Double(cpH) / sar) : cpH
-                    logger.info("[dovi-sys] system path active: profile=\(demuxer.doviProfile) strategy=\(String(describing: self.rendererStrategy), privacy: .public)")
                 } else {
                     logger.info("[dovi-sys] 样本构造器初始化失败,open 阶段即回软件路径")
                     systemDVP7Rewriter = nil

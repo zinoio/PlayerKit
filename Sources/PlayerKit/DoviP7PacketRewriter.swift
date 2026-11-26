@@ -19,33 +19,79 @@ import Foundation
 /// CMSampleBuffer 契约)。解析失败/非 mp4 格式返回 nil,调用方原包透传。
 public final class DoviP7PacketRewriter: @unchecked Sendable {
 
+    public enum InputFormat: Sendable {
+        /// MKV/MP4 容器(extradata 为 hvcC):输入 packet 为 4 字节大端长度前缀 NAL。
+        case lengthPrefixed
+        /// MPEG-TS / M2TS(ISO 原盘):输入 packet 为 annexb(3/4 字节起始码),
+        /// 改写后统一输出 4 字节长度前缀以匹配合成 hvcC 的 CMSampleBuffer 契约。
+        case annexB
+    }
+
+    public let inputFormat: InputFormat
+
     /// RPU 校验窗口统计(R2):checked = 已消费帧数,valid = RPU 转换成功帧数。
     private var checkedFrames = 0
     private var validRpuFrames = 0
     private let stateLock = NSLock()
 
-    public init() {}
+    public init(inputFormat: InputFormat = .lengthPrefixed) {
+        self.inputFormat = inputFormat
+    }
 
-    /// 改写一个 mp4/length-prefixed P7 packet。nil = 无法按 4 字节长度前缀
-    /// 解析(非 mp4 格式/截断)——调用方应原样透传(设计 D7 per-frame fallback)。
+    /// 改写一个 P7 packet(按 `inputFormat` 解析 mp4 长度前缀或 annexb 起始码),
+    /// 统一输出 4 字节长度前缀以喂给 hvcC `SystemDVSampleBuilder`。
+    /// nil = 无法按指定格式解析(格式不匹配/截断)——调用方原样透传(设计 D7)。
     @discardableResult
     public func rewrite(_ packet: Data) -> Data? {
         let bytes = [UInt8](packet)
-        guard bytes.count >= 8 else { return nil }
+        guard bytes.count >= 6 else { return nil }
 
-        // 第一遍:纯解析,确认整个 packet 都能按 4 字节长度前缀走通。
-        // 不通过 → nil(原包透传),绝不输出半解析结果。
         struct NalRef { let off: Int; let len: Int } // off 指向 NAL header,len 含 header
         var nals: [NalRef] = []
-        var i = 0
-        while i < bytes.count {
-            guard i + 4 <= bytes.count else { return nil }
-            let b0 = Int(bytes[i]); let b1 = Int(bytes[i+1]); let b2 = Int(bytes[i+2]); let b3 = Int(bytes[i+3])
-            let nalLen = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
-            let hdr = i + 4
-            guard nalLen >= 2, hdr + nalLen <= bytes.count else { return nil }
-            nals.append(NalRef(off: hdr, len: nalLen))
-            i = hdr + nalLen
+
+        switch inputFormat {
+        case .lengthPrefixed:
+            guard bytes.count >= 8 else { return nil }
+            var i = 0
+            while i < bytes.count {
+                guard i + 4 <= bytes.count else { return nil }
+                let b0 = Int(bytes[i]); let b1 = Int(bytes[i+1]); let b2 = Int(bytes[i+2]); let b3 = Int(bytes[i+3])
+                let nalLen = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+                let hdr = i + 4
+                guard nalLen >= 2, hdr + nalLen <= bytes.count else { return nil }
+                nals.append(NalRef(off: hdr, len: nalLen))
+                i = hdr + nalLen
+            }
+        case .annexB:
+            var i = 0
+            while i + 3 < bytes.count {
+                let scLen: Int
+                if i + 4 <= bytes.count, bytes[i] == 0, bytes[i+1] == 0, bytes[i+2] == 0, bytes[i+3] == 1 {
+                    scLen = 4
+                } else if bytes[i] == 0, bytes[i+1] == 0, bytes[i+2] == 1 {
+                    scLen = 3
+                } else {
+                    i += 1
+                    continue
+                }
+                let start = i + scLen
+                guard start < bytes.count else { break }
+                var end = start + 1
+                var foundNext = false
+                while end + 3 <= bytes.count {
+                    if bytes[end] == 0, bytes[end+1] == 0,
+                       (bytes[end+2] == 1 || (end + 3 < bytes.count && bytes[end+2] == 0 && bytes[end+3] == 1)) {
+                        foundNext = true
+                        break
+                    }
+                    end += 1
+                }
+                if !foundNext { end = bytes.count }
+                if end - start >= 2 {
+                    nals.append(NalRef(off: start, len: end - start))
+                }
+                i = end
+            }
         }
         guard !nals.isEmpty else { return nil }
 

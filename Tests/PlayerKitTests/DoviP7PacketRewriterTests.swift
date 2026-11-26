@@ -160,6 +160,45 @@ final class DoviP7PacketRewriterTests: XCTestCase {
         XCTAssertEqual(snap.valid, 1)
     }
 
+    // MARK: - V1b: MPEG-TS / M2TS annexb → 4 字节长度前缀改写
+
+    func testAnnexBModeStripsELAndOutputsLengthPrefixedP81() throws {
+        let vps: [UInt8] = [0x40, 0x01, 0x0C, 0x01]              // t32
+        let vcl: [UInt8] = [0x26, 0x01, 0xAA, 0xBB, 0xCC]        // t19 IDR
+        let el: [UInt8]  = [0x7E, 0x01, 0x11, 0x22]              // t63 EL
+        let cfg62: [UInt8] = [0x7C, 0x01, 0x02, 0x01, 0x00]      // t62 el_type=0x02 config (非 RPU)
+        var annexb: [UInt8] = []
+        annexb += [0, 0, 0, 1] + vps
+        annexb += [0, 0, 1] + vcl
+        annexb += [0, 0, 0, 1] + el
+        annexb += [0, 0, 0, 1] + cfg62
+        annexb += [0, 0, 0, 1] + p7RpuNal
+
+        let rewriter = DoviP7PacketRewriter(inputFormat: .annexB)
+        let out = try XCTUnwrap(rewriter.rewrite(Data(annexb)), "合法 annexb P7 包应改写为长度前缀")
+        let nals = try XCTUnwrap(parseNals(out), "输出应为合法 4 字节长度前缀 NAL 序列")
+        XCTAssertEqual(nals.map(\.type), [32, 19, 62], "应剥除 EL(t63) 与非 RPU t62 配置,保留 VPS/VCL/转换态 RPU")
+        XCTAssertEqual(nals[0].nal, vps)
+        XCTAssertEqual(nals[1].nal, vcl)
+        XCTAssertEqual(Array(nals[2].nal.prefix(2)), [0x7C, 0x01])
+        let converted = try XCTUnwrap(DoviRpuP7ToP81.convertNAL(p7RpuNal))
+        XCTAssertEqual(Array(nals[2].nal.dropFirst(2)), Array(converted.dropFirst(4)))
+        let snap = rewriter.validationSnapshot()
+        XCTAssertEqual(snap.checked, 1)
+        XCTAssertEqual(snap.valid, 1)
+    }
+
+    func testAnnexBModeFallsBackWhenDualTrackHasNoInBandRPU() {
+        let blOnly = Data([0, 0, 0, 1, 0x02, 0x01, 0xAA, 0xBB])
+        let rewriter = DoviP7PacketRewriter(inputFormat: .annexB)
+        for frame in 1...8 {
+            let out = rewriter.rewrite(blOnly)
+            XCTAssertNotNil(out)
+            XCTAssertEqual(rewriter.shouldFallbackToSoftware(), frame == 8,
+                           "双轨 M2TS BL PID 无带内 RPU 时,第 8 帧必须触发回退软解")
+        }
+    }
+
     // MARK: - 真实样本端到端(本地,无样本 skip)
 
     /// Twisters P7 MKV:matroskadec 产出的 mp4 域 packet 直接喂 rewriter。

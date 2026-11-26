@@ -254,14 +254,15 @@ final class FFmpegDemuxer: @unchecked Sendable {
             && (cp.profile == AV_PROFILE_HEVC_MAIN_10 || cp.profile == AV_PROFILE_HEVC_REXT)
         let isHEVC10Bit = isHEVC && (cp.bits_per_raw_sample == 10 || isHEVC10BitByProfile)
 
-        // P7 转换态(设计 2026-11-16 D6):一期只对 MKV/WebM 的 BlockAdditions
-        // 路径开启(ffmpeg 逐帧供给已实测完整);ISO/M2TS 待 V1b 实测后再开。
+        // P7 转换态(设计 2026-11-16 D6):MKV/WebM(mp4 length-prefixed)与
+        // MPEG-TS/M2TS(annexb → length-prefixed + hvcC 合成)均可进入转换态。
         // 原始 profile/compat 保持不变,只填独立转换态副本。
-        // 码流级改写由 NativeBackend 在系统路径分叉处构造 DoviP7PacketRewriter
-        // 完成(mp4 length-prefix 域:剥 unspec63 EL、转换替换 unspec62 RPU)。
+        // 若双轨 M2TS 的 BL PID 无带内 RPU,开头 8 帧 R2 校验窗口会自动回退软解。
         let containerName = formatCtx?.pointee.iformat?.pointee.name
             .map { String(cString: $0) } ?? ""
-        let p7Convertible = containerName.contains("matroska") || containerName.contains("webm")
+        let p7Convertible = containerName.contains("matroska")
+            || containerName.contains("webm")
+            || containerName.contains("mpegts")
         let convertedCompat: UInt8? = (isDolbyVision && doviProfile == 7 && p7Convertible) ? 1 : nil
 
         return VideoStreamAttributes(
@@ -305,6 +306,31 @@ final class FFmpegDemuxer: @unchecked Sendable {
 
         return false
     }
+
+    /// True when the opened container is MPEG-TS / M2TS (annexb packets, no hvcC extradata).
+    var isMpegTSContainer: Bool {
+        let name = formatCtx?.pointee.iformat?.pointee.name.map { String(cString: $0) } ?? ""
+        return name.contains("mpegts")
+    }
+
+    /// Synthesizes an `hvcC` configuration record for annexb containers (MPEG-TS/M2TS)
+    /// from codecpar annexb extradata or the HEVC PES stream captured during disc DV probing.
+    func synthesizedHvcC() -> [UInt8]? {
+        if let vs = videoStream {
+            let cp = vs.pointee.codecpar.pointee
+            if let extra = cp.extradata, cp.extradata_size > 0 {
+                let raw = Data(bytes: extra, count: Int(cp.extradata_size))
+                if let sets = HevcHvcCBuilder.extractParameterSets(from: raw),
+                   let built = HevcHvcCBuilder.build(sets) {
+                    return [UInt8](built)
+                }
+            }
+        }
+        return discSynthesizedHvcC
+    }
+
+    /// Cached hvcC synthesized from the disc probe's HEVC PES stream (zero extra I/O).
+    private var discSynthesizedHvcC: [UInt8]?
 
     private(set) var videoStream: UnsafeMutablePointer<AVStream>?
     private(set) var audioStream: UnsafeMutablePointer<AVStream>?
@@ -593,6 +619,11 @@ final class FFmpegDemuxer: @unchecked Sendable {
         guard let config else {
             logger.info("disc DV probe: no DOVI registration descriptor in stream head (\(data.count, privacy: .public) bytes scanned) \(DiscDoviProbe.describe(from: data), privacy: .public)")
             return
+        }
+
+        if let sets = DiscDoviProbe.extractHevcParameterSets(from: data),
+           let built = HevcHvcCBuilder.build(sets) {
+            discSynthesizedHvcC = [UInt8](built)
         }
 
         var record = AVDOVIDecoderConfigurationRecord()
@@ -1051,6 +1082,7 @@ final class FFmpegDemuxer: @unchecked Sendable {
         audioStream = nil
         audioStreamScore = 0
         subtitleStream = nil
+        discSynthesizedHvcC = nil
         duration = 0
         if !releaseReader {
             readerReleaseDeferred = true

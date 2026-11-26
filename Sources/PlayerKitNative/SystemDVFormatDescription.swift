@@ -45,6 +45,21 @@ enum SystemDVFormatDescription {
         return (type, Data(payload))
     }
 
+    /// P7 转换态格式描述副本(设计 2026-11-16 V2 / Q5 身份隔离):
+    /// 原 `AVDOVIDecoderConfigurationRecord` 保持 profile=7/el=1 供识别/徽标/日志;
+    /// 传给 CoreMedia `dvh1` FD 的副本改写为 profile=8、el=0、rpu=1、bl=1、
+    /// compat=compatId(1),使 `configBox` 产出 `dvvC` 而非 P7 `dvcC`。
+    static func convertedP81Record(from src: AVDOVIDecoderConfigurationRecord,
+                                   compatId: UInt8) -> AVDOVIDecoderConfigurationRecord {
+        var copy = src
+        copy.dv_profile = 8
+        copy.rpu_present_flag = 1
+        copy.el_present_flag = 0
+        copy.bl_present_flag = 1
+        copy.dv_bl_signal_compatibility_id = compatId
+        return copy
+    }
+
     /// Build the `dvh1` format description: `hvcC` (from the container's
     /// extradata, parsed by `VTVideoDecoder.parseHVCC` on the decode side) plus
     /// the DV config atom via `SampleDescriptionExtensionAtoms`.

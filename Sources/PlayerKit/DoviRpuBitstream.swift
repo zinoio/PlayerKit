@@ -18,6 +18,8 @@ struct DoviBitReader {
 
     var bitsRemaining: Int { bytes.count * 8 - bitPos }
     var isByteAligned: Bool { bitPos % 8 == 0 }
+    /// 读越界(结构已错):调用方据此判失败,走 per-frame 降级。
+    var overrun: Bool { bitPos > bytes.count * 8 }
 
     mutating func read(_ count: Int) -> UInt64 {
         var v: UInt64 = 0
@@ -38,7 +40,15 @@ struct DoviBitReader {
     /// Exp-Golomb `ue(v)`.
     mutating func readUE() -> UInt64 {
         var zeros = 0
-        while read(1) == 0 { zeros += 1 }
+        while read(1) == 0 {
+            zeros += 1
+            // 越界后 read 恒返回 0:不设上限会死循环(畸形/截断 RPU 卡死 demux
+            // 线程)。合法 ue 前导零 ≤ 32;超限标记越界并返回。
+            if zeros > 32 || overrun {
+                bitPos = bytes.count * 8 + 1
+                return 0
+            }
+        }
         guard zeros > 0 else { return 0 }
         let suffix = read(zeros)
         return (1 << zeros) - 1 + suffix
@@ -48,11 +58,6 @@ struct DoviBitReader {
 
     /// 回滚到指定位位置(V40 组探测失败时用)。
     mutating func rewind(to pos: Int) { bitPos = pos }
-}
-
-/// 连续三个 ue(v)(压缩 DM 头)。
-private func rThreeUEs(_ r: inout DoviBitReader) -> (UInt64, UInt64, UInt64) {
-    (r.readUE(), r.readUE(), r.readUE())
 }
 
 struct DoviBitWriter {
@@ -304,11 +309,36 @@ struct DoviRpuMapping {
         var pivots: [UInt64] = []
         /// 每 piece:`mappingIdc`(0=poly,1=mmr)
         var mappingIdc: [UInt64] = []
-        /// polynomial:每 piece 为 (polyOrderMinus1, linearInterpFlag,
-        /// [(coefInt, coefFixed)];coef 数 = order+2)
+        /// polynomial piece(按出现顺序,与 mmr 分别计数):(polyOrderMinus1,
+        /// linearInterpFlag, [(coefInt, coefFixed)];coef 数 = order+2)
         var poly: [(order: UInt64, linear: Bool, coefs: [(Int64, Int64)])] = []
-        /// mmr:每 piece 为 (orderMinus1, constInt, constFixed, coefs)
+        /// mmr piece(按出现顺序):(orderMinus1, constInt, constFixed, coefs)
         var mmr: [(order: UInt8, constInt: Int64, constFixed: Int64, coefs: [(Int64, Int64)])] = []
+    }
+
+    /// P7 NLQ 数据块(libdovi `RpuDataNlq`):每 component 原始位值。
+    /// 定点字段按原始 `coefficient_log2_denom` 位存(不解释符号),保证无损回写。
+    struct Nlq: Equatable {
+        var offset: [UInt64] = []
+        var vdrInMaxInt: [UInt64] = []
+        var vdrInMax: [UInt64] = []
+        var slopeInt: [UInt64] = []
+        var slope: [UInt64] = []
+        var thresholdInt: [UInt64] = []
+        var threshold: [UInt64] = []
+
+        /// MEL(Minimal Enhancement Layer)判定,对齐 libdovi:NLQ 为恒等
+        /// (offset=0、vdr_in_max=1.0、deadzone 全 0)。否则为 FEL——EL 携带
+        /// 真实残差,BL 的 mapping 只是「BL+EL 合成」的一半。
+        var isMEL: Bool {
+            offset.allSatisfy { $0 == 0 }
+                && vdrInMaxInt.allSatisfy { $0 == 1 }
+                && vdrInMax.allSatisfy { $0 == 0 }
+                && slopeInt.allSatisfy { $0 == 0 }
+                && slope.allSatisfy { $0 == 0 }
+                && thresholdInt.allSatisfy { $0 == 0 }
+                && threshold.allSatisfy { $0 == 0 }
+        }
     }
 
     var vdrRpuId: UInt64 = 0
@@ -319,17 +349,31 @@ struct DoviRpuMapping {
     var nlqPredPivotValue: [UInt64] = []
     var numXPartitionsMinus1: UInt64 = 0
     var numYPartitionsMinus1: UInt64 = 0
+    var nlq: Nlq?
 
-    static func parse(_ r: inout DoviBitReader, header: DoviRpuHeader) -> DoviRpuMapping {
+    /// 结构上限(规范值放宽):畸形 ue 不得驱动超大循环/分配。
+    static let maxPivotsMinus2: UInt64 = 7
+    static let maxPolyOrderMinus1: UInt64 = 7
+    static let maxPartitions: UInt64 = 4096
+
+    /// 解析失败(越界/畸形/不支持的系数类型)返回 nil——调用方该帧降级。
+    static func parse(_ r: inout DoviBitReader, header: DoviRpuHeader) -> DoviRpuMapping? {
+        // 仅支持定点系数(coefficient_data_type 0,UHD 原盘/流媒体实际取值)。
+        guard header.coefficientDataType == 0 else { return nil }
+        let denomLen = Int(header.coefficientLog2Denom)
+        let blBitDepth = Int(header.blBitDepthMinus8) + 8
+        let elBits = Int(header.elBitDepthMinus8) + 8
+        guard (1...32).contains(denomLen), blBitDepth <= 16, elBits <= 16 else { return nil }
+
         var m = DoviRpuMapping()
         m.vdrRpuId = r.readUE()
         m.mappingColorSpace = r.readUE()
         m.mappingChromaFormatIdc = r.readUE()
-        let blBitDepth = Int(header.blBitDepthMinus8) + 8
 
         for _ in 0..<3 {
             var c = Curve()
             c.numPivotsMinus2 = r.readUE()
+            guard c.numPivotsMinus2 <= maxPivotsMinus2, !r.overrun else { return nil }
             let numPivots = Int(c.numPivotsMinus2) + 2
             for _ in 0..<numPivots { c.pivots.append(r.read(blBitDepth)) }
             m.curves.append(c)
@@ -343,8 +387,9 @@ struct DoviRpuMapping {
 
         m.numXPartitionsMinus1 = r.readUE()
         m.numYPartitionsMinus1 = r.readUE()
+        guard m.numXPartitionsMinus1 < maxPartitions,
+              m.numYPartitionsMinus1 < maxPartitions, !r.overrun else { return nil }
 
-        let denomLen = Int(header.coefficientLog2Denom)
         // 定点系数:bitstream-io write_signed_counted = 符号 1 位 + (N-1) 位
         // 幅度,总长 N 位(denomLen)。不是 N+1!(2026-11-16 对拍定位)
         let magLen = denomLen - 1
@@ -361,10 +406,12 @@ struct DoviRpuMapping {
             let numPieces = Int(m.curves[ci].numPivotsMinus2) + 1
             for _ in 0..<numPieces {
                 let idc = r.readUE()
+                guard idc <= 1, !r.overrun else { return nil }
                 m.curves[ci].mappingIdc.append(idc)
                 if idc == 0 {
                     // polynomial
                     let order = r.readUE()
+                    guard order <= maxPolyOrderMinus1, !r.overrun else { return nil }
                     var linear = false
                     if order == 0 { linear = r.readBit() }
                     var coefs: [(Int64, Int64)] = []
@@ -393,26 +440,45 @@ struct DoviRpuMapping {
                     }
                     m.curves[ci].mmr.append((order, constV, constFixed, coefs))
                 }
+                guard !r.overrun else { return nil }
             }
         }
 
         // NLQ 数据块(P7 mapping 尾部,libdovi `RpuDataNlq::parse`):
-        // 每 component:nlq_offset(el 位深,无符号)+ vdr_in_max(int ue +
-        // 符号定点)+ LinearDeadzone(slope int/定点 + threshold int/定点)。
-        // 转换丢弃,但必须消费这些位,否则 DM 段起点错位。
-        if m.nlqMethodIdc != nil {
-            let elBits = Int(header.elBitDepthMinus8) + 8
+        // 每 component:nlq_offset(el 位深)+ vdr_in_max(int ue + 定点)+
+        // LinearDeadzone(slope int/定点 + threshold int/定点)。
+        // 必须消费这些位(否则 DM 段起点错位),同时保留原值供 MEL/FEL 判定。
+        if let method = m.nlqMethodIdc {
+            guard method == 0 else { return nil } // 仅 linear_dz 有定义
+            var nlq = Nlq()
             for _ in 0..<3 {
-                _ = r.read(elBits)
-                _ = r.readUE()
-                _ = readSignedFixed()
-                _ = r.readUE()
-                _ = readSignedFixed()
-                _ = r.readUE()
-                _ = readSignedFixed()
+                nlq.offset.append(r.read(elBits))
+                nlq.vdrInMaxInt.append(r.readUE())
+                nlq.vdrInMax.append(r.read(denomLen))
+                nlq.slopeInt.append(r.readUE())
+                nlq.slope.append(r.read(denomLen))
+                nlq.thresholdInt.append(r.readUE())
+                nlq.threshold.append(r.read(denomLen))
             }
+            m.nlq = nlq
         }
+        guard !r.overrun else { return nil }
         return m
+    }
+
+    /// libdovi `remove_mapping` 等价:三条曲线置为恒等(单段一次多项式
+    /// y = x,pivots = [0, 2^bl_bit_depth - 1])。FEL 转 P8.1 时使用——
+    /// 丢掉 EL 残差后再套 FEL 的 BL mapping 会把画面推离母版(dovi_tool
+    /// mode 2 对 FEL 同做法)。
+    mutating func setIdentityMapping(blBitDepth: Int) {
+        let maxPivot = (UInt64(1) << UInt64(blBitDepth)) - 1
+        var c = Curve()
+        c.numPivotsMinus2 = 0
+        c.pivots = [0, maxPivot]
+        c.mappingIdc = [0]
+        c.poly = [(order: 0, linear: false, coefs: [(0, 0), (1, 0)])]
+        c.mmr = []
+        curves = [c, c, c]
     }
 
     func write(_ w: inout DoviBitWriter, header: DoviRpuHeader) {
@@ -420,13 +486,22 @@ struct DoviRpuMapping {
         w.writeUE(mappingColorSpace)
         w.writeUE(mappingChromaFormatIdc)
         let blBitDepth = Int(header.blBitDepthMinus8) + 8
+        let elBits = Int(header.elBitDepthMinus8) + 8
 
         for c in curves {
             w.writeUE(c.numPivotsMinus2)
             for p in c.pivots { w.write(p, blBitDepth) }
         }
 
-        // P8.1 转换态:disableResidualFlag = true → 不写 NLQ(规范分支)。
+        // NLQ 头:只在 header 声明有残差时写(P8.1 转换态 disableResidualFlag
+        // = true → 规范分支不写;P7 无损回写时写回原值)。
+        let writesNlq = header.rpuFormat & 0x700 == 0 && !header.disableResidualFlag
+        if writesNlq {
+            w.write(UInt64(nlqMethodIdc ?? 0), 3)
+            for i in 0..<2 {
+                w.write(i < nlqPredPivotValue.count ? nlqPredPivotValue[i] : 0, blBitDepth)
+            }
+        }
 
         w.writeUE(numXPartitionsMinus1)
         w.writeUE(numYPartitionsMinus1)
@@ -438,40 +513,50 @@ struct DoviRpuMapping {
             // (bitstream-io write_signed_counted 语义,对齐 readSignedFixed)
             let neg = v < 0
             w.writeBit(neg)
-            let mag = neg ? -v : v
-            w.write(UInt64(mag), magLen)
+            w.write(UInt64(neg ? -v : v), magLen)
         }
         func writeSE(_ v: Int64) {
-            let code = v <= 0 ? UInt64(-v) << 1 : UInt64(v) << 1 - 1
             // H.264 se(v):k>0 → 2k-1;k≤0 → -2k
-            let codeNum = v > 0 ? UInt64(v) * 2 - 1 : UInt64(-v) * 2
-            _ = code
-            w.writeUE(codeNum)
+            w.writeUE(v > 0 ? UInt64(v) * 2 - 1 : UInt64(-v) * 2)
         }
 
-        for ci in 0..<3 {
-            let c = curves[ci]
-            let numPieces = Int(c.numPivotsMinus2) + 1
-            for i in 0..<numPieces {
-                w.writeUE(c.mappingIdc[i])
-                if c.mappingIdc[i] == 0 {
-                    let p = c.poly[i]
-                    w.writeUE(p.0)
-                    if p.0 == 0 { w.writeBit(p.1) }
-                    for coef in p.2 {
+        for c in curves {
+            // poly / mmr 各自按出现顺序计数:piece 下标 ≠ 各自数组下标
+            // (曲线内混合 poly/mmr piece 时按 piece 下标取会越界崩溃)。
+            var polyIdx = 0
+            var mmrIdx = 0
+            for idc in c.mappingIdc {
+                w.writeUE(idc)
+                if idc == 0 {
+                    let p = c.poly[polyIdx]; polyIdx += 1
+                    w.writeUE(p.order)
+                    if p.order == 0 { w.writeBit(p.linear) }
+                    for coef in p.coefs {
                         writeSE(coef.0)
                         writeSignedFixed(coef.1)
                     }
                 } else {
-                    let p = c.mmr[i]
-                    w.write(UInt64(p.0), 2)
-                    writeSE(p.1)
-                    writeSignedFixed(p.2)
-                    for coef in p.3 {
+                    let p = c.mmr[mmrIdx]; mmrIdx += 1
+                    w.write(UInt64(p.order), 2)
+                    writeSE(p.constInt)
+                    writeSignedFixed(p.constFixed)
+                    for coef in p.coefs {
                         writeSE(coef.0)
                         writeSignedFixed(coef.1)
                     }
                 }
+            }
+        }
+
+        if writesNlq, let nlq {
+            for i in 0..<3 {
+                w.write(nlq.offset[i], elBits)
+                w.writeUE(nlq.vdrInMaxInt[i])
+                w.write(nlq.vdrInMax[i], denomLen)
+                w.writeUE(nlq.slopeInt[i])
+                w.write(nlq.slope[i], denomLen)
+                w.writeUE(nlq.thresholdInt[i])
+                w.write(nlq.threshold[i], denomLen)
             }
         }
     }
@@ -506,9 +591,9 @@ struct DoviRpuDmFixed {
         d.affectedDmMetadataId = r.readUE()
         d.currentDmMetadataId = r.readUE()
         d.sceneRefreshFlag = r.readUE()
-        for _ in 0..<9 { d.yccToRgbCoef.append(Int64(bitPattern: r.read(16))) }
+        for _ in 0..<9 { d.yccToRgbCoef.append(Int64(Int16(bitPattern: UInt16(truncatingIfNeeded: r.read(16))))) }
         for _ in 0..<3 { d.yccToRgbOffset.append(r.read(32)) }
-        for _ in 0..<9 { d.rgbToLmsCoef.append(Int64(bitPattern: r.read(16))) }
+        for _ in 0..<9 { d.rgbToLmsCoef.append(Int64(Int16(bitPattern: UInt16(truncatingIfNeeded: r.read(16))))) }
         d.signalEotf = r.read(16)
         d.signalEotfParam0 = r.read(16)
         d.signalEotfParam1 = r.read(16)
@@ -552,13 +637,35 @@ struct DoviRpuDmFixed {
     }
 }
 
-// MARK: - P7 → P8.1 转换(dovi_tool mode 2,MEL 路径)
+// MARK: - P7 → P8.1 转换(dovi_tool mode 2)
+
+/// 解析后的完整 RPU 帧(header + mapping + DM),可无损回写。
+struct DoviRpuParsedFrame {
+    struct DmBlockGroup {
+        var numBlocks: UInt64
+        var blocks: [(len: UInt64, level: UInt64, payload: [Bool])]
+    }
+
+    var header: DoviRpuHeader
+    var mapping: DoviRpuMapping
+    /// 压缩 DM(`reserved_zero_3bits == 1`):固定头只有 3 个 ue。
+    var compressedDM: Bool
+    var dmFixed: DoviRpuDmFixed
+    var v29: DmBlockGroup
+    var v40: DmBlockGroup?
+    var trailingZeros: Int
+
+    /// P7 且 NLQ 非恒等 = FEL。
+    var isFEL: Bool {
+        guard let nlq = mapping.nlq else { return false }
+        return !nlq.isMEL
+    }
+}
 
 public enum DoviRpuP7ToP81 {
 
-    /// 转换一个 P7 RPU NAL(输入含/不含起始码均可,内部 trim)。
-    /// 返回完整 NAL 字节(不含起始码,含 EPB 处理);失败返回 nil。
-    public static func convertNAL(_ nal: [UInt8]) -> [UInt8]? {
+    /// 解析一个 RPU NAL(输入含/不含起始码均可,内部 trim)。
+    static func parse(_ nal: [UInt8]) -> DoviRpuParsedFrame? {
         guard let trimmed = DoviRpuFrameCodec.trim(nal) else { return nil }
         let cleared = DoviEmulationPrevention.clear(trimmed)
 
@@ -570,98 +677,89 @@ public enum DoviRpuP7ToP81 {
 
         var reader = DoviBitReader(Array(cleared[0..<end]))
         guard reader.read(8) == 25 else { return nil }
-        var header = DoviRpuHeader.parse(&reader)
-        guard header.rpuType == 2 else { return nil }
-        // P7 特征:profile 由 vdr_rpu_profile=1 + NLQ/EL 旗标体现;宽松校验。
-        guard !header.usePrevVdrRpuFlag else { return nil }
-
-        let mapping = DoviRpuMapping.parse(&reader, header: header)
+        let header = DoviRpuHeader.parse(&reader)
+        guard header.rpuType == 2, !header.usePrevVdrRpuFlag, !reader.overrun else { return nil }
+        guard let mapping = DoviRpuMapping.parse(&reader, header: header) else { return nil }
 
         // DM:结构化解析(设计 Task 2b)。固定头 + v29 块组(+ v40 块组)。
         // 块组**必须解析成结构再重写**而不是照搬位:P7 帧里组后 align padding
         // 是相对源位流的(实测 6 位),重写后位置不同,照搬会多出 padding 位
         // (2026-11-16 对拍:ours 比 dovi_tool 输出多 1 字节)。
-        // 每块 = 块长 ue + level 8 位 + 块长×8 位 payload(块内容不解析,原样)。
-        // trimmed 末尾:… align | crc32(32) | 0x80(8)
-        let crcStartBit = (end - 5) * 8
-
-        // —— DM 固定头(VdrDmData::parse;边读边记录字段值供重写)——
+        let compressed = header.reservedZero3Bits == 1
         var dmFixed = DoviRpuDmFixed()
-        if header.reservedZero3Bits == 1 {
-            // 压缩 DM:仅 3 个 ue,后接块组(重写时固定头只写这 3 个 ue)
-            let u = rThreeUEs(&reader)
-            dmFixed.affectedDmMetadataId = u.0
-            dmFixed.currentDmMetadataId = u.1
-            dmFixed.sceneRefreshFlag = u.2
+        if compressed {
+            dmFixed.affectedDmMetadataId = reader.readUE()
+            dmFixed.currentDmMetadataId = reader.readUE()
+            dmFixed.sceneRefreshFlag = reader.readUE()
         } else {
             dmFixed = DoviRpuDmFixed.parse(&reader)
         }
+        guard !reader.overrun else { return nil }
 
-        // —— DM 扩展块组解析 ——
-        struct DmBlockGroup {
-            var numBlocks: UInt64
-            var blocks: [(len: UInt64, level: UInt64, payload: [Bool])]
+        // V29 组(必须存在);V40 组(存在则保留,探测失败回滚视为不存在)
+        guard let v29 = parseBlockGroup(&reader) else { return nil }
+        var v40: DoviRpuParsedFrame.DmBlockGroup?
+        if reader.bitsRemaining >= 56 {
+            v40 = parseBlockGroup(&reader)
         }
-        func parseBlockGroup() -> DmBlockGroup? {
-            let startPos = reader.bitPos
-            guard reader.bitsRemaining >= 8 else { return nil }
-            let numBlocks = reader.readUE()
-            guard numBlocks >= 1, numBlocks <= 64 else {
+
+        return DoviRpuParsedFrame(header: header, mapping: mapping, compressedDM: compressed,
+                                  dmFixed: dmFixed, v29: v29, v40: v40,
+                                  trailingZeros: trailingZeros)
+    }
+
+    /// 每块 = 块长 ue + level 8 位 + 块长×8 位 payload(块内容不解析,原样)。
+    private static func parseBlockGroup(_ reader: inout DoviBitReader) -> DoviRpuParsedFrame.DmBlockGroup? {
+        let startPos = reader.bitPos
+        guard reader.bitsRemaining >= 8 else { return nil }
+        let numBlocks = reader.readUE()
+        guard numBlocks >= 1, numBlocks <= 64, !reader.overrun else {
+            reader.rewind(to: startPos); return nil
+        }
+        var blocks: [(len: UInt64, level: UInt64, payload: [Bool])] = []
+        // dm_alignment_zero_bit
+        while !reader.isByteAligned {
+            guard reader.bitsRemaining > 0, reader.readBit() == false else {
                 reader.rewind(to: startPos); return nil
             }
-            var blocks: [(UInt64, UInt64, [Bool])] = []
-            // dm_alignment_zero_bit
-            while !reader.isByteAligned {
-                guard reader.bitsRemaining > 0, reader.readBit() == false else {
-                    reader.rewind(to: startPos); return nil
-                }
-            }
-            for _ in 0..<numBlocks {
-                guard reader.bitsRemaining >= 8 else {
-                    reader.rewind(to: startPos); return nil
-                }
-                let blockLen = reader.readUE()
-                let level = reader.read(8)
-                guard blockLen >= 1, blockLen <= 256,
-                      reader.bitsRemaining >= Int(blockLen) * 8 else {
-                    reader.rewind(to: startPos); return nil
-                }
-                var payload: [Bool] = []
-                for _ in 0..<(Int(blockLen) * 8) { payload.append(reader.readBit()) }
-                blocks.append((blockLen, level, payload))
-            }
-            return DmBlockGroup(numBlocks: numBlocks, blocks: blocks)
         }
-
-        // V29 组(必须存在)
-        guard let v29 = parseBlockGroup() else { return nil }
-
-        // V40 组(存在则保留;探测失败回滚到组起点,视为不存在)
-        var v40: DmBlockGroup?
-        if reader.bitsRemaining >= 56 {
-            v40 = parseBlockGroup()
+        for _ in 0..<numBlocks {
+            guard reader.bitsRemaining >= 8 else {
+                reader.rewind(to: startPos); return nil
+            }
+            let blockLen = reader.readUE()
+            let level = reader.read(8)
+            guard !reader.overrun, blockLen >= 1, blockLen <= 256,
+                  reader.bitsRemaining >= Int(blockLen) * 8 else {
+                reader.rewind(to: startPos); return nil
+            }
+            var payload: [Bool] = []
+            payload.reserveCapacity(Int(blockLen) * 8)
+            for _ in 0..<(Int(blockLen) * 8) { payload.append(reader.readBit()) }
+            blocks.append((blockLen, level, payload))
         }
+        return DoviRpuParsedFrame.DmBlockGroup(numBlocks: numBlocks, blocks: blocks)
+    }
 
-        // —— 转换(dovi_tool convert_to_p81)——
-        header.elSpatialResamplingFilterFlag = false
-        header.disableResidualFlag = true
-        var outMapping = mapping
-        outMapping.nlqMethodIdc = nil
-        outMapping.nlqPredPivotValue = []
-        outMapping.numXPartitionsMinus1 = 0
-        outMapping.numYPartitionsMinus1 = 0
-
-        // —— 重写:固定头 → v29 → v40 → align → CRC(全部重新序列化)——
+    /// 序列化:固定头 → v29 → v40 → align → CRC(全部重新序列化)。
+    /// 输出 annexb NAL(`00000001` + EPB 后 RBSP,与 dovi_tool 输出格式一致)。
+    static func serialize(_ f: DoviRpuParsedFrame) -> [UInt8]? {
         var w = DoviBitWriter()
         w.write(25, 8)
-        header.write(&w)
-        outMapping.write(&w, header: header)
+        f.header.write(&w)
+        f.mapping.write(&w, header: f.header)
 
-        // DM 固定头:set_p81_coeffs 替换矩阵
-        dmFixed.applyP81Coeffs()
-        dmFixed.write(&w)
+        if f.compressedDM {
+            // 压缩 DM 固定头只有 3 个 ue(对齐 parse;libdovi VdrDmData
+            // compressed 分支)。写全量固定头会凭空多出矩阵字段。
+            w.writeUE(f.dmFixed.affectedDmMetadataId)
+            w.writeUE(f.dmFixed.currentDmMetadataId)
+            w.writeUE(f.dmFixed.sceneRefreshFlag)
+        } else {
+            f.dmFixed.write(&w)
+        }
 
-        func writeGroup(_ g: DmBlockGroup) {
+        func writeGroup(_ g: DoviRpuParsedFrame.DmBlockGroup) {
             w.writeUE(g.numBlocks)
             w.byteAlign()
             for b in g.blocks {
@@ -670,8 +768,8 @@ public enum DoviRpuP7ToP81 {
                 w.writeBits(b.payload)
             }
         }
-        writeGroup(v29)
-        if let g40 = v40 { writeGroup(g40) }
+        writeGroup(f.v29)
+        if let g40 = f.v40 { writeGroup(g40) }
 
         w.byteAlign()
         var payload = w.data()
@@ -682,11 +780,41 @@ public enum DoviRpuP7ToP81 {
         payload.append(UInt8((crc >> 8) & 0xFF))
         payload.append(UInt8(crc & 0xFF))
         payload.append(0x80)
-        for _ in 0..<trailingZeros { payload.append(0) }
+        for _ in 0..<f.trailingZeros { payload.append(0) }
 
-        // annexb NAL:起始码 + EPB(与 dovi_tool 输出格式一致)
         var nal: [UInt8] = [0, 0, 0, 1]
         nal.append(contentsOf: DoviEmulationPrevention.add(payload))
         return nal
+    }
+
+    /// 转换一个 P7 RPU NAL(输入含/不含起始码均可,内部 trim)。
+    /// 返回 annexb NAL(起始码 + EPB 后 RBSP);失败返回 nil(该帧降级)。
+    ///
+    /// 语义对齐 dovi_tool `convert_to_p81`:
+    /// - header:`el_spatial_resampling_filter_flag = 0`、`disable_residual_flag = 1`
+    /// - mapping:丢 NLQ、partition 归零;**FEL 额外把三条曲线置恒等**
+    ///   (`remove_mapping`)——MEL 的 mapping 原样保留(1442 帧对拍)
+    /// - DM:`set_p81_coeffs` 替换矩阵(压缩 DM 无矩阵字段,不受影响)
+    public static func convertNAL(_ nal: [UInt8]) -> [UInt8]? {
+        guard var f = parse(nal) else { return nil }
+        let fel = f.isFEL
+
+        f.header.elSpatialResamplingFilterFlag = false
+        f.header.disableResidualFlag = true
+        f.mapping.nlqMethodIdc = nil
+        f.mapping.nlqPredPivotValue = []
+        f.mapping.nlq = nil
+        f.mapping.numXPartitionsMinus1 = 0
+        f.mapping.numYPartitionsMinus1 = 0
+        if fel {
+            f.mapping.setIdentityMapping(blBitDepth: Int(f.header.blBitDepthMinus8) + 8)
+        }
+        f.dmFixed.applyP81Coeffs()
+        return serialize(f)
+    }
+
+    /// RPU 是否为 P7 FEL(解析失败返回 nil)。供日志/诊断与测试。
+    public static func isFEL(_ nal: [UInt8]) -> Bool? {
+        parse(nal)?.isFEL
     }
 }
