@@ -33,15 +33,16 @@ final class AudioUnitOutputPausedEnqueueTests: XCTestCase {
         return condition()
     }
 
-    /// Polls until `clock.audioTime` has not moved for 0.5 s (queue drained).
-    /// CI runners have no real audio device: the callback cadence is driven by
-    /// the synthetic device clock and its scheduling jitter is large, so a
-    /// "must finish within T seconds" assertion turns that jitter into phantom
-    /// frame loss (same assertion measured 1.035 s / 0.971 s on two CI runs,
-    /// and PR #65's CI hit it on code without this branch's changes). The
-    /// regression only needs SETTLING: every enqueued frame must eventually
-    /// be consumed, however slowly.
-    private func waitUntilClockSettles(timeout: TimeInterval, clock: AudioClock) -> Bool {
+    /// Polls until `clock.audioTime` has not moved for `quiet` seconds.
+    ///
+    /// Do not wait for `hasPendingOutput == false` here: with a finite feed the
+    /// AudioQueue can keep its last 1–2 buffers checked out on CI and never
+    /// fire their callbacks, even after 30 s. The ±50 ms assertion below
+    /// tolerates that normal tail while still failing the old 60-buffer cap
+    /// (which loses ~40 frames).
+    private func waitUntilClockSettles(timeout: TimeInterval,
+                                       quiet: TimeInterval = 1.0,
+                                       clock: AudioClock) -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         var last = clock.audioTime
         var lastMove = Date()
@@ -51,10 +52,30 @@ final class AudioUnitOutputPausedEnqueueTests: XCTestCase {
                 last = now
                 lastMove = Date()
             }
-            if Date().timeIntervalSince(lastMove) > 0.5 { return true }
+            if Date().timeIntervalSince(lastMove) > quiet { return true }
             Thread.sleep(forTimeInterval: 0.01)
         }
         return false
+    }
+
+    /// Waits until the clock has at least reached `minimum`, then until it
+    /// stops moving. The first wait prevents a delayed AudioQueueStart (common
+    /// on CI) from looking like a settled clock at 0; the second lets the tail
+    /// callbacks land before the final assertion.
+    private func waitUntilSettled(atLeast minimum: Double,
+                                  timeout: TimeInterval = 30.0,
+                                  clock: AudioClock) -> Bool {
+        guard waitUntil(timeout: timeout, { clock.audioTime >= minimum }) else { return false }
+        return waitUntilClockSettles(timeout: 5.0, clock: clock)
+    }
+
+    private func drainDescription(_ output: AudioUnitOutput, clock: AudioClock) -> String {
+        let d = output.drainQueueDiag()
+        let bufferedSeconds = Double(d.bufferedSamplesNow) / Double(max(1, d.sampleRateNow))
+        return "buffered=\(d.bufferedSamplesNow) samples "
+            + "(\(String(format: "%.3f", bufferedSeconds))s), "
+            + "frames=\(d.bufferedFramesNow), callbacks=\(d.callbackCount), "
+            + "paused=\(d.pausedNow), clock=\(String(format: "%.3f", clock.audioTime))s"
     }
 
     /// Every frame handed to a paused queue must still be played after resume() as
@@ -74,13 +95,12 @@ final class AudioUnitOutputPausedEnqueueTests: XCTestCase {
         output.resume()
 
         let expected = Double(total * samplesPerFrame) / Double(sampleRate)  // 1.0667 s
-        // 等时钟停走再断言终值,不设消费速率限时:GitHub macOS runner 没有真实
-        // 音频设备,回调节奏由合成时钟驱动且调度抖动大(同断言两次 CI 实测
-        // 1.035s / 0.971s,「4 秒内到达」会超时;PR #65 的 CI 在不含本分支
-        // 改动的代码上同样挂过 3 帧)。丢帧检测语义保留:停走后的终值若达不到
-        // expected ±50ms,就是真的有帧被丢(旧 60-buffer cap 回归)。
-        XCTAssertTrue(waitUntilClockSettles(timeout: 30.0, clock: clock),
-            "audio clock never settled (still at \(clock.audioTime)s after 30s)")
+        // 等时钟停走再断言终值:CI 的有限喂入结束后,AudioQueue 可能把最后
+        // 1~2 个 buffer 留在队列里不再回调,不能用 hasPendingOutput == false
+        // 当排空判据。±50ms 容差覆盖这个正常尾部;旧 60-buffer cap 会丢约
+        // 40 帧(0.64s),仍然会红。
+        XCTAssertTrue(waitUntilSettled(atLeast: expected - 0.05, clock: clock),
+            "audio clock never reached/settled: \(drainDescription(output, clock: clock))")
         XCTAssertEqual(clock.audioTime, expected, accuracy: 0.05,
             "frames were lost: enqueued \(total) frames (=\(String(format: "%.3f", expected))s), "
             + "clock settled at \(String(format: "%.3f", clock.audioTime))s "
@@ -103,8 +123,12 @@ final class AudioUnitOutputPausedEnqueueTests: XCTestCase {
         for _ in 0..<200 { output.enqueue(silentFrame()) }  // 2.13 s offered, 0.5 s allowed
         output.resume()
 
-        Thread.sleep(forTimeInterval: 1.6)  // long enough to play everything that was kept
+        // 固定 1.6s 既受 CI 虚拟设备回调节奏影响,也会把 primer 记账缺口
+        // 误判成「没播够」。等时钟至少到达下限后再停走;最后 1~2 个 buffer
+        // 留在 AudioQueue 属于正常尾部。
         let cap = 0.5
+        XCTAssertTrue(waitUntilSettled(atLeast: cap - 0.06, clock: clock),
+            "audio clock never reached/settled: \(drainDescription(output, clock: clock))")
         XCTAssertGreaterThan(clock.audioTime, cap - 0.06, "the allowed 0.5 s must be played")
         // Upper margin must clear scheduler-timing overshoot: the cap check
         // runs before each enqueue, so the kept total can legitimately exceed
