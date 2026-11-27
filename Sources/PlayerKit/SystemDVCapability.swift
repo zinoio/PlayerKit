@@ -64,6 +64,17 @@ public enum SystemDVPolicy {
         }
     }
 
+    /// Phase 2 route b(iOS / tvOS)流资格判定:仅放行含 HDR10 兼容基础层的
+    /// P8.1(`compatId == 1`)与转换态 P7(`convertedP7CompatId == 1`)。
+    /// P5 基础层为 IPT 非 PQ/BT.2020,保持软件 IPT 纠色路径。
+    public static func isRouteBEligible(profile: UInt8, compatId: UInt8,
+                                        convertedP7CompatId: UInt8? = nil) -> Bool {
+        if profile == 7 {
+            return convertedP7CompatId.map { eligibleP8CompatIds.contains($0) } ?? false
+        }
+        return profile == 8 && eligibleP8CompatIds.contains(compatId)
+    }
+
     /// P7 转换态 open 后的逐帧 RPU 校验窗口:开头 N 帧全无有效 RPU → 判路由
     /// 失误,回 `degradedHDR10`(设计 §4.3)。单帧畸形只降级该帧,不 reopen。
     public static let rpuValidationFrames = 8
@@ -92,29 +103,31 @@ public struct SystemDVCapability: Sendable, Equatable {
 
     public var isAvailable: Bool
 
-    public init(isAvailable: Bool) {
+    /// Phase 2 route b(iOS / tvOS):VT 10-bit 硬解基础层 + 逐帧挂
+    /// `DolbyVisionRPUData` / `DolbyCompatibilityID` 附件交由
+    /// `AVSampleBufferDisplayLayer` 系统呈现。
+    public var supportsRouteB: Bool
+
+    public init(isAvailable: Bool, supportsRouteB: Bool = false) {
         self.isAvailable = isAvailable
+        self.supportsRouteB = supportsRouteB
     }
 
     /// Sentinel for "system DV path not usable here" — also the default value
     /// of `decideRendererStrategy(systemDolbyVision:)`, keeping every existing
     /// call site on the software path.
-    public static let unavailable = SystemDVCapability(isAvailable: false)
+    public static let unavailable = SystemDVCapability(isAvailable: false, supportsRouteB: false)
 
-    /// Probe from a display capability snapshot. macOS: EDR-capable displays
-    /// qualify. **iOS/tvOS: `.unavailable`(2026-11-06 spike 定案)**——七轮真机
-    /// 证实 iOS 全屏 in-app 对压缩 DV 直通(dvh1)合成黑帧(与 DV 声明无关,
-    /// PiP 可用),管线其余部分全绿;压缩直通路线定案不可行,iPhone 真 DV
-    /// 唯一路线 = route b(解码帧+RPU 附件),届时按其结论重开本探针。
-    /// 详见 reflux PR #466/#472 设计稿 §7(七轮判读)。
-    /// Note (design §5.4): the result must be re-derived when the display
-    /// configuration changes — the display-change notification flow (macOS)
-    /// handles that, no extra observer here.
+    /// Probe from a display capability snapshot.
+    /// - macOS: EDR-capable displays use `isAvailable` (compressed passthrough).
+    /// - iOS / tvOS: compressed passthrough is unavailable (7-round spike proved
+    ///   black screen on iOS 26 full-screen), while `supportsRouteB` follows
+    ///   `display.supportsEDR` (Phase 2 decoded-frame + RPU attachment path).
     public static func probe(display: DisplayCapability) -> SystemDVCapability {
 #if os(macOS)
-        return SystemDVCapability(isAvailable: display.supportsEDR)
+        return SystemDVCapability(isAvailable: display.supportsEDR, supportsRouteB: false)
 #else
-        return .unavailable
+        return SystemDVCapability(isAvailable: false, supportsRouteB: display.supportsEDR)
 #endif
     }
 }

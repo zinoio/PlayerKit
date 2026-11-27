@@ -770,6 +770,7 @@ public final class PlaybackVerifier: VideoRenderer {
         case .hlgOOTF:                          return "hlgOOTF"
         case .degradedHDR10:                    return "degradedHDR10"
         case .doviSystem:                       return "doviSystem"
+        case .doviRouteB:                       return "doviRouteB"
         }
     }
 
@@ -784,7 +785,7 @@ public final class PlaybackVerifier: VideoRenderer {
     static func isHDRStrategy(_ strategy: RendererStrategy?) -> Bool {
         switch strategy {
         case .hdr10Static, .hdr10Plus, .doviProfile5, .doviProfile8, .hlgOOTF, .degradedHDR10,
-             .doviSystem:
+             .doviSystem, .doviRouteB:
             return true
         case .sdr8Bit, .sdr10Bit, nil:
             return false
@@ -793,7 +794,7 @@ public final class PlaybackVerifier: VideoRenderer {
 
     static func isDVStrategy(_ strategy: RendererStrategy?) -> Bool {
         switch strategy {
-        case .doviProfile5, .doviProfile8, .doviSystem: return true
+        case .doviProfile5, .doviProfile8, .doviSystem, .doviRouteB: return true
         default: return false
         }
     }

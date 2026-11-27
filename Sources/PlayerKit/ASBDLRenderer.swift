@@ -61,6 +61,24 @@ public class ASBDLRenderer: VideoRenderer {
         displayLayer.videoGravity = .resizeAspect
     }
 
+    /// Phase 2 route b: CoreVideo attachment keys consumed by iOS/tvOS
+    /// backboardd HDRProcessing stack when rendering decoded 10-bit CVPixelBuffers.
+    public static let doviRpuAttachmentKey: CFString = "DolbyVisionRPUData" as CFString
+    public static let doviCompatIdAttachmentKey: CFString = "DolbyCompatibilityID" as CFString
+
+    /// Attach or strip per-frame Dolby Vision RPU metadata on a `CVPixelBuffer`.
+    /// Passing `nil` explicitly removes both keys so pooled pixel buffers never
+    /// leak stale RPU across frames or strategy transitions.
+    public static func applyRouteBAttachments(_ pb: CVPixelBuffer, rpuData: Data?) {
+        if let rpuData, !rpuData.isEmpty {
+            CVBufferSetAttachment(pb, doviRpuAttachmentKey, rpuData as CFData, .shouldPropagate)
+            CVBufferSetAttachment(pb, doviCompatIdAttachmentKey, "1" as CFString, .shouldPropagate)
+        } else {
+            CVBufferRemoveAttachment(pb, doviRpuAttachmentKey)
+            CVBufferRemoveAttachment(pb, doviCompatIdAttachmentKey)
+        }
+    }
+
     public nonisolated func render(
         pixelBuffer: CVPixelBuffer,
         pts: Double,
@@ -68,9 +86,10 @@ public class ASBDLRenderer: VideoRenderer {
         metadata: FrameMetadata,
         strategy: RendererStrategy?
     ) {
+        let isRouteB = strategy == .doviRouteB
         let pb: CVPixelBuffer
         let cp: VideoColorParams
-        if let toneMapper {
+        if !isRouteB, let toneMapper {
             let result = toneMapper.process(
                 pixelBuffer: pixelBuffer, colorParams: colorParams,
                 metadata: metadata, strategy: strategy)
@@ -81,6 +100,8 @@ public class ASBDLRenderer: VideoRenderer {
             cp = colorParams
         }
         attachColorParams(pb, colorParams: cp)
+        Self.applyRouteBAttachments(pb, rpuData: isRouteB ? metadata.doviRpuData : nil)
+        updatePreferredDynamicRangeIfNeeded(high: isRouteB)
         let cmPts = CMTime(seconds: pts, preferredTimescale: 90000)
         guard let sbuf = makeSampleBuffer(pixelBuffer: pb, pts: cmPts) else {
             logger.info("ASBDL: makeSampleBuffer failed at pts=\(pts)")
@@ -111,6 +132,28 @@ public class ASBDLRenderer: VideoRenderer {
     /// True while the layer is hidden by `clear()` and the next rendered frame
     /// must reveal it. The layer starts visible, so this starts false.
     private let needsReveal = OSAllocatedUnfairLock(initialState: false)
+    private let highDynamicRangeActive = OSAllocatedUnfairLock(initialState: false)
+
+    private func updatePreferredDynamicRangeIfNeeded(high: Bool) {
+#if os(iOS) || os(tvOS)
+        let changed = highDynamicRangeActive.withLock { current -> Bool in
+            guard current != high else { return false }
+            current = high
+            return true
+        }
+        guard changed else { return }
+        if #available(iOS 26.0, tvOS 26.0, *) {
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                let target = self.highDynamicRangeActive.withLock { $0 }
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                self.displayLayer.preferredDynamicRange = target ? .high : .standard
+                CATransaction.commit()
+            }
+        }
+#endif
+    }
 
     private func revealOnMain() {
         DispatchQueue.main.async { [weak self] in
@@ -148,6 +191,7 @@ public class ASBDLRenderer: VideoRenderer {
 
     public func clear() {
         displayLayer.flushAndRemoveImage()
+        updatePreferredDynamicRangeIfNeeded(high: false)
         // Show black to satisfy the protocol "show black" contract.
         needsReveal.withLock { $0 = true }
         displayLayer.isHidden = true
