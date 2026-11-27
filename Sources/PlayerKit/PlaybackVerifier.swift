@@ -136,6 +136,15 @@ public final class ProbeToneMapping: ToneMapping {
                         metadata: metadata, strategy: strategy)
     }
 
+    public func process(pixelBuffer: CVPixelBuffer,
+                        elPixelBuffer: CVPixelBuffer?,
+                        colorParams: VideoColorParams,
+                        metadata: FrameMetadata,
+                        strategy: RendererStrategy?) -> ProcessedFrame {
+        wrapped.process(pixelBuffer: pixelBuffer, elPixelBuffer: elPixelBuffer,
+                        colorParams: colorParams, metadata: metadata, strategy: strategy)
+    }
+
     /// Observer path — double checksum for one probe frame. Called off the
     /// render thread; mappers are thread-safe by PlayerKit contract
     /// (NativeBackend already runs them from arbitrary display threads).
@@ -369,6 +378,16 @@ public final class PlaybackVerifier: VideoRenderer {
                        colorParams: VideoColorParams,
                        metadata: FrameMetadata,
                        strategy: RendererStrategy?) {
+        render(pixelBuffer: pixelBuffer, elPixelBuffer: nil, pts: pts,
+               colorParams: colorParams, metadata: metadata, strategy: strategy)
+    }
+
+    public func render(pixelBuffer: CVPixelBuffer,
+                       elPixelBuffer: CVPixelBuffer?,
+                       pts: Double,
+                       colorParams: VideoColorParams,
+                       metadata: FrameMetadata,
+                       strategy: RendererStrategy?) {
         stateLock.lock()
         if !sessionActive {
             sessionActive = true
@@ -397,8 +416,8 @@ public final class PlaybackVerifier: VideoRenderer {
         }
 
         // Forward unchanged — pure observer.
-        wrapped.render(pixelBuffer: pixelBuffer, pts: pts, colorParams: colorParams,
-                       metadata: metadata, strategy: strategy)
+        wrapped.render(pixelBuffer: pixelBuffer, elPixelBuffer: elPixelBuffer, pts: pts,
+                       colorParams: colorParams, metadata: metadata, strategy: strategy)
     }
 
     /// `NativeBackend.stop()` calls `flush()` then `clear()`; `seek()` calls

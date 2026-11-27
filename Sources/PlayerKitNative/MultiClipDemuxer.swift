@@ -312,6 +312,7 @@ extension MultiClipDemuxer: PacketDemuxing {
     var audioStream: UnsafeMutablePointer<AVStream>? { currentDemuxer?.audioStream }
     var subtitleStream: UnsafeMutablePointer<AVStream>? { currentDemuxer?.subtitleStream }
     var videoStreamIndex: Int32 { currentDemuxer?.videoStreamIndex ?? -1 }
+    var elVideoStreamIndex: Int32 { currentDemuxer?.elVideoStreamIndex ?? -1 }
     var audioStreamIndex: Int32 { currentDemuxer?.audioStreamIndex ?? -1 }
     var subtitleStreamIndex: Int32 { currentDemuxer?.subtitleStreamIndex ?? -1 }
     var downloadedUpToOffset: Int64 { currentDemuxer?.downloadedUpToOffset ?? -1 }

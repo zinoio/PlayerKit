@@ -8,6 +8,9 @@ import CFFmpeg
 /// extracted from the AVFrame.
 struct DecodedVideoFrame {
     let pixelBuffer: CVPixelBuffer
+    /// Phase 3 (macOS 软解完整 P7 FEL): decoded 10-bit Enhancement Layer pixel
+    /// buffer paired with `pixelBuffer` by PTS, nil for non-FEL / HW paths.
+    var elPixelBuffer: CVPixelBuffer? = nil
     let metadata: FrameMetadata
     /// The decoder's own display-order presentation time, in seconds, when
     /// the decoder can determine it more reliably than the caller's
@@ -27,5 +30,12 @@ protocol VideoDecoding {
     var height: Int { get }
     var isHardware: Bool { get }
     func decode(packet: UnsafeMutablePointer<AVPacket>) -> DecodedVideoFrame?
+    /// Phase 3 (macOS 软解完整 P7 FEL): feed an external EL-track HEVC packet
+    /// (e.g. dual-track M2TS / BDMV) into the paired EL software decoder.
+    func feedExternalElPacket(_ packet: UnsafeMutablePointer<AVPacket>)
     func flush()
+}
+
+extension VideoDecoding {
+    func feedExternalElPacket(_ packet: UnsafeMutablePointer<AVPacket>) {}
 }

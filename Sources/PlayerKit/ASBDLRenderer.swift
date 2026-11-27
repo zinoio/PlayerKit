@@ -26,6 +26,26 @@ public protocol ToneMapping: AnyObject {
                  colorParams: VideoColorParams,
                  metadata: FrameMetadata,
                  strategy: RendererStrategy?) -> ProcessedFrame
+
+    /// Phase 3 (macOS 软解完整 P7 FEL NLQ): optional EL pixel buffer overload.
+    /// Default implementation forwards to the 4-argument `process(...)` so
+    /// existing conformers remain source-compatible.
+    func process(pixelBuffer: CVPixelBuffer,
+                 elPixelBuffer: CVPixelBuffer?,
+                 colorParams: VideoColorParams,
+                 metadata: FrameMetadata,
+                 strategy: RendererStrategy?) -> ProcessedFrame
+}
+
+public extension ToneMapping {
+    func process(pixelBuffer: CVPixelBuffer,
+                 elPixelBuffer: CVPixelBuffer?,
+                 colorParams: VideoColorParams,
+                 metadata: FrameMetadata,
+                 strategy: RendererStrategy?) -> ProcessedFrame {
+        process(pixelBuffer: pixelBuffer, colorParams: colorParams,
+                metadata: metadata, strategy: strategy)
+    }
 }
 
 /// Video renderer wrapping `AVSampleBufferDisplayLayer`.
@@ -86,13 +106,25 @@ public class ASBDLRenderer: VideoRenderer {
         metadata: FrameMetadata,
         strategy: RendererStrategy?
     ) {
+        render(pixelBuffer: pixelBuffer, elPixelBuffer: nil, pts: pts,
+               colorParams: colorParams, metadata: metadata, strategy: strategy)
+    }
+
+    public nonisolated func render(
+        pixelBuffer: CVPixelBuffer,
+        elPixelBuffer: CVPixelBuffer?,
+        pts: Double,
+        colorParams: VideoColorParams,
+        metadata: FrameMetadata,
+        strategy: RendererStrategy?
+    ) {
         let isRouteB = strategy == .doviRouteB
         let pb: CVPixelBuffer
         let cp: VideoColorParams
         if !isRouteB, let toneMapper {
             let result = toneMapper.process(
-                pixelBuffer: pixelBuffer, colorParams: colorParams,
-                metadata: metadata, strategy: strategy)
+                pixelBuffer: pixelBuffer, elPixelBuffer: elPixelBuffer,
+                colorParams: colorParams, metadata: metadata, strategy: strategy)
             pb = result.pixelBuffer
             cp = result.colorParams
         } else {

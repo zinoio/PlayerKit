@@ -207,6 +207,15 @@ public protocol VideoRenderer: AnyObject {
                 metadata: FrameMetadata,
                 strategy: RendererStrategy?)
 
+    /// Phase 3 (macOS 软解完整 P7 FEL NLQ): render with optional decoded EL
+    /// pixel buffer. Default forwards to the 5-argument `render(...)`.
+    nonisolated func render(pixelBuffer: CVPixelBuffer,
+                elPixelBuffer: CVPixelBuffer?,
+                pts: Double,
+                colorParams: VideoColorParams,
+                metadata: FrameMetadata,
+                strategy: RendererStrategy?)
+
     /// Flush pending rendering commands.
     func flush()
 
@@ -225,4 +234,14 @@ public extension VideoRenderer {
     var prefersTenBit: Bool { false }
 
     func configure(codedSize: CGSize, sampleAspectRatio: Double) {}
+
+    nonisolated func render(pixelBuffer: CVPixelBuffer,
+                elPixelBuffer: CVPixelBuffer?,
+                pts: Double,
+                colorParams: VideoColorParams,
+                metadata: FrameMetadata,
+                strategy: RendererStrategy?) {
+        render(pixelBuffer: pixelBuffer, pts: pts, colorParams: colorParams,
+               metadata: metadata, strategy: strategy)
+    }
 }

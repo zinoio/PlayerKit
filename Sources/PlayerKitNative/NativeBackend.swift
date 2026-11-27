@@ -2200,7 +2200,7 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
                             logger.info("[diag] append#\(diagAppendCount, privacy: .public) framePts=\(String(format:"%.3f",framePts), privacy: .public) decoderPts=\(frame.pts.map { String(format:"%.3f",$0) } ?? "nil", privacy: .public) bounded=\(diagBounded, privacy: .public) rawPTS=\(String(format:"%.3f",rawPTS), privacy: .public) REGRESSED=\(regressed, privacy: .public)")
                         }
                         diagLastAppendedPts = framePts
-                        jitter.append(.init(pixelBuffer: frame.pixelBuffer, pts: framePts, metadata: frame.metadata))
+                        jitter.append(.init(pixelBuffer: frame.pixelBuffer, elPixelBuffer: frame.elPixelBuffer, pts: framePts, metadata: frame.metadata))
                         displayLoopLock.withLock { self.diagAppendsSinceLog += 1 }
                         let ptsCopy = framePts
                         DispatchQueue.main.async { [weak self] in
@@ -2357,6 +2357,12 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
                             displayLoopLock.withLock { self.diagBackPressureSleeps += 1 }
                         }
                     }
+
+                } else if streamIndex == demuxer.elVideoStreamIndex, demuxer.elVideoStreamIndex >= 0 {
+                    // Phase 3 (macOS 软解完整 P7 FEL): dual-track M2TS/BDMV
+                    // secondary HEVC EL stream — feed into paired EL decoder.
+                    self.videoDecoder?.feedExternalElPacket(packet)
+                    dLock.unlock()
 
                 } else if streamIndex == demuxer.audioStreamIndex {
                     let codecName = String(cString: avcodec_get_name(
@@ -3137,6 +3143,7 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
         // Renderers are thread-safe by contract (ASBDL enqueue / Metal command
         // buffers / ToneMapProcessor's own lock) — this runs on the display thread.
         _renderer.render(pixelBuffer: popped.pixelBuffer,
+                         elPixelBuffer: popped.elPixelBuffer,
                          pts: popped.pts,
                          colorParams: cp,
                          metadata: popped.metadata,
