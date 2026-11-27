@@ -4849,34 +4849,48 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
         // nonisolated state and hops UI writes via applyDisplayUpdate.
         if cvDisplayLink == nil {
             var link: CVDisplayLink?
-            CVDisplayLinkCreateWithActiveCGDisplays(&link)
-            guard let link else {
-                logger.error("CVDisplayLinkCreateWithActiveCGDisplays FAILED")
-                return
+            let createRC = CVDisplayLinkCreateWithActiveCGDisplays(&link)
+            if let link {
+                cvDisplayLink = link
+            } else {
+                // Headless / no active CG display: there is no CVDisplayLink,
+                // but the fallback timer below still drives presentation. Do
+                // NOT return here — that left the pipeline with no display
+                // driver at all (state stayed at 0, tests timed out).
+                logger.error("CVDisplayLinkCreateWithActiveCGDisplays FAILED rc=\(createRC) — using fallback timer only")
             }
-            cvDisplayLink = link
         }
-        // Always (re)bind the output callback to the current proxy.  pause()
-        // keeps displayLinkProxy alive on macOS so the raw pointer stays valid
-        // across pause/resume cycles; we still reset the callback each start
-        // so a fresh proxy (after stop()) is correctly wired.
-        let proxy = displayLinkProxy ?? DisplayLinkProxy(backend: self)
-        displayLinkProxy = proxy
-        let proxyPtr = Unmanaged.passUnretained(proxy).toOpaque()
-        CVDisplayLinkSetOutputCallback(cvDisplayLink!, { _, _, _, _, _, ctx in
-            guard let ctx else { return kCVReturnSuccess }
-            let p = Unmanaged<DisplayLinkProxy>.fromOpaque(ctx).takeUnretainedValue()
-            p.tick()
-            return kCVReturnSuccess
-        }, proxyPtr)
-        if let cv = cvDisplayLink, !CVDisplayLinkIsRunning(cv) {
-            CVDisplayLinkStart(cv)
+        if let cv = cvDisplayLink {
+            // Always (re)bind the output callback to the current proxy.  pause()
+            // keeps displayLinkProxy alive on macOS so the raw pointer stays valid
+            // across pause/resume cycles; we still reset the callback each start
+            // so a fresh proxy (after stop()) is correctly wired.
+            let proxy = displayLinkProxy ?? DisplayLinkProxy(backend: self)
+            displayLinkProxy = proxy
+            let proxyPtr = Unmanaged.passUnretained(proxy).toOpaque()
+            CVDisplayLinkSetOutputCallback(cv, { _, _, _, _, _, ctx in
+                guard let ctx else { return kCVReturnSuccess }
+                let p = Unmanaged<DisplayLinkProxy>.fromOpaque(ctx).takeUnretainedValue()
+                p.tick()
+                return kCVReturnSuccess
+            }, proxyPtr)
+            if !CVDisplayLinkIsRunning(cv) {
+                CVDisplayLinkStart(cv)
+            }
         }
         // 兜底驱动(见 fallbackRenderTimer 属性注释)。displayNextFrame 幂等
         // (renderGate tryLock),双驱动无副作用;后台串行 queue 不再占主线程。
         fallbackRenderTimer?.cancel()
         let timer = DispatchSource.makeTimerSource(queue: displayFallbackQueue)
-        timer.schedule(deadline: .now() + 0.05, repeating: 0.033)
+        // Headless (no CVDisplayLink): the timer is the ONLY driver, and a
+        // 30 Hz period is too coarse for the bypass pacer — a 24 fps frame
+        // needs two 33 ms ticks (66 ms/frame ≈ 0.64×, observed on the
+        // self-hosted mini). Drive it fast enough that a normal source frame
+        // is due on the next few ticks; with a display link the 30 Hz timer
+        // stays a low-cost backup.
+        let fallbackInterval: DispatchTimeInterval = cvDisplayLink == nil
+            ? .milliseconds(8) : .milliseconds(33)
+        timer.schedule(deadline: .now() + 0.05, repeating: fallbackInterval)
         timer.setEventHandler { [weak self] in
             self?.displayNextFrame()
         }
