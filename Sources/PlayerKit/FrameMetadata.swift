@@ -23,6 +23,11 @@ public struct FrameMetadata: Sendable, Equatable {
     /// geometric approximation chain (`DolbyVisionColorSignal`).
     public var doviReshape: DoviReshapingCurve?
 
+    /// Phase 3 (macOS 软解完整 P7):Non-Linear Inverse Quantization (NLQ)
+    /// 参数，来自 `AVDOVIMetadata.mapping.nlq[0..2]`。`nil` 或 MEL 时渲染器
+    /// 逐位回退现有 reshape 链（设计 D7）。
+    public var doviNlq: DoviNlqData?
+
     /// P7→P8.1 转换态(设计 2026-11-16 §4.2/D7):非 nil = 该帧已按 compat 1
     /// 转换,消费方优先使用;原始 `dovi` / `doviReshape` 保持不变(身份隔离,
     /// 徽标/日志/语料 manifest 仍见 P7 源身份)。
@@ -53,6 +58,7 @@ public struct FrameMetadata: Sendable, Equatable {
                 masteringDisplay: MasteringDisplayMetadata? = nil,
                 contentLightLevel: ContentLightLevelMetadata? = nil,
                 doviReshape: DoviReshapingCurve? = nil,
+                doviNlq: DoviNlqData? = nil,
                 p7Converted: DoviRpuConverter.ConvertedFrame? = nil,
                 doviRpuData: Data? = nil) {
         self.dovi = dovi
@@ -60,6 +66,7 @@ public struct FrameMetadata: Sendable, Equatable {
         self.masteringDisplay = masteringDisplay
         self.contentLightLevel = contentLightLevel
         self.doviReshape = doviReshape
+        self.doviNlq = doviNlq
         self.p7Converted = p7Converted
         self.doviRpuData = doviRpuData
     }

@@ -598,6 +598,38 @@ final class FFmpegVideoDecoder {
         return DoviReshapingCurve(components: components, rgbToLms: rgbToLms)
     }
 
+    /// Extract Profile 7 NLQ parameters (`AVDOVIDataMapping.nlq[0..2]`) from
+    /// FFmpeg's `AVDOVIMetadata`. Returns `nil` when residual is disabled,
+    /// `nlq_method_idc != AV_DOVI_NLQ_LINEAR_DZ`, or bit-depth/denom is invalid.
+    static func parseDoviNlq(_ m: UnsafePointer<AVDOVIMetadata>) -> DoviNlqData? {
+        guard let headerPtr = av_dovi_get_header(m),
+              let mappingPtr = av_dovi_get_mapping(m) else { return nil }
+        let header = headerPtr.pointee
+        var mapping = mappingPtr.pointee
+        guard header.disable_residual_flag == 0,
+              mapping.nlq_method_idc == AV_DOVI_NLQ_LINEAR_DZ,
+              header.el_bit_depth >= 8, header.el_bit_depth <= 16,
+              header.coef_log2_denom > 0, header.coef_log2_denom <= 31 else {
+            return nil
+        }
+        let elScale = 1.0 / Float((1 << Int(header.el_bit_depth)) - 1)
+        let coefScale = 1.0 / Float(1 << Int(header.coef_log2_denom))
+        let rawParams: [AVDOVINLQParams] = withUnsafeBytes(of: &mapping.nlq) {
+            UnsafeRawBufferPointer($0).bindMemory(to: AVDOVINLQParams.self).map { $0 }
+        }
+        guard rawParams.count >= 3 else { return nil }
+        let comps = (0..<3).map { i -> DoviNlqData.Component in
+            let p = rawParams[i]
+            return DoviNlqData.Component(
+                offset: elScale * Float(p.nlq_offset),
+                vdrInMax: coefScale * Float(p.vdr_in_max),
+                slope: coefScale * Float(p.linear_deadzone_slope),
+                threshold: coefScale * Float(p.linear_deadzone_threshold)
+            )
+        }
+        return DoviNlqData(components: comps, elBitDepth: header.el_bit_depth)
+    }
+
     /// Extract all per-frame HDR side data into a `FrameMetadata` value type.
     /// Covers Dolby Vision (Level 1 + Level 2/8 trim + Level 3 offsets +
     /// Level 6), HDR10+ bezier curve, SMPTE ST 2086 mastering display, and
@@ -632,16 +664,16 @@ final class FFmpegVideoDecoder {
                 if let dm = av_dovi_find_level(m, 6), dm.pointee.level == 6 {
                     dovi.level6 = FFmpegVideoDecoder.parseDoviLevel6(dm.pointee)
                 }
-                // RPU reshaping curve (P5 / P8 compat 0/4). nil when absent
-                // or malformed — renderer falls back to geometric IPT.
+                // RPU reshaping curve (P5 / P8 compat 0/4) + P7 NLQ params.
                 meta.doviReshape = FFmpegVideoDecoder.parseDoviReshapingCurve(m)
+                meta.doviNlq = FFmpegVideoDecoder.parseDoviNlq(m)
                 // P7 转换态(设计 2026-11-16 §4.2/D7):数据管线把 EL/RPU 转成
-                // compat 1,只写独立副本;原始 dovi/doviReshape 保持不动。
-                if cfg.profile == 7 {
-                    let header = UnsafeRawPointer(m)
-                        .assumingMemoryBound(to: AVDOVIRpuDataHeader.self).pointee
-                    let mapping = UnsafeRawPointer(m)
-                        .assumingMemoryBound(to: AVDOVIDataMapping.self).pointee
+                // compat 1,只写独立副本;原始 dovi/doviReshape/doviNlq 保持不动。
+                if cfg.profile == 7,
+                   let headerPtr = av_dovi_get_header(m),
+                   let mappingPtr = av_dovi_get_mapping(m) {
+                    let header = headerPtr.pointee
+                    let mapping = mappingPtr.pointee
                     let snapshot = DoviRpuConverter.P7Snapshot(
                         dvProfile: cfg.profile,
                         elPresent: true, // profile 7 规范恒有 EL 层
