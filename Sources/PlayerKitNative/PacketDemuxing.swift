@@ -22,6 +22,9 @@ protocol PacketDemuxing: AnyObject, Sendable {
     var audioStream: UnsafeMutablePointer<AVStream>? { get }
     var subtitleStream: UnsafeMutablePointer<AVStream>? { get }
     var videoStreamIndex: Int32 { get }
+    /// Secondary HEVC Enhancement Layer stream index for dual-track P7 M2TS/BDMV
+    /// (-1 when absent or single-track).
+    var elVideoStreamIndex: Int32 { get }
     var audioStreamIndex: Int32 { get }
     var subtitleStreamIndex: Int32 { get }
     var downloadedUpToOffset: Int64 { get }
@@ -78,6 +81,7 @@ protocol PacketDemuxing: AnyObject, Sendable {
 extension FFmpegDemuxer: PacketDemuxing {}
 
 extension PacketDemuxing {
+    var elVideoStreamIndex: Int32 { -1 }
     var audioStreamIndices: [Int32] { [] }
     func setCachedAudioStreams(_ indices: Set<Int32>) {}
     var lastDemuxInterrupted: Bool { false }

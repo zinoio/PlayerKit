@@ -22,6 +22,30 @@ final class FFmpegVideoDecoder {
     /// read once from `AV_PKT_DATA_DOVI_CONF` in codecpar coded_side_data.
     /// Per-frame Level 1 / Level 6 come from `AV_FRAME_DATA_DOVI_METADATA`.
     private let doviConfig: DolbyVisionFrameMetadata?
+    /// True when `AV_PKT_DATA_DOVI_CONF.el_present_flag != 0`.
+    private let doviElPresent: Bool
+    /// True when container extradata is MP4/MKV `hvcC` (length-prefixed NALs);
+    /// false for Annex-B streams (MPEG-TS / M2TS).
+    private let isLengthPrefixedPacket: Bool
+
+    /// Phase 3 (macOS 软解完整 P7 FEL): independent software HEVC decoder and
+    /// PTS-based frame pairer for Enhancement Layer (EL) 10-bit residual frames.
+    /// Lazily created only on macOS software decode of P7 streams with EL.
+    private var elCodecCtx: UnsafeMutablePointer<AVCodecContext>?
+    private var elPairer = DoviElFramePairer<CVPixelBuffer>(capacity: 16, tolerance: 0.025)
+    private var elDecoderFailed = false
+
+    private var elDecodeEnabled: Bool {
+        #if os(macOS)
+        return !isHardware
+            && doviConfig?.profile == 7
+            && doviElPresent
+            && !elDecoderFailed
+            && !UserDefaults.standard.bool(forKey: "doviNlqOff")
+        #else
+        return false
+        #endif
+    }
 
     // Cached YUV→BGRA conversion context for convertSWFrame(), keyed by
     // (width, height, source pixel format). Recreated only when those change
@@ -41,9 +65,19 @@ final class FFmpegVideoDecoder {
         let codecpar = stream.pointee.codecpar.pointee
         self.colorParams = colorParams
 
-        // Extract stream-level DoVi configuration record (profile + bl_signal_compat_id).
+        // Extract stream-level DoVi configuration record (profile + bl_signal_compat_id + el_present).
         // This is constant per stream; attach to every emitted DolbyVisionFrameMetadata.
-        self.doviConfig = Self.extractDoviConfig(from: stream.pointee.codecpar)
+        let (cfg, elPresent) = Self.extractDoviConfig(from: stream.pointee.codecpar)
+        self.doviConfig = cfg
+        self.doviElPresent = elPresent
+        if let ext = codecpar.extradata,
+           UInt(bitPattern: ext) >= 0x100000000,
+           codecpar.extradata_size >= 23,
+           ext[0] == 1 {
+            self.isLengthPrefixedPacket = true
+        } else {
+            self.isLengthPrefixedPacket = false
+        }
 
         // HEVC and H.264 are handled by VTVideoDecoder — its VT session
         // explicitly requests Metal-compatible IOSurface-backed pixel buffers
@@ -149,6 +183,14 @@ final class FFmpegVideoDecoder {
 
     func decode(packet: UnsafeMutablePointer<AVPacket>) -> DecodedVideoFrame? {
         guard let ctx = codecCtx else { return nil }
+        // Phase 3 (macOS 软解完整 P7 FEL): extract embedded NAL_UNSPEC63 EL
+        // sub-stream (single-track MKV/MP4) before BL decode.
+        if elDecodeEnabled, let data = packet.pointee.data, packet.pointee.size > 6 {
+            let pktView = Data(bytesNoCopy: data, count: Int(packet.pointee.size), deallocator: .none)
+            if let elAnnexB = DoviElExtractor.extractAnnexB(from: pktView, isLengthPrefixed: isLengthPrefixedPacket) {
+                decodeElAnnexB(elAnnexB, pts: packet.pointee.pts, dts: packet.pointee.dts)
+            }
+        }
         guard avcodec_send_packet(ctx, packet) == 0 else { return nil }
         var frame = av_frame_alloc()
         defer { av_frame_free(&frame) }
@@ -187,15 +229,92 @@ final class FFmpegVideoDecoder {
         // av_frame_free.
         let metadata = extractFrameMetadata(from: f)
 
+        let elPb: CVPixelBuffer?
+        if elDecodeEnabled,
+           let nlq = metadata.doviNlq, !nlq.isMEL,
+           let p = framePTS {
+            elPb = elPairer.take(matching: p)
+        } else {
+            elPb = nil
+        }
+
         if f.pointee.format == Int32(AV_PIX_FMT_VIDEOTOOLBOX.rawValue) {
             guard let pb = extractHWPixelBuffer(from: f) else { return nil }
-            return DecodedVideoFrame(pixelBuffer: pb, metadata: metadata, pts: framePTS)
+            return DecodedVideoFrame(pixelBuffer: pb, elPixelBuffer: elPb, metadata: metadata, pts: framePTS)
         } else if Self.is10BitPlanar(f.pointee.format) {
             guard let pb = create10BitBiplanarBuffer(from: f) else { return nil }
-            return DecodedVideoFrame(pixelBuffer: pb, metadata: metadata, pts: framePTS)
+            return DecodedVideoFrame(pixelBuffer: pb, elPixelBuffer: elPb, metadata: metadata, pts: framePTS)
         } else {
             guard let pb = convertSWFrame(f) else { return nil }
-            return DecodedVideoFrame(pixelBuffer: pb, metadata: metadata, pts: framePTS)
+            return DecodedVideoFrame(pixelBuffer: pb, elPixelBuffer: elPb, metadata: metadata, pts: framePTS)
+        }
+    }
+
+    // MARK: - Phase 3: P7 FEL Enhancement Layer (EL) software decode
+
+    func feedExternalElPacket(_ packet: UnsafeMutablePointer<AVPacket>) {
+        guard elDecodeEnabled,
+              let elCtx = ensureElCodecContext() else { return }
+        guard avcodec_send_packet(elCtx, packet) == 0 else { return }
+        drainElFrames(from: elCtx)
+    }
+
+    private func decodeElAnnexB(_ data: Data, pts: Int64, dts: Int64) {
+        guard let elCtx = ensureElCodecContext() else { return }
+        var pkt = av_packet_alloc()
+        guard let p = pkt else { return }
+        defer { av_packet_free(&pkt) }
+        guard av_new_packet(p, Int32(data.count)) == 0 else { return }
+        data.withUnsafeBytes { raw in
+            if let src = raw.baseAddress, let dst = p.pointee.data {
+                memcpy(dst, src, data.count)
+            }
+        }
+        p.pointee.pts = pts
+        p.pointee.dts = dts
+        guard avcodec_send_packet(elCtx, p) == 0 else { return }
+        drainElFrames(from: elCtx)
+    }
+
+    private func ensureElCodecContext() -> UnsafeMutablePointer<AVCodecContext>? {
+        if let existing = elCodecCtx { return existing }
+        guard let codec = avcodec_find_decoder(AV_CODEC_ID_HEVC),
+              let ctx = avcodec_alloc_context3(codec) else {
+            elDecoderFailed = true
+            return nil
+        }
+        ctx.pointee.time_base = streamTimeBase
+        ctx.pointee.thread_count = 0
+        guard avcodec_open2(ctx, codec, nil) == 0 else {
+            FFmpegVideoDecoder.safeFree(&elCodecCtx)
+            var tmp: UnsafeMutablePointer<AVCodecContext>? = ctx
+            FFmpegVideoDecoder.safeFree(&tmp)
+            elDecoderFailed = true
+            logger.error("P7 FEL EL software HEVC decoder open failed")
+            return nil
+        }
+        elCodecCtx = ctx
+        logger.notice("P7 FEL EL software HEVC decoder active")
+        return ctx
+    }
+
+    private func drainElFrames(from elCtx: UnsafeMutablePointer<AVCodecContext>) {
+        var elFrame = av_frame_alloc()
+        defer { av_frame_free(&elFrame) }
+        guard let f = elFrame else { return }
+        let noPTS = Int64(bitPattern: 0x8000000000000000)
+        let tb = streamTimeBase
+        while avcodec_receive_frame(elCtx, f) == 0 {
+            defer { av_frame_unref(f) }
+            guard Self.is10BitPlanar(f.pointee.format),
+                  let elPb = create10BitBiplanarBuffer(from: f) else { continue }
+            let ticks = f.pointee.best_effort_timestamp
+            guard ticks != noPTS, tb.den > 0 else { continue }
+            var elPTS = Double(ticks) * Double(tb.num) / Double(tb.den)
+            if streamStartTime != noPTS {
+                elPTS -= Double(streamStartTime) * Double(tb.num) / Double(tb.den)
+            }
+            elPairer.store(elPb, pts: elPTS)
         }
     }
 
@@ -389,18 +508,19 @@ final class FFmpegVideoDecoder {
 
     func flush() {
         if let ctx = codecCtx { avcodec_flush_buffers(ctx) }
+        if let elCtx = elCodecCtx { avcodec_flush_buffers(elCtx) }
+        elPairer.clear()
     }
 
     // MARK: - Dolby Vision metadata extraction
 
     /// Read stream-level `AVDOVIDecoderConfigurationRecord` from codecpar
-    /// `coded_side_data`. This carries `dv_profile` and
-    /// `dv_bl_signal_compatibility_id`, both constant per stream. Returns nil
-    /// for non-Dolby-Vision streams (no DOVI_CONF side data).
-    private static func extractDoviConfig(from codecpar: UnsafeMutablePointer<AVCodecParameters>?) -> DolbyVisionFrameMetadata? {
-        guard let cp = codecpar else { return nil }
+    /// `coded_side_data`. This carries `dv_profile`, `dv_bl_signal_compatibility_id`,
+    /// and `el_present_flag`, all constant per stream.
+    private static func extractDoviConfig(from codecpar: UnsafeMutablePointer<AVCodecParameters>?) -> (DolbyVisionFrameMetadata?, Bool) {
+        guard let cp = codecpar else { return (nil, false) }
         let nb = Int(cp.pointee.nb_coded_side_data)
-        guard nb > 0, let sideData = cp.pointee.coded_side_data else { return nil }
+        guard nb > 0, let sideData = cp.pointee.coded_side_data else { return (nil, false) }
         for i in 0..<nb {
             let sd = sideData[i]
             if sd.type == AV_PKT_DATA_DOVI_CONF, let data = sd.data {
@@ -408,11 +528,12 @@ final class FFmpegVideoDecoder {
                 var m = DolbyVisionFrameMetadata()
                 m.profile = cfg.dv_profile
                 m.blSignalCompatibilityId = cfg.dv_bl_signal_compatibility_id
+                let elPresent = cfg.el_present_flag != 0
                 logger.info("DV stream config: profile=\(cfg.dv_profile) bl_compat_id=\(cfg.dv_bl_signal_compatibility_id) el=\(cfg.el_present_flag)")
-                return m
+                return (m, elPresent)
             }
         }
-        return nil
+        return (nil, false)
     }
 
     // MARK: - DoVi DM block parsing (pure, unit-tested)
@@ -827,6 +948,8 @@ final class FFmpegVideoDecoder {
 
     deinit {
         FFmpegVideoDecoder.safeFree(&self.codecCtx)
+        FFmpegVideoDecoder.safeFree(&self.elCodecCtx)
+        elPairer.clear()
         if hwDeviceCtx != nil { av_buffer_unref(&self.hwDeviceCtx) }
         if let sws = swsCtx { sws_freeContext(sws) }
         logger.info("deinit, decoded \(self.decodedFrames) frames")

@@ -104,6 +104,8 @@ final class FFmpegDemuxer: @unchecked Sendable {
     private(set) var lastSeekLandedPTS: Double?
 
     var videoStreamIndex: Int32 { videoStream.map { $0.pointee.index } ?? -1 }
+    private(set) var elVideoStream: UnsafeMutablePointer<AVStream>?
+    var elVideoStreamIndex: Int32 { elVideoStream.map { $0.pointee.index } ?? -1 }
     var audioStreamIndex: Int32 { audioStream.map { $0.pointee.index } ?? -1 }
     /// 所有音频流的下标(zyno#171:决定是否启用备选音轨缓存、缓存哪些流)。
     var audioStreamIndices: [Int32] {
@@ -392,7 +394,12 @@ final class FFmpegDemuxer: @unchecked Sendable {
     private func applyStreamDiscard() {
         guard let ctx = formatCtx else { return }
         let nb = Int(ctx.pointee.nb_streams)
-        let keep: Set<Int32> = Set([videoStream, audioStream, subtitleStream]
+        #if os(macOS)
+        let keepStreams: [UnsafeMutablePointer<AVStream>?] = [videoStream, elVideoStream, audioStream, subtitleStream]
+        #else
+        let keepStreams: [UnsafeMutablePointer<AVStream>?] = [videoStream, audioStream, subtitleStream]
+        #endif
+        let keep: Set<Int32> = Set(keepStreams
             .compactMap { $0?.pointee.index }).union(cachedAudioStreams)
         for i in 0..<nb {
             guard let s = ctx.pointee.streams[i] else { continue }
@@ -717,6 +724,28 @@ final class FFmpegDemuxer: @unchecked Sendable {
                 if audioStream == nil || score > audioStreamScore {
                     audioStream = stream
                     audioStreamScore = score
+                }
+            }
+        }
+
+        // Phase 3 (macOS 软解完整 P7 FEL): detect secondary HEVC Enhancement
+        // Layer stream in dual-track M2TS/BDMV containers (e.g. PID 0x1015
+        // 1920x1080 10-bit HEVC alongside main 3840x2160 HEVC BL).
+        elVideoStream = nil
+        if let mainVS = videoStream,
+           mainVS.pointee.codecpar.pointee.codec_id == AV_CODEC_ID_HEVC {
+            let mainIdx = mainVS.pointee.index
+            let mainW = Int(mainVS.pointee.codecpar.pointee.width)
+            for i in 0..<Int(nbStreams) {
+                guard let s = ctx.pointee.streams[i],
+                      s.pointee.index != mainIdx,
+                      s.pointee.codecpar.pointee.codec_type == AVMEDIA_TYPE_VIDEO,
+                      s.pointee.codecpar.pointee.codec_id == AV_CODEC_ID_HEVC else { continue }
+                let w = Int(s.pointee.codecpar.pointee.width)
+                if w == 0 || mainW == 0 || w <= mainW {
+                    elVideoStream = s
+                    logger.info("detected secondary HEVC EL stream idx=\(s.pointee.index) \(w)x\(s.pointee.codecpar.pointee.height)")
+                    break
                 }
             }
         }

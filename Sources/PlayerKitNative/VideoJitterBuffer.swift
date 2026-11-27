@@ -6,12 +6,26 @@ final class VideoJitterBuffer: @unchecked Sendable {
 
     struct Frame {
         let pixelBuffer: CVPixelBuffer
+        let elPixelBuffer: CVPixelBuffer?
         let pts: Double
         let metadata: FrameMetadata
 
+        init(pixelBuffer: CVPixelBuffer,
+             elPixelBuffer: CVPixelBuffer? = nil,
+             pts: Double,
+             metadata: FrameMetadata) {
+            self.pixelBuffer = pixelBuffer
+            self.elPixelBuffer = elPixelBuffer
+            self.pts = pts
+            self.metadata = metadata
+        }
+
         /// Bytes this frame holds. A frame is a decoded picture, so this is what
         /// actually costs memory (a 4K 10-bit HDR frame is ~18.5 MB).
-        var byteSize: Int { CVPixelBufferGetDataSize(pixelBuffer) }
+        var byteSize: Int {
+            CVPixelBufferGetDataSize(pixelBuffer)
+                + (elPixelBuffer.map { CVPixelBufferGetDataSize($0) } ?? 0)
+        }
     }
 
     enum State: Equatable { case playing, buffering }
