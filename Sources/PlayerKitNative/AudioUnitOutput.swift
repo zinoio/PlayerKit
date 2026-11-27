@@ -380,6 +380,31 @@ public final class AudioUnitOutput: AudioOutputBackend {
             }
         }
 
+        // Initialize the callback-side accounting BEFORE AudioQueueStart.
+        // AudioQueueStart can deliver the three primer callbacks immediately;
+        // if pendingPrimerCallbacks is still 0 at that point, those callbacks
+        // are misclassified as real frames. The three real frames they should
+        // have cancelled are then misclassified as primers, leaving phantom
+        // pending samples and an audio clock short by the same amount. On CI
+        // this showed up as a 3–8 frame deficit (the paused-enqueue flake).
+        // Keep audioQueue unset until after start so enqueue() cannot observe
+        // a not-yet-started queue; callbacks only need the counters below.
+        lock.lock()
+        // 新队列的 sampleTime 从 0 起算,内容基准取当前时钟位置(seek 时
+        // 调用方已先 audioClock.reset(to: target),这里正好对上)。
+        _deviceBaseContent = clock.audioTime
+        _deviceBaseSample = 0
+        enqueuedFrames = 0
+        bufferedFrameCount = 0
+        pendingPrimerCallbacks = primerCount
+        bufferedSamples = 0
+        takenOutputSamples = 0
+        leadAnchorWall = 0
+        leadAnchorTaken = 0
+        lastCallbackWall = 0
+        contentFifo.removeAll(); playedContentEndPTS = .nan
+        lock.unlock()
+
         // #608:Start 失败不再静默——连续失败越过阈值触发降级(设备死亡
         // 时每次重建都是一次 HAL 喂锤,必须在源头记账)。
         let startRC = Self.startImpl(queue)
@@ -396,19 +421,6 @@ public final class AudioUnitOutput: AudioOutputBackend {
         audioQueue = queue
         running = true
         paused = false
-        // 新队列的 sampleTime 从 0 起算,内容基准取当前时钟位置(seek 时
-        // 调用方已先 audioClock.reset(to: target),这里正好对上)。
-        _deviceBaseContent = clock.audioTime
-        _deviceBaseSample = 0
-        enqueuedFrames = 0
-        bufferedFrameCount = 0
-        pendingPrimerCallbacks = primerCount
-        bufferedSamples = 0
-        takenOutputSamples = 0
-        leadAnchorWall = 0
-        leadAnchorTaken = 0
-        lastCallbackWall = 0
-        contentFifo.removeAll(); playedContentEndPTS = .nan
         lock.unlock()
 
         logger.info("started: \(sr)Hz \(ch)ch")
@@ -819,8 +831,19 @@ public final class AudioUnitOutput: AudioOutputBackend {
         // controlQueue.async 下发的,AudioToolbox 内部 IO-cycle 等待可能让它
         // 晚到;此间回调若继续消耗缓冲,会把音频时钟推过暂停位置(2026-11-15
         // 真机:恢复后位置 = 暂停位置 + 暂停时长,画面跳过整个暂停段)。
+        // 但 primer 回调必须照常记账:start() 后立刻 pause() 时,primer 可能
+        // 已被设备消费而回调现在才到;若这里直接丢弃, pendingPrimerCallbacks
+        // 会永远停在 3,随后 3 个真实帧会被误判成 primer 而不计入时钟/缓冲,
+        // 造成 3 帧(32ms)的固定缺口(CI paused-enqueue flake 的根因)。
+        // primer 是静音且不推进内容时钟,处理它不会造成暂停位置前跳。
         if paused {
+            let ch = _channels
+            let isPrimer = pendingPrimerCallbacks > 0
+            if isPrimer { pendingPrimerCallbacks -= 1 }
             lock.unlock()
+            if isPrimer {
+                clock.advancePrimer(byteCount: byteCount, channels: ch)
+            }
             return
         }
         if bufferedFrameCount > 0 { bufferedFrameCount &-= 1 }
