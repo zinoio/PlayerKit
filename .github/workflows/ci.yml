@@ -40,6 +40,11 @@ jobs:
         run: xcrun swift build -v
 
       - name: Test
+        env:
+          # GitHub 托管 runner 无真实显示刷新/音频设备:依赖真实 AV 设备的
+          # 时序/接线路由用例在 CI 上随机挂(同一 commit 两次 run 一过一挂)。
+          # 这些用例在本地/真机全量覆盖,CI 显式跳过。
+          PLAYERKIT_CI_SKIP_AV_DEVICE_TESTS: "1"
         run: xcrun swift test --parallel
 
   lint:
