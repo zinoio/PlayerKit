@@ -25,6 +25,12 @@ import XCTest
 /// gate for that root cause, not just a sanity check — see assertSanePacing.
 final class AVSyncJitterMeasurementTests: XCTestCase {
 
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        try XCTSkipIf(ProcessInfo.processInfo.environment["PLAYERKIT_CI_SKIP_AV_DEVICE_TESTS"] == "1",
+                      "CI 无真实音视频设备,跳过 AV 同步抖动测量")
+    }
+
     private func fixtureURL(_ name: String, _ ext: String) -> URL {
         Bundle.module.url(forResource: name, withExtension: ext, subdirectory: "Fixtures")!
     }

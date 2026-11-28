@@ -77,6 +77,41 @@ This downloads FFmpeg source, builds for the configured Apple platforms, and rep
 - Unit tests live in `Tests/PlayerKitTests/`. Every public API change should come with a test.
 - Run `xcrun swift test` before pushing. CI runs the same.
 
+### Device-dependent tests skipped in CI
+
+GitHub-hosted `macos-15` runners have no reliable display refresh or audio
+device: `CVDisplayLink` may be created without ever ticking, and the audio
+clock does not advance. Tests that assert real-time AV behavior are therefore
+skipped on CI via `PLAYERKIT_CI_SKIP_AV_DEVICE_TESTS=1` (set in `ci.yml` and
+`nightly.yml`):
+
+| Test / class | Depends on |
+|---|---|
+| `NativeBackendSystemDVTests` (whole class) | system DV path, display ticks, audio master clock |
+| `AudioUnitOutputControlNonBlockingTests` (whole class) | real-time pause/resume audio clock |
+| `AudioUnitOutputPausedEnqueueTests` (whole class) | real-time enqueue/flush pacing |
+| `AudioUnitOutputRecoveryTests` (whole class) | real-time burst pacing |
+| `AudioDeviceDemotionTests.testDemotedResumeSkipsStartCalls` | HAL start-call wiring |
+| `AudioDeviceDemotionTests.testDemotedEnqueueDropsFramesWithoutStart` | HAL start-call wiring |
+| `PlaybackSpeedMeasurementTests` (whole class) | real-time 1x/2x playback speed |
+| `AVSyncJitterMeasurementTests` (whole class) | real-time A/V offset windows |
+| `ResumeAVSyncTests` (whole class) | real-time pause/resume sync |
+| `TwoStepStartAVSyncTests` (whole class) | real-time play-then-seek sync |
+
+These tests still run locally and on real devices (default path — just don't
+set the variable). If you add a test that waits for real audio/display timing,
+guard it the same way:
+
+```swift
+override func setUpWithError() throws {
+    try super.setUpWithError()
+    try XCTSkipIf(ProcessInfo.processInfo.environment["PLAYERKIT_CI_SKIP_AV_DEVICE_TESTS"] == "1",
+                  "CI has no real AV device")
+}
+```
+
+and add it to the table above.
+
 ## Commit rules
 
 - One feature per commit. If a change spans multiple files, stage them all together.
