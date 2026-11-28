@@ -16,15 +16,15 @@ final class AudioUnitOutputVolumeTests: XCTestCase {
     private let sampleRate: Int32 = 48000
 
     private var captured: [Float] = []
-    private var savedImpl: ((AudioQueueRef, Float) -> OSStatus)!
+    private var savedImpl: ((AudioComponentInstance, Float) -> OSStatus)!
 
     override func setUp() {
         super.setUp()
         captured = []
         savedImpl = AudioUnitOutput.setVolumeParamImpl
-        AudioUnitOutput.setVolumeParamImpl = { [weak self] queue, volume in
+        AudioUnitOutput.setVolumeParamImpl = { [weak self] _, volume in
             self?.captured.append(volume)
-            return AudioQueueSetParameter(queue, kAudioQueueParam_Volume, volume)
+            return noErr
         }
     }
 

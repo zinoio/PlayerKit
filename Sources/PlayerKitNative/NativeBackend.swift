@@ -3300,6 +3300,11 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
             return pt + audioClock.fullDelay
         }
         if !systemDVActive, audioClock.hasConsumedOutput {
+            let latency = audioUnitOutput?.hardwareOutputLatency ?? 0
+            if latency > 0 {
+                let rate = displayLoopLock.withLock { displayRate }
+                return audioClock.audioTime - latency * rate
+            }
             return audioClock.audioTime
         }
         // 兜底:音频尚未产出(首播前)时的设备时钟;cons 有值即不再使用。

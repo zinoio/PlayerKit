@@ -16,8 +16,8 @@ import AudioToolbox
 final class AudioUnitOutputControlNonBlockingTests: XCTestCase {
 
     override func tearDown() {
-        AudioUnitOutput.pauseImpl = { AudioQueuePause($0) }
-        AudioUnitOutput.startImpl = { AudioQueueStart($0, nil) }
+        AudioUnitOutput.pauseImpl = { AudioOutputUnitStop($0) }
+        AudioUnitOutput.startImpl = { AudioOutputUnitStart($0) }
         super.tearDown()
     }
 
@@ -90,36 +90,33 @@ final class AudioUnitOutputControlNonBlockingTests: XCTestCase {
         releaseControlCall.signal()
     }
 
-    /// enqueue() must not block its caller on the restart AudioQueueStart
-    /// either — it runs on the demux thread, the same hot path the 2026-10-10
-    /// deadlock froze (via resume()'s synchronous Start). Contract mirrors the
-    /// pause/resume tests: the buffer goes into the queue synchronously and the
-    /// control call is issued off-thread.
+    /// With Pull-mode AudioUnit, enqueue() only copies PCM into the ring buffer
+    /// and never calls AudioOutputUnitStart — zero XPC / HAL blocking even if
+    /// startImpl is stuck (eliminates the 200–1200 Hz AudioQueueStart storm).
     func testEnqueueDoesNotBlockCallerWhenAudioQueueStartIsStuck() throws {
         let output = makeStartedOutput()
         defer { output.stop() }
         guard output.hasQueueForTesting else {
-            throw XCTSkip("no AudioQueue available in this environment")
+            throw XCTSkip("no AudioUnit available in this environment")
         }
 
-        let enteredControlCall = DispatchSemaphore(value: 0)
-        let releaseControlCall = DispatchSemaphore(value: 0)
+        var startCalls = 0
         AudioUnitOutput.startImpl = { _ in
-            enteredControlCall.signal()
-            releaseControlCall.wait()   // simulate a stuck AudioToolbox server context
+            startCalls += 1
             return noErr
         }
 
-        let callerReturned = expectation(description: "enqueue() returned to caller")
+        let callerReturned = expectation(description: "enqueue() returned immediately")
         DispatchQueue.global().async {
-            output.enqueue(PCMFrame(data: Data(count: 512 * 2 * 4), pts: 0, sampleCount: 512))
+            for _ in 0..<200 {
+                output.enqueue(PCMFrame(data: Data(count: 40 * 2 * 4), pts: 0, sampleCount: 40))
+            }
             callerReturned.fulfill()
         }
-        wait(for: [callerReturned], timeout: 5)
+        wait(for: [callerReturned], timeout: 2)
 
-        XCTAssertEqual(enteredControlCall.wait(timeout: .now() + 5), .success,
-            "enqueue() must still issue the restart AudioQueueStart, only asynchronously")
-        releaseControlCall.signal()
+        XCTAssertEqual(startCalls, 0,
+            "Pull-mode enqueue() must never call AudioOutputUnitStart (zero XPC storm)")
     }
 
     /// pause() → resume() must end UP resumed: the serial control queue keeps
