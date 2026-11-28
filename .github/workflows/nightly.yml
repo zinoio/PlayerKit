@@ -1,4 +1,7 @@
-# Nightly corpus regression (P6b): ci.yml + schedule, nothing else.
+# Nightly corpus regression (P6b): scheduled run only.
+# PR / main pushes are already covered by ci.yml — having nightly.yml also
+# trigger on pull_request/push ran Build & Test twice per PR (2026-11-28:
+# two identical macOS jobs, same commit, one sometimes flaky).
 # On failure the run just fails (existing notifications cover it). To file a
 # hdr-verify issue from a locally archived session, run the reflux repo's
 # `Tools/verify-report-to-issue.py` (dry-run by default) and
@@ -7,12 +10,9 @@
 name: Nightly
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
   schedule:
     - cron: "0 3 * * *"
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
