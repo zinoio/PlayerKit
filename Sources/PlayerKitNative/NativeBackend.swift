@@ -228,6 +228,7 @@ public final class NativeBackend: PlayerBackend, SubtitleFontConfigurable {
     nonisolated(unsafe) var firstTickLogged = false
     nonisolated(unsafe) var lastBypassPopTime: Double = 0
     nonisolated(unsafe) var lastNotifiedPos: Duration = .zero
+    nonisolated(unsafe) var lastNotifiedFELActive = false
     nonisolated(unsafe) var passthroughWallClockAnchor: (wall: Double, pts: Double)?
     nonisolated(unsafe) var forceClockCalibration = false
     nonisolated(unsafe) var audioDeviceDemoted = false

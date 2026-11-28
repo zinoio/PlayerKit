@@ -573,11 +573,15 @@ extension NativeBackend {
             colorMatrix: isHDR ? "\(colorParams.matrix)" : nil,
             transfer: isHDR ? "\(colorParams.transfer)" : nil,
             isDolbyVision: demuxer.isDolbyVision,
+            doviProfile: demuxer.doviProfile,
+            doviElPresent: demuxer.doviElPresent,
             fps: fps,
             profile: profile,
             level: cp.level > 0 ? Int(cp.level) : nil,
             bitrate: cp.bit_rate > 0 ? cp.bit_rate : nil
         )
+        state.doviFELActive = false
+        displayLoopLock.withLock { lastNotifiedFELActive = false }
         state.videoBitrateIsEstimated = false
         if demuxer.isDolbyVision {
             logger.notice("[dovi-probe] DOVI_CONF present: profile=\(demuxer.doviProfile) blCompatId=\(demuxer.doviBLSignalCompatibilityId) isHDR=\(isHDR, privacy: .public)")
