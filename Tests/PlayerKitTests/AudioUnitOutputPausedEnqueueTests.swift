@@ -16,6 +16,12 @@ import XCTest
 /// 52 dropped frames (0.555 s) ⇔ a +0.561 s audio-vs-clock step.
 final class AudioUnitOutputPausedEnqueueTests: XCTestCase {
 
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        try XCTSkipIf(ProcessInfo.processInfo.environment["PLAYERKIT_CI_SKIP_AV_DEVICE_TESTS"] == "1",
+                      "CI 无真实音频设备,跳过 AudioUnitOutput 实时播放用例")
+    }
+
     private let sampleRate: Int32 = 48000
     private let samplesPerFrame = 512  // one DTS core frame — the size the app enqueues
 
