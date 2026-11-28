@@ -17,6 +17,12 @@ final class ResumeAVSyncTests: XCTestCase {
     private var savedLog = false
     private var savedMute = false
 
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        try XCTSkipIf(ProcessInfo.processInfo.environment["PLAYERKIT_CI_SKIP_AV_DEVICE_TESTS"] == "1",
+                      "CI 无真实音视频设备,跳过真实播放 AV 同步用例")
+    }
+
     override func setUp() {
         savedLog = AudioUnitOutput.tracksPlayedContent; savedMute = AudioUnitOutput.mutedForTesting
         AudioUnitOutput.tracksPlayedContent = true   // enables the played-content tracking used by the seam
@@ -77,6 +83,12 @@ final class TwoStepStartAVSyncTests: XCTestCase {
 
     private var savedLog = false
     private var savedMute = false
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        try XCTSkipIf(ProcessInfo.processInfo.environment["PLAYERKIT_CI_SKIP_AV_DEVICE_TESTS"] == "1",
+                      "CI 无真实音视频设备,跳过真实播放 AV 同步用例")
+    }
+
     override func setUp() {
         continueAfterFailure = false
         savedLog = AudioUnitOutput.tracksPlayedContent; savedMute = AudioUnitOutput.mutedForTesting

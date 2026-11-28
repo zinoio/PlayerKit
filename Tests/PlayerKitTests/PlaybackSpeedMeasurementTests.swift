@@ -15,6 +15,12 @@ import XCTest
 ///     mirrors the known-good source)
 final class PlaybackSpeedMeasurementTests: XCTestCase {
 
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        try XCTSkipIf(ProcessInfo.processInfo.environment["PLAYERKIT_CI_SKIP_AV_DEVICE_TESTS"] == "1",
+                      "CI 无真实音视频设备,跳过真实播放速度测量")
+    }
+
     /// Relative tolerance for measured playback speed: `|speed − expected| ≤
     /// fraction × expected`.  RELATIVE on purpose — CI load throttles decode
     /// proportionally (the full-suite runs of zyno#111 measured a 0.69x
