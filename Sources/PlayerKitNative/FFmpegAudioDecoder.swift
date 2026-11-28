@@ -38,6 +38,7 @@ private func srFromASC(_ data: UnsafePointer<UInt8>, _ size: Int32) -> Int32? {
 final class FFmpegAudioDecoder {
     private var codecCtx: UnsafeMutablePointer<AVCodecContext>?
     private var swrCtx: OpaquePointer?
+    private var reusableFrame: UnsafeMutablePointer<AVFrame>?
     let outputSampleRate: Int32
     let outputChannels: Int32
     private let inputChannels: Int32
@@ -117,35 +118,73 @@ final class FFmpegAudioDecoder {
 
     func decode(packet: UnsafeMutablePointer<AVPacket>) -> PCMFrame? {
         guard let ctx = codecCtx else { return nil }
-        let sendRet = avcodec_send_packet(ctx, packet)
-        guard sendRet == 0 else {
+        if reusableFrame == nil {
+            reusableFrame = av_frame_alloc()
+        }
+        guard let frame = reusableFrame else { return nil }
+
+        var firstFrame: PCMFrame?
+        var combinedData: Data?
+        var combinedSamples = 0
+        var combinedPts = Double.nan
+
+        // FFmpeg AVERROR_EOF = -MKTAG('E','O','F',' ') = -541478725
+        let averrorEOF: Int32 = -541_478_725
+        func drainFrames() {
+            while true {
+                let recvRet = avcodec_receive_frame(ctx, frame)
+                if recvRet == -Int32(EAGAIN) || recvRet == averrorEOF {
+                    break
+                }
+                guard recvRet == 0 else {
+                    failedReceives += 1
+                    if failedReceives <= 5 || failedReceives % 50 == 0 {
+                        logger.error("receive_frame[\(self.failedReceives)] ret=\(recvRet)")
+                    }
+                    break
+                }
+                if decodedFrames == 0 {
+                    logger.info("first frame: sr=\(frame.pointee.sample_rate) nb=\(frame.pointee.nb_samples) fmt=\(frame.pointee.format) ch=\(frame.pointee.ch_layout.nb_channels)")
+                }
+                decodedFrames += 1
+                let pts = Double(frame.pointee.pts)
+                    * Double(frame.pointee.time_base.num)
+                    / Double(max(frame.pointee.time_base.den, 1))
+                if let pcm = resample(frame: frame, pts: pts) {
+                    if firstFrame == nil {
+                        firstFrame = pcm
+                        combinedPts = pcm.pts
+                        combinedSamples = pcm.sampleCount
+                    } else {
+                        if combinedData == nil {
+                            combinedData = firstFrame!.data
+                        }
+                        combinedData!.append(pcm.data)
+                        combinedSamples += pcm.sampleCount
+                    }
+                }
+                av_frame_unref(frame)
+            }
+        }
+
+        var sendRet = avcodec_send_packet(ctx, packet)
+        if sendRet == -Int32(EAGAIN) {
+            // 解码器内部仍有未取走的输出帧(多帧 PES / TrueHD 突发包):先排干再重发,不丢包。
+            drainFrames()
+            sendRet = avcodec_send_packet(ctx, packet)
+        }
+        if sendRet != 0 {
             failedPackets += 1
-            if failedPackets <= 3 {
+            if failedPackets <= 5 || failedPackets % 50 == 0 {
                 logger.error("send_packet FAILED ret=\(sendRet) (#\(self.failedPackets))")
             }
-            return nil
         }
+        drainFrames()
 
-        var frame = av_frame_alloc()
-        defer { av_frame_free(&frame) }
-
-        let recvRet = avcodec_receive_frame(ctx, frame)
-        guard recvRet == 0, let f = frame else {
-            failedReceives += 1
-            if failedReceives <= 5 || failedReceives % 50 == 0 {
-                logger.error("receive_frame[\(self.failedReceives)] ret=\(recvRet)")
-            }
-            return nil
+        if let data = combinedData {
+            return PCMFrame(data: data, pts: combinedPts, sampleCount: combinedSamples)
         }
-
-        if decodedFrames == 0 {
-            logger.info("first frame: sr=\(f.pointee.sample_rate) nb=\(f.pointee.nb_samples) fmt=\(f.pointee.format) ch=\(f.pointee.ch_layout.nb_channels)")
-        }
-        decodedFrames += 1
-        let pts = Double(f.pointee.pts)
-            * Double(f.pointee.time_base.num)
-            / Double(max(f.pointee.time_base.den, 1))
-        return resample(frame: f, pts: pts)
+        return firstFrame
     }
 
     private func resample(frame: UnsafeMutablePointer<AVFrame>, pts: Double) -> PCMFrame? {
@@ -216,6 +255,7 @@ final class FFmpegAudioDecoder {
     }
 
     deinit {
+        if reusableFrame != nil { av_frame_free(&reusableFrame) }
         avcodec_free_context(&codecCtx)
         if swrCtx != nil { swr_free(&swrCtx) }
         logger.info("deinit, decoded \(self.decodedFrames) frames")
