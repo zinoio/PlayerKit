@@ -17,11 +17,11 @@ final class AudioDeviceDemotionTests: XCTestCase {
 
     override func setUp() {
         super.setUp()
-        AudioUnitOutput.startImpl = { AudioQueueStart($0, nil) }
+        AudioUnitOutput.startImpl = { AudioOutputUnitStart($0) }
     }
 
     override func tearDown() {
-        AudioUnitOutput.startImpl = { AudioQueueStart($0, nil) }
+        AudioUnitOutput.startImpl = { AudioOutputUnitStart($0) }
         super.tearDown()
     }
 

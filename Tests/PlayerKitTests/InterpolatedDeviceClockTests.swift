@@ -94,7 +94,7 @@ final class MasterClockCacheWiringTests: XCTestCase {
     private let sampleRate: Int32 = 48000
     private var savedMute = false
     private var savedFreshWindow: TimeInterval?
-    private var savedGetCurrentTime: ((AudioQueueRef) -> (sampleTime: Double, valid: Bool))!
+    private var savedGetCurrentTime: ((AudioComponentInstance) -> (sampleTime: Double, valid: Bool))?
 
     override func setUp() {
         super.setUp()
@@ -111,9 +111,7 @@ final class MasterClockCacheWiringTests: XCTestCase {
         super.tearDown()
     }
 
-    /// 暖机:轮询到设备时间可读。AudioQueueStart 刚落地时 GetCurrentTime 会
-    /// 瞬时失败(AudioToolbox server 尚未注册完 IO;生产首读同样可能 nil,
-    /// 旧行为一致,由下一帧显示循环自然重试)。
+    /// 暖机:轮询到设备时间可读。
     private func warmUp(_ output: AudioUnitOutput) -> Bool {
         let deadline = Date().addingTimeInterval(2)
         while Date() < deadline {
@@ -133,12 +131,10 @@ final class MasterClockCacheWiringTests: XCTestCase {
     }
 
     private func countingGetCurrentTime(_ counter: CounterBox)
-        -> (AudioQueueRef) -> (sampleTime: Double, valid: Bool) {
-        return { queue in
+        -> (AudioComponentInstance) -> (sampleTime: Double, valid: Bool) {
+        return { _ in
             counter.value += 1
-            var ts = AudioTimeStamp()
-            let rc = AudioQueueGetCurrentTime(queue, nil, &ts, nil)
-            return (ts.mSampleTime, rc == noErr && ts.mFlags.contains(.sampleTimeValid))
+            return (Double(counter.value * 480), true)
         }
     }
 
