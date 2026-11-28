@@ -15,6 +15,12 @@ import AudioToolbox
 /// but NEVER block the caller on the AudioQueue control call itself.
 final class AudioUnitOutputControlNonBlockingTests: XCTestCase {
 
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        try XCTSkipIf(ProcessInfo.processInfo.environment["PLAYERKIT_CI_SKIP_AV_DEVICE_TESTS"] == "1",
+                      "CI 无真实音频设备,跳过 AudioUnitOutput 实时播放用例")
+    }
+
     override func tearDown() {
         AudioUnitOutput.pauseImpl = { AudioOutputUnitStop($0) }
         AudioUnitOutput.startImpl = { AudioOutputUnitStart($0) }

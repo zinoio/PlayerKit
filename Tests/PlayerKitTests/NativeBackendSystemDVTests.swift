@@ -14,7 +14,13 @@ final class NativeBackendSystemDVTests: XCTestCase {
 
     private var savedMute = false
 
-    override func setUp() {
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        // GitHub 托管 runner 无真实显示刷新/音频设备:CVDisplayLink 可能创建成功
+        // 但不 tick、音频主时钟不推进,时序断言随机挂(同一 commit 两次 run 一过一挂)。
+        // 本地/真机仍全量覆盖;CI 用显式环境变量跳过整组集成/时序用例。
+        try XCTSkipIf(ProcessInfo.processInfo.environment["PLAYERKIT_CI_SKIP_AV_DEVICE_TESTS"] == "1",
+                      "CI 无真实显示/音频设备,跳过系统 DV 时序集成用例")
         savedMute = AudioUnitOutput.mutedForTesting
         AudioUnitOutput.mutedForTesting = true   // 静音:不骚扰开发机
     }
