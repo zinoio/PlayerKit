@@ -32,6 +32,7 @@ protocol PacketDemuxing: AnyObject, Sendable {
     var isPassthroughCodec: Bool { get }
     var isDolbyVision: Bool { get }
     var doviProfile: UInt8 { get }
+    var doviElPresent: Bool { get }
     var doviBLSignalCompatibilityId: UInt8 { get }
     var hasHDR10Plus: Bool { get }
     /// HDR-relevant stream attributes for the renderer strategy decision
@@ -82,6 +83,7 @@ extension FFmpegDemuxer: PacketDemuxing {}
 
 extension PacketDemuxing {
     var elVideoStreamIndex: Int32 { -1 }
+    var doviElPresent: Bool { false }
     var audioStreamIndices: [Int32] { [] }
     func setCachedAudioStreams(_ indices: Set<Int32>) {}
     var lastDemuxInterrupted: Bool { false }

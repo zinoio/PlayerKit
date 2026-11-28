@@ -65,6 +65,9 @@ public struct PlayerState: @unchecked Sendable {
     /// True when `videoInfo.bitrate` was filled by the demux EMA because the
     /// container did not declare a stream bitrate (P1 diagnostics).
     public var videoBitrateIsEstimated: Bool = false
+    /// True when Dolby Vision Profile 7 Full Enhancement Layer (FEL) NLQ residual
+    /// reconstruction is actively running on rendered frames.
+    public var doviFELActive: Bool = false
 
     public init() {}
 }
@@ -131,8 +134,12 @@ public struct VideoInfo: Sendable, Equatable {
     public let colorMatrix: String?
     /// Transfer characteristic (e.g. "smpte2084").
     public let transfer: String?
-    /// Whether the stream is Dolby Vision (profile 5/8/9 detected via DOVI_CONF side data).
+    /// Whether the stream is Dolby Vision (profile 5/7/8/9 detected via DOVI_CONF side data).
     public let isDolbyVision: Bool
+    /// Dolby Vision profile number (e.g. 5, 7, 8, 9), 0 when not Dolby Vision or unknown.
+    public var doviProfile: UInt8
+    /// True when the Dolby Vision stream declares an Enhancement Layer (`el_present_flag != 0`).
+    public var doviElPresent: Bool
     /// Frame rate in fps (from avg_frame_rate), nil when unknown.
     public var fps: Double?
     /// Codec profile name (e.g. "Main 10"), nil when unknown.
@@ -145,6 +152,7 @@ public struct VideoInfo: Sendable, Equatable {
     public init(width: Int, height: Int, codec: String? = nil,
                 isHDR: Bool = false, colorMatrix: String? = nil,
                 transfer: String? = nil, isDolbyVision: Bool = false,
+                doviProfile: UInt8 = 0, doviElPresent: Bool = false,
                 fps: Double? = nil, profile: String? = nil,
                 level: Int? = nil, bitrate: Int64? = nil) {
         self.width = width
@@ -154,6 +162,8 @@ public struct VideoInfo: Sendable, Equatable {
         self.colorMatrix = colorMatrix
         self.transfer = transfer
         self.isDolbyVision = isDolbyVision
+        self.doviProfile = doviProfile
+        self.doviElPresent = doviElPresent
         self.fps = fps
         self.profile = profile
         self.level = level

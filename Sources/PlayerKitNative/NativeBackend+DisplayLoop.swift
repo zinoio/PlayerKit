@@ -25,6 +25,7 @@ extension NativeBackend {
         var subtitleText: String?? = nil
         var subtitleImage: CGImage?? = nil
         var subtitleImageRect: CGRect? = nil
+        var doviFELActive: Bool? = nil
         var generation: Int
         var notify: Bool
     }
@@ -223,12 +224,25 @@ extension NativeBackend {
 
         let posDur = Duration.milliseconds(Int64(popped.pts * 1000))
         let gen = playGeneration
+        let felActiveNow = popped.elPixelBuffer != nil
+            && (popped.metadata.doviNlq.map { !$0.isMEL } ?? false)
+            && !UserDefaults.standard.bool(forKey: "doviNlqOff")
 
-        let due = displayLoopLock.withLock { (posDur - lastNotifiedPos) >= .milliseconds(500) }
-        if firstFrameRendered || due {
-            if due { displayLoopLock.withLock { lastNotifiedPos = posDur } }
-            applyDisplayUpdate(DisplayUIUpdate(position: posDur, durationAtLeast: posDur,
-                                               generation: gen, notify: true))
+        let (due, felChanged) = displayLoopLock.withLock { () -> (Bool, Bool) in
+            let posDue = (posDur - lastNotifiedPos) >= .milliseconds(500)
+            if posDue { lastNotifiedPos = posDur }
+            let felDiff = felActiveNow != lastNotifiedFELActive
+            if felDiff { lastNotifiedFELActive = felActiveNow }
+            return (posDue, felDiff)
+        }
+        if firstFrameRendered || due || felChanged {
+            applyDisplayUpdate(DisplayUIUpdate(
+                position: posDur,
+                durationAtLeast: posDur,
+                doviFELActive: felChanged ? felActiveNow : nil,
+                generation: gen,
+                notify: true
+            ))
         }
 
         updateActiveSubtitles(displayPts: popped.pts, posDur: posDur, generation: gen)
@@ -452,6 +466,7 @@ extension NativeBackend {
             state.currentSubtitleImage = img
             state.currentSubtitleImageRect = u.subtitleImageRect ?? .zero
         }
+        if let fel = u.doviFELActive { state.doviFELActive = fel }
         state.audioOutputDegraded = displayLoopLock.withLock { audioDeviceDemoted }
 
         if u.notify { notifyStateChange() }

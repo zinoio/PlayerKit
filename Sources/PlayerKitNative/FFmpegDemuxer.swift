@@ -204,6 +204,9 @@ final class FFmpegDemuxer: @unchecked Sendable {
     /// DV profile (4/5/7/8). 0 when the stream is not Dolby Vision.
     var doviProfile: UInt8 { doviConfiguration?.dv_profile ?? 0 }
 
+    /// True when the DV config record declares an Enhancement Layer (`el_present_flag != 0`).
+    var doviElPresent: Bool { (doviConfiguration?.el_present_flag ?? 0) != 0 }
+
     /// BL signal compatibility id from the DV config record. 0 for non-DV
     /// streams. Verified semantics (2026-10-28, Chromium constants + c5
     /// ffprobe gold standard): 1 = HDR10-compatible base, 2 = SDR, 4 = HLG,

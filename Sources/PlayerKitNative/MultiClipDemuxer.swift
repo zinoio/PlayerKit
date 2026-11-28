@@ -325,6 +325,7 @@ extension MultiClipDemuxer: PacketDemuxing {
     var isPassthroughCodec: Bool { currentDemuxer?.isPassthroughCodec ?? false }
     var isDolbyVision: Bool { currentDemuxer?.isDolbyVision ?? false }
     var doviProfile: UInt8 { currentDemuxer?.doviProfile ?? 0 }
+    var doviElPresent: Bool { currentDemuxer?.doviElPresent ?? false }
     var doviBLSignalCompatibilityId: UInt8 { currentDemuxer?.doviBLSignalCompatibilityId ?? 0 }
     var hasHDR10Plus: Bool { currentDemuxer?.hasHDR10Plus ?? false }
     func videoStreamAttributes() -> VideoStreamAttributes? { currentDemuxer?.videoStreamAttributes() }
