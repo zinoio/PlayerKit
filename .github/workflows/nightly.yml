@@ -48,6 +48,8 @@ jobs:
         run: xcrun swift build -v
 
       - name: Test
+        env:
+          PLAYERKIT_CI_SKIP_AV_DEVICE_TESTS: "1"
         run: xcrun swift test --parallel
 
   lint:

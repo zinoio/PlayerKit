@@ -170,6 +170,9 @@ final class AudioDeviceDemotionTests: XCTestCase {
 
     /// 降级后 resume() 不得再调 AudioQueueStart(零打扰),降级边沿回调上报。
     func testDemotedResumeSkipsStartCalls() throws {
+        if ProcessInfo.processInfo.environment["PLAYERKIT_CI_SKIP_AV_DEVICE_TESTS"] == "1" {
+            throw XCTSkip("CI 无真实音频设备,跳过接线行为用例")
+        }
         let output = AudioUnitOutput(clock: AudioClock(), delaySecs: 0)
         output.start(sampleRate: 48000, channels: 2)
         guard output.hasQueueForTesting else {
@@ -202,6 +205,9 @@ final class AudioDeviceDemotionTests: XCTestCase {
 
     /// 降级后 enqueue 直接丢帧:不进队列、不计数、不触发 Start。
     func testDemotedEnqueueDropsFramesWithoutStart() throws {
+        if ProcessInfo.processInfo.environment["PLAYERKIT_CI_SKIP_AV_DEVICE_TESTS"] == "1" {
+            throw XCTSkip("CI 无真实音频设备,跳过接线行为用例")
+        }
         let output = AudioUnitOutput(clock: AudioClock(), delaySecs: 0)
         output.start(sampleRate: 48000, channels: 2)
         guard output.hasQueueForTesting else {
