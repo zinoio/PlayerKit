@@ -189,6 +189,14 @@ public final class AudioUnitOutput: AudioOutputBackend {
     private var diagQueueTimeLast: Double?
     private var diagQueueTimeDelta: Double = 0
     private var diagEnqueuedSamples: Int64 = 0
+    private var diagUnderrunCount = 0
+
+    func drainUnderrunCount() -> Int {
+        lock.lock(); defer { lock.unlock() }
+        let n = diagUnderrunCount
+        diagUnderrunCount = 0
+        return n
+    }
 
     public let supportsPassthrough: Bool = false
 
@@ -727,6 +735,9 @@ public final class AudioUnitOutput: AudioOutputBackend {
         let alignedRequest = (requestedBytes / bytesPerFrame) * bytesPerFrame
         let copiedBytes = ringBuffer.read(into: dst, count: alignedRequest)
         let copiedSamples = copiedBytes / bytesPerFrame
+        if copiedBytes < alignedRequest {
+            diagUnderrunCount += 1
+        }
 
         diagCallbackCount += 1
         if copiedSamples > 0 {
